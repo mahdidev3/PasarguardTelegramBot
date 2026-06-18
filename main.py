@@ -824,7 +824,8 @@ def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int
         text += f"🎁 تخفیف دعوت دوستان: <b>{fmt_money(discount)}</b>\n"
     text += f"✅ مبلغ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
     text += "یک نام دلخواه برای اشتراک وارد کنید یا دکمه زیر را بزنید تا خودکار ساخته شود.\n\n"
-    text += "ربات به‌صورت خودکار ابتدای نام را <code>howtosee_</code> می‌گذارد."
+    text += "ربات به‌صورت خودکار ابتدای نام را <code>howtosee_</code> می‌گذارد.\n"
+    text += "فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است."
     return text, plan.price, discount, payable
 
 
