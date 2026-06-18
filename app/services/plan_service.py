@@ -72,12 +72,13 @@ async def seed_catalog_defaults(free_test_mb: int) -> None:
                 session.add(DataAddonPackageDB(**asdict(seed), sort_order=idx * 10, is_active=True))
         for service_type, title in [("standard", "رایگان استاندارد"), ("speed", "رایگان پرسرعت")]:
             key = f"free_{service_type}_{free_test_mb}"
+            free_title = f"{free_test_mb} مگابایت | {title}"
             existing = (await session.execute(select(FreeTestPlanDB).where(FreeTestPlanDB.key == key))).scalar_one_or_none()
             if existing is None:
                 session.add(
                     FreeTestPlanDB(
                         key=key,
-                        title=f"{free_test_mb} مگابایت | {title}",
+                        title=free_title,
                         data_gb=free_test_mb / 1024,
                         days=3,
                         category=f"free:{service_type}",
@@ -86,6 +87,23 @@ async def seed_catalog_defaults(free_test_mb: int) -> None:
                         is_active=True,
                     )
                 )
+            # Phase 4.10: free user flows also need real Pasarguard templates.
+            catalog_existing = (await session.execute(select(CatalogPlan).where(CatalogPlan.key == key))).scalar_one_or_none()
+            if catalog_existing is None:
+                session.add(
+                    CatalogPlan(
+                        key=key,
+                        title=free_title,
+                        data_gb=free_test_mb / 1024,
+                        days=3,
+                        price=0,
+                        category=f"free:{service_type}",
+                        badge="رایگان",
+                        sort_order=500 if service_type == "standard" else 510,
+                        is_active=True,
+                    )
+                )
+
 
 
 async def list_categories(active_only: bool = True) -> list[PlanCategory]:

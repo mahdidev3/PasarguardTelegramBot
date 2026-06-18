@@ -36,6 +36,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from app.bootstrap import bootstrap_phase1
+from app.config import settings
 from app.services.text_template_service import render_template_sync
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
@@ -47,6 +48,7 @@ from app.services.pasarguard_template_service import render_sync_report, sync_pl
 from app.services.pasarguard_user_service import (
     apply_template_to_remote_user,
     create_remote_user_for_service,
+    ensure_template_for_plan,
     reset_remote_user_usage,
     revoke_remote_subscription,
     set_remote_user_status,
@@ -101,7 +103,7 @@ TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 
 # -----------------------------
-# Demo catalog - no PasarGuard API yet
+# Legacy catalog bridge - synced with DB/Pasarguard templates in Phase 4
 # -----------------------------
 @dataclass(frozen=True)
 class Plan:
@@ -123,48 +125,8 @@ class DataAddon:
     badge: str
 
 
-@dataclass(frozen=True)
-class Coupon:
-    code: str
-    percent: int
-    title: str
 
-
-PLANS: dict[str, Plan] = {
-    "m_10": Plan("m_10", "۱۰ گیگابایت | یک‌ماهه", 10, 31, 100_000, "monthly", "اقتصادی"),
-    "m_20": Plan("m_20", "۲۰ گیگابایت | یک‌ماهه", 20, 31, 190_000, "monthly", "محبوب"),
-    "m_30": Plan("m_30", "۳۰ گیگابایت | یک‌ماهه", 30, 31, 270_000, "monthly", "متعادل"),
-    "m_40": Plan("m_40", "۴۰ گیگابایت | یک‌ماهه", 40, 31, 340_000, "monthly", "حرفه‌ای"),
-    "m_50": Plan("m_50", "۵۰ گیگابایت | یک‌ماهه", 50, 31, 400_000, "monthly", "پرفروش"),
-    "q_60": Plan("q_60", "۶۰ گیگابایت | سه‌ماهه", 60, 93, 540_000, "quarterly", "سه‌ماهه"),
-    "q_100": Plan("q_100", "۱۰۰ گیگابایت | سه‌ماهه", 100, 93, 850_000, "quarterly", "پیشنهادی"),
-    "q_150": Plan("q_150", "۱۵۰ گیگابایت | سه‌ماهه", 150, 93, 1_180_000, "quarterly", "حجیم"),
-}
-
-DATA_ADDON_PACKAGES: dict[str, DataAddon] = {
-    "add_5": DataAddon("add_5", "۵ گیگابایت حجم اضافه", 5, 39_000, "شروع اقتصادی"),
-    "add_10": DataAddon("add_10", "۱۰ گیگابایت حجم اضافه", 10, 69_000, "انتخاب هوشمند"),
-    "add_20": DataAddon("add_20", "۲۰ گیگابایت حجم اضافه", 20, 129_000, "پیشنهادی"),
-    "add_50": DataAddon("add_50", "۵۰ گیگابایت حجم اضافه", 50, 299_000, "به‌صرفه‌ترین"),
-}
-
-FREE_SERVICE_TYPES: dict[str, dict[str, str]] = {
-    "standard": {"title": "🌍 سرویس رایگان استاندارد", "subtitle": "برای تست اتصال روزمره"},
-    "speed": {"title": "⚡ سرویس رایگان پرسرعت", "subtitle": "برای تست سرعت و پایداری"},
-}
-
-FREE_TEST_PLANS: dict[str, Plan] = {
-    "free_standard_150": Plan("free_standard_150", f"{FREE_TEST_MB} مگابایت | رایگان استاندارد", FREE_TEST_MB / 1024, 3, 0, "free:standard", "رایگان"),
-    "free_speed_150": Plan("free_speed_150", f"{FREE_TEST_MB} مگابایت | رایگان پرسرعت", FREE_TEST_MB / 1024, 3, 0, "free:speed", "رایگان"),
-}
-
-DEMO_COUPONS: dict[str, Coupon] = {
-    "HOWTOSEE10": Coupon("HOWTOSEE10", 10, "تخفیف عمومی HowTooSee"),
-    "VIP20": Coupon("VIP20", 20, "تخفیف ویژه VIP"),
-    "TEST5": Coupon("TEST5", 5, "کد تست پنج درصدی"),
-}
-
-# Demo in-memory storage. Later this should be persisted or replaced by payment/order DB fields.
+# Small transient state for user-entered service names; durable order data lives in SQLite/PostgreSQL.
 pending_names: dict[int, str] = {}
 order_discounts: dict[int, dict[str, Any]] = {}
 
@@ -242,7 +204,20 @@ def subscription_link(service: sqlite3.Row) -> str:
             return str(service["pasarguard_subscription_url"])
     except Exception:
         pass
+    # Phase 4.10: when Pasarguard is enabled, production services must not expose fake/local subscription URLs.
+    if settings.pasarguard_enabled:
+        return ""
     return f"{SUBSCRIPTION_BASE_URL}/{service['token']}"
+
+
+def subscription_link_or_pending_text(service: sqlite3.Row) -> str:
+    link = subscription_link(service)
+    if link:
+        return link
+    status = str(service["status"] or "")
+    if status in {"provisioning", "provisioning_failed"}:
+        return "لینک واقعی هنوز از Pasarguard دریافت نشده است."
+    return "لینک واقعی Pasarguard برای این سرویس ثبت نشده است."
 
 
 # -----------------------------
@@ -411,24 +386,41 @@ class DB:
         with closing(self.connect()) as conn:
             return conn.execute("SELECT * FROM orders WHERE id = ? AND user_telegram_id = ?", (order_id, telegram_id)).fetchone()
 
-    def create_service(self, telegram_id: int, name: str, plan: Plan, paid_amount: int, is_test: bool = False) -> int:
+    def create_service(self, telegram_id: int, name: str, plan: Plan, paid_amount: int, is_test: bool = False, status: str = "active") -> int:
         token = make_token()
         expires = datetime.now(TEHRAN_TZ) + timedelta(days=plan.days)
         with closing(self.connect()) as conn:
             cur = conn.execute(
                 """
                 INSERT INTO services
-                (user_telegram_id, name, plan_key, plan_title, data_gb, days, price, paid_amount, token, expires_at, is_test, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_telegram_id, name, plan_key, plan_title, data_gb, days, price, paid_amount, token, expires_at, is_test, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (telegram_id, name, plan.key, plan.title, plan.data_gb, plan.days, plan.price, paid_amount, token, expires.isoformat(timespec="seconds"), 1 if is_test else 0, now_iso()),
+                (telegram_id, name, plan.key, plan.title, plan.data_gb, plan.days, plan.price, paid_amount, token, expires.isoformat(timespec="seconds"), 1 if is_test else 0, status, now_iso()),
             )
+            if is_test and status == "active":
+                conn.execute("UPDATE users SET free_test_used = 1 WHERE telegram_id = ?", (telegram_id,))
+            elif paid_amount > 0 and status == "active":
+                conn.execute("UPDATE users SET first_purchase_done = 1 WHERE telegram_id = ?", (telegram_id,))
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def set_service_status(self, service_id: int, telegram_id: int, status: str, error: str | None = None) -> None:
+        with closing(self.connect()) as conn:
+            if error is not None and "pasarguard_sync_error" in [row[1] for row in conn.execute("PRAGMA table_info(services)").fetchall()]:
+                conn.execute("UPDATE services SET status = ?, pasarguard_sync_error = ? WHERE id = ? AND user_telegram_id = ?", (status, error, service_id, telegram_id))
+            else:
+                conn.execute("UPDATE services SET status = ? WHERE id = ? AND user_telegram_id = ?", (status, service_id, telegram_id))
+            conn.commit()
+
+    def activate_service_after_provisioning(self, service_id: int, telegram_id: int, *, is_test: bool = False, paid_amount: int = 0) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("UPDATE services SET status = 'active', pasarguard_sync_error = NULL WHERE id = ? AND user_telegram_id = ?", (service_id, telegram_id))
             if is_test:
                 conn.execute("UPDATE users SET free_test_used = 1 WHERE telegram_id = ?", (telegram_id,))
             elif paid_amount > 0:
                 conn.execute("UPDATE users SET first_purchase_done = 1 WHERE telegram_id = ?", (telegram_id,))
             conn.commit()
-            return int(cur.lastrowid)
 
     def mark_first_purchase_done(self, telegram_id: int) -> None:
         with closing(self.connect()) as conn:
@@ -630,16 +622,6 @@ def ensure_admin_schema() -> None:
                 "INSERT OR IGNORE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (key, value, now_iso()),
             )
-        for code, coupon in DEMO_COUPONS.items():
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO coupons
-                (code, percent, title, scope, target_user_ids, usage_limit, per_user_limit, used_count,
-                 stack_with_referral, max_discount_percent, active, expires_at, created_by, created_at)
-                VALUES (?, ?, ?, 'all', NULL, NULL, 1, 0, 1, 40, 1, NULL, NULL, ?)
-                """,
-                (code, coupon.percent, coupon.title, now_iso()),
-            )
         conn.commit()
 
 
@@ -786,7 +768,7 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     service_id: Optional[int] = None
     if plan_key in PLANS:
         service_name = make_service_name(telegram_id)
-        service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False)
+        service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     elif plan_key.startswith("addon:"):
         _, package_key, service_id_s = plan_key.split(":")
         pkg = DATA_ADDON_PACKAGES.get(package_key)
@@ -837,7 +819,7 @@ def create_manual_service_for_user(telegram_id: int, plan_key: str, paid_amount:
     if not user or not plan:
         return None
     order_id = db.create_order(telegram_id, plan_key, plan.price, max(plan.price - paid_amount, 0), 0, "paid", "ساخت دستی ادمین")
-    service_id = db.create_service(telegram_id, make_service_name(telegram_id), plan, paid_amount, is_test=False)
+    service_id = db.create_service(telegram_id, make_service_name(telegram_id), plan, paid_amount, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     db.update_order_service(order_id, service_id)
     admin_log(admin_id, "MANUAL_SERVICE_CREATE", "user", telegram_id, f"plan={plan_key}, paid={paid_amount}, order={order_id}, service={service_id}")
     return service_id
@@ -908,6 +890,56 @@ def finalize_coupon_usage(order_id: int, telegram_id: int) -> None:
         )
         conn.execute("UPDATE coupons SET used_count = (SELECT COUNT(*) FROM coupon_usages WHERE code = ?) WHERE code = ?", (code, code))
         conn.commit()
+
+
+def mark_order_terminal(order_id: int, *, status: str, method: str, wallet_used: int = 0, service_id: int | None = None, admin_note: str | None = None) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE orders
+            SET status = ?, payment_method = ?, wallet_used = ?, service_id = COALESCE(?, service_id), admin_note = COALESCE(?, admin_note)
+            WHERE id = ?
+            """,
+            (status, method, wallet_used, service_id, admin_note, order_id),
+        )
+        conn.commit()
+
+
+def _remote_result_is_production_ready(result: Any) -> bool:
+    if not settings.pasarguard_enabled:
+        return True
+    return bool(result and result.ok and result.applied and result.subscription_url)
+
+
+def _remote_failure_text(result: Any) -> str:
+    if result is None:
+        return "Pasarguard نتیجه‌ای برنگرداند."
+    return str(getattr(result, "error", None) or getattr(result, "message", None) or "فعال‌سازی remote ناموفق بود.")
+
+
+async def provision_service_or_mark_failed(service_id: int, telegram_id: int, *, order_id: int | None, is_test: bool, paid_amount: int) -> tuple[bool, Any, sqlite3.Row | None]:
+    service = db.get_service(service_id, telegram_id)
+    if not service:
+        return False, None, None
+    result = await create_remote_user_for_service(db, service, order_id=order_id)
+    service = db.get_service(service_id, telegram_id) or service
+    if _remote_result_is_production_ready(result):
+        db.activate_service_after_provisioning(service_id, telegram_id, is_test=is_test, paid_amount=paid_amount)
+        if result and getattr(result, "applied", False):
+            # Pull once so usage/expire/subscription_url exactly match panel response.
+            fresh = db.get_service(service_id, telegram_id)
+            if fresh and 'pasarguard_username' in fresh.keys() and fresh['pasarguard_username']:
+                await sync_remote_user_from_panel(db, fresh)
+        return True, result, db.get_service(service_id, telegram_id)
+    error = _remote_failure_text(result)
+    db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
+    return False, result, db.get_service(service_id, telegram_id)
+
+
+def refund_wallet_payment_if_needed(telegram_id: int, amount: int, order_id: int, reason: str) -> None:
+    if amount > 0:
+        db.add_wallet(telegram_id, amount, "wallet_refund", f"برگشت پرداخت سفارش #{order_id}: {reason[:80]}")
+
 
 
 def create_coupon_admin(code: str, percent: int, title: str, scope: str, target_user_ids: str, usage_limit: Optional[int], expires_days: Optional[int], admin_id: int) -> None:
@@ -1548,8 +1580,26 @@ def service_text(service: sqlite3.Row) -> str:
     used_gb = int(service["data_used_mb"]) / 1024
     left_gb = max(float(service["data_gb"]) - used_gb, 0)
     link = subscription_link(service)
-    status_label = "فعال ✅" if service["status"] == "active" else "غیرفعال ⛔"
+    status_map = {
+        "active": "فعال ✅",
+        "suspended": "غیرفعال ⛔",
+        "locked": "قفل‌شده 🔒",
+        "provisioning": "در حال فعال‌سازی 🔄",
+        "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
+        "deleted": "حذف‌شده 🗑",
+    }
+    status_label = status_map.get(str(service["status"] or ""), h(service["status"]))
     type_label = "\n🎁 نوع: <b>سرویس رایگان</b>" if service["is_test"] else ""
+    link_block = (
+        f"🔗 لینک اشتراک:\n<code>{h(link)}</code>\n\n"
+        f'📊 برای بررسی وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده، از این بخش استفاده کنید:\n<a href="{h(link)}">پنل کاربری اشتراک</a> ❗️\n\n'
+        if link else
+        "🔗 لینک اشتراک:\n<code>در انتظار دریافت لینک واقعی Pasarguard</code>\n\n"
+    )
+    error_line = (
+        f"⚠️ خطای فعال‌سازی: <code>{h(service['pasarguard_sync_error'])}</code>\n\n"
+        if 'pasarguard_sync_error' in service.keys() and service['pasarguard_sync_error'] else ""
+    )
     return (
         header("📦 جزئیات سرویس", service["name"])
         + f"🟢 وضعیت: <b>{status_label}</b>{type_label}\n"
@@ -1557,19 +1607,21 @@ def service_text(service: sqlite3.Row) -> str:
         + f"📊 حجم باقی‌مانده: <b>{fmt_number(round(left_gb, 2))} گیگابایت</b>\n"
         + f"⏳ زمان باقی‌مانده: <b>{fmt_number(days_left)} روز</b>\n"
         + f"💳 مبلغ پرداختی: <b>{fmt_money(int(service['paid_amount']))}</b>\n\n"
-        + f"🔗 لینک اشتراک:\n<code>{h(link)}</code>\n\n"
-        + f"📊 برای بررسی وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده، از این بخش استفاده کنید:\n<a href=\"{h(link)}\">پنل کاربری اشتراک</a> ❗️\n\n"
+        + error_line
+        + link_block
         + "برای مدیریت سرویس از دکمه‌های زیر استفاده کنید."
     )
 
 
 def sub_link_text(service: sqlite3.Row) -> str:
     link = subscription_link(service)
+    if not link:
+        return header("🔗 لینک اشتراک", service["name"]) + "هنوز لینک واقعی Pasarguard برای این سرویس ثبت نشده است. لطفاً از جزئیات سرویس گزینه sync را بزنید یا با پشتیبانی تماس بگیرید."
     return (
         header("🔗 لینک اشتراک", service["name"])
         + f"<code>{h(link)}</code>\n\n"
         + "برای کپی کردن، روی لینک بالا لمس کنید.\n\n"
-        + f"📊 وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده را می‌توانید از اینجا ببینید:\n<a href=\"{h(link)}\">پنل کاربری اشتراک</a> ❗️"
+        + f'📊 وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده را می‌توانید از اینجا ببینید:\n<a href="{h(link)}">پنل کاربری اشتراک</a> ❗️'
     )
 
 
@@ -1709,6 +1761,36 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup: Optio
     await callback.answer()
 
 
+async def order_activation_preflight(order: sqlite3.Row, telegram_id: int) -> tuple[bool, str]:
+    """Prevent taking even demo payments when real Pasarguard activation is known to fail."""
+    if not settings.pasarguard_enabled:
+        return True, ""
+    if settings.pasarguard_dry_run:
+        return False, "Pasarguard در حالت Dry-run است؛ پرداخت می‌تواند دمو باشد، اما فعال‌سازی production واقعی انجام نمی‌شود. Dry-run را خاموش کن یا از ادمین بخواه سرویس را بعداً دستی فعال کند."
+    plan_key = str(order["plan_key"])
+    if plan_key.startswith("addon:") or plan_key.startswith("renew:"):
+        try:
+            service_id = int(plan_key.split(":")[-1])
+        except Exception:
+            return False, "شناسه سرویس داخل سفارش معتبر نیست."
+        service = db.get_service(service_id, telegram_id)
+        if not service or service["status"] == "deleted":
+            return False, "سرویس مقصد برای این سفارش پیدا نشد."
+        if 'pasarguard_username' not in service.keys() or not service['pasarguard_username']:
+            return False, "این سرویس هنوز به user واقعی Pasarguard وصل نیست؛ تمدید/افزایش حجم production ممکن نیست."
+        if plan_key.startswith("addon:"):
+            return True, ""
+        renew_plan_key = plan_key.split(":")[1]
+        template_id, _plan, error = await ensure_template_for_plan(renew_plan_key)
+        if error or not template_id:
+            return False, error or "template پلن تمدید در Pasarguard پیدا نشد."
+        return True, ""
+    template_id, _plan, error = await ensure_template_for_plan(plan_key)
+    if error or not template_id:
+        return False, error or "template پلن در Pasarguard پیدا نشد."
+    return True, ""
+
+
 async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, order_id: int) -> None:
     user = db.get_user(telegram_id)
     order = db.get_order(order_id, telegram_id)
@@ -1717,7 +1799,12 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
             await target.answer("سفارش پیدا نشد.", show_alert=True)
         return
     text, back_callback, payable = render_order_payment_text(order, user)
-    markup = order_payment_kb(order_id, payable, int(user["wallet_balance"]), back_callback, "⬅️ بازگشت")
+    ok, reason = await order_activation_preflight(order, telegram_id)
+    if not ok:
+        text += "\n\n⚠️ <b>این سفارش فعلاً قابل پرداخت نیست.</b>\n" + h(reason)
+        markup = inline([[('🎫 پشتیبانی', 'ticket_new')], [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")]])
+    else:
+        markup = order_payment_kb(order_id, payable, int(user["wallet_balance"]), back_callback, "⬅️ بازگشت")
     if isinstance(target, CallbackQuery):
         await edit_or_answer(target, text, markup)
     else:
@@ -1908,7 +1995,7 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(CouponStates.waiting_code)
     await state.update_data(order_id=order_id)
-    text = header("🎟 کد تخفیف") + "کد تخفیف را وارد کنید.\n\nکدهای دمو برای تست:\n<code>HOWTOSEE10</code>\n<code>VIP20</code>\n<code>TEST5</code>"
+    text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید.\n\nکدها از پنل ادمین و دیتابیس واقعی خوانده می‌شوند؛ کد hardcoded در مسیر کاربر استفاده نمی‌شود."
     await edit_or_answer(callback, text, coupon_cancel_kb(order_id))
 
 
@@ -1923,21 +2010,24 @@ async def coupon_finish(message: Message, state: FSMContext) -> None:
         await message.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", reply_markup=back_home_kb())
         return
     code = (message.text or "").strip().upper()
-    coupon = DEMO_COUPONS.get(code)
-    if not coupon:
-        await message.answer("❌ این کد تخفیف معتبر نیست.\nلطفاً دوباره وارد کنید یا انصراف را بزنید.", reply_markup=coupon_cancel_kb(order_id))
+    coupon_row_obj, error = validate_coupon_for_order(code, int(user["telegram_id"]), order)
+    if not coupon_row_obj:
+        await message.answer(f"❌ {h(error or 'این کد تخفیف معتبر نیست.')}\nلطفاً دوباره وارد کنید یا انصراف را بزنید.", reply_markup=coupon_cancel_kb(order_id))
         return
 
     amount = int(order["amount"])
     details = order_discounts.get(order_id, {"referral": int(order["discount_amount"]), "coupon": 0, "coupon_code": None})
     referral_discount = int(details.get("referral", 0))
+    if not int(coupon_row_obj["stack_with_referral"] or 1):
+        referral_discount = 0
     base_for_coupon = max(amount - referral_discount, 0)
-    coupon_discount = int(base_for_coupon * coupon.percent / 100)
-    total_discount = min(referral_discount + coupon_discount, int(amount * 0.40))
-    order_discounts[order_id] = {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": coupon.code}
-    db.update_order_discount(order_id, int(user["telegram_id"]), total_discount)
+    coupon_discount = int(base_for_coupon * int(coupon_row_obj["percent"]) / 100)
+    max_discount_percent = int(coupon_row_obj["max_discount_percent"] or 40)
+    total_discount = min(referral_discount + coupon_discount, int(amount * max_discount_percent / 100))
+    order_discounts[order_id] = {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": code}
+    save_order_coupon(order_id, int(user["telegram_id"]), code, coupon_discount, total_discount)
     await state.clear()
-    await message.answer(header("✅ کد تخفیف اعمال شد") + f"کد <code>{h(coupon.code)}</code> با موفقیت روی سفارش اعمال شد.")
+    await message.answer(header("✅ کد تخفیف اعمال شد") + f"کد <code>{h(code)}</code> با موفقیت روی سفارش اعمال شد.")
     await show_order_payment(message, int(user["telegram_id"]), order_id)
 
 
@@ -1981,16 +2071,30 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         wallet_used = payable
 
     service_name = pending_names.get(order_id) or make_service_name(telegram_id)
-    service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False)
+    service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     db.update_order_service(order_id, service_id)
-    with closing(db.connect()) as conn:
-        conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, order_id))
-        conn.commit()
+
+    ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=order_id, is_test=False, paid_amount=payable)
+    if not ok:
+        error = _remote_failure_text(remote_result)
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, order_id, error)
+        mark_order_terminal(order_id, status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(
+            callback,
+            header("⚠️ پرداخت ثبت شد ولی فعال‌سازی ناموفق بود", service_name)
+            + "سرویس به‌صورت fake فعال نشد، چون لینک واقعی Pasarguard دریافت نشد.\n"
+            + "اگر با کیف پول پرداخت کرده باشید، مبلغ به کیف پول برگشته است.\n\n"
+            + f"خطا: <code>{h(error)}</code>",
+            inline([[('🎫 ارتباط با پشتیبانی', 'ticket_new')], [('📦 سرویس‌های من', 'my_services'), ('🏠 منوی اصلی', 'home')]]),
+        )
+        return
+
+    mark_order_terminal(order_id, status="paid", method=method, wallet_used=wallet_used, service_id=service_id)
     finalize_coupon_usage(order_id, telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, order_id, payable)
     service = db.get_service(service_id, telegram_id)
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ سفارش با موفقیت فعال شد", service_name) + f"سرویس شما آماده استفاده است.\n\n{service_text(service)}{extra}", service_details_kb(service))
+    await edit_or_answer(callback, header("✅ سفارش با موفقیت فعال شد", service_name) + f"سرویس واقعی Pasarguard شما آماده استفاده است.\n\n{service_text(service)}{extra}" + (remote_result.notice() if remote_result else ""), service_details_kb(service))
 
 
 async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
@@ -2015,18 +2119,30 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
             return
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت افزایش حجم سفارش #{order['id']}")
         wallet_used = payable
+
     db.add_data_to_service(service_id, telegram_id, pkg.data_gb)
+    service = db.get_service(service_id, telegram_id)
+    remote_result = await update_remote_user_limit(db, service)
+    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
+        error = _remote_failure_text(remote_result)
+        db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(callback, header("⚠️ افزایش حجم ناموفق بود", service["name"]) + "تغییر remote در Pasarguard انجام نشد؛ سرویس fake فعال نمی‌شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(db.get_service(service_id, telegram_id)))
+        return
+
     if payable > 0:
         db.mark_first_purchase_done(telegram_id)
     db.update_order_service(int(order["id"]), service_id)
-    with closing(db.connect()) as conn:
-        conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, int(order["id"])))
-        conn.commit()
+    mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used, service_id=service_id)
     finalize_coupon_usage(int(order["id"]), telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
     service = db.get_service(service_id, telegram_id)
+    if service and 'pasarguard_username' in service.keys() and service['pasarguard_username']:
+        await sync_remote_user_from_panel(db, service)
+        service = db.get_service(service_id, telegram_id) or service
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ حجم سرویس افزایش یافت", service["name"]) + f"بسته <b>{h(pkg.title)}</b> به سرویس شما اضافه شد.\n⏳ زمان پایان سرویس تغییری نکرد.\n\n" + service_text(service) + extra, service_details_kb(service))
+    await edit_or_answer(callback, header("✅ حجم سرویس افزایش یافت", service["name"]) + f"بسته <b>{h(pkg.title)}</b> به سرویس واقعی شما اضافه شد.\n⏳ زمان پایان سرویس تغییری نکرد.\n\n" + service_text(service) + extra + remote_result.notice(), service_details_kb(service))
 
 
 async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
@@ -2051,16 +2167,29 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
             return
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت تمدید سفارش #{order['id']}")
         wallet_used = payable
+
     db.renew_service(service_id, telegram_id, plan, payable)
+    service = db.get_service(service_id, telegram_id)
+    remote_result = await apply_template_to_remote_user(db, service, order_id=int(order["id"]))
+    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
+        error = _remote_failure_text(remote_result)
+        db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(callback, header("⚠️ تمدید ناموفق بود", service["name"]) + "template روی remote user اعمال نشد؛ سرویس fake تمدید نمی‌شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(db.get_service(service_id, telegram_id)))
+        return
+
     db.update_order_service(int(order["id"]), service_id)
-    with closing(db.connect()) as conn:
-        conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, int(order["id"])))
-        conn.commit()
+    mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used, service_id=service_id)
     finalize_coupon_usage(int(order["id"]), telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
     service = db.get_service(service_id, telegram_id)
+    if service and 'pasarguard_username' in service.keys() and service['pasarguard_username']:
+        await reset_remote_user_usage(db, service)
+        await sync_remote_user_from_panel(db, service)
+        service = db.get_service(service_id, telegram_id) or service
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ سرویس با موفقیت تمدید شد", service["name"]) + "حجم مصرف‌شده صفر شد و زمان سرویس طبق پلن جدید تنظیم شد.\n\n" + service_text(service) + extra, service_details_kb(service))
+    await edit_or_answer(callback, header("✅ سرویس با موفقیت تمدید شد", service["name"]) + "حجم مصرف‌شده صفر شد و زمان سرویس طبق template واقعی Pasarguard تنظیم شد.\n\n" + service_text(service) + extra + remote_result.notice(), service_details_kb(service))
 
 
 @router.message(F.text == "📦 سرویس‌های من")
@@ -2214,10 +2343,16 @@ async def revoke(callback: CallbackQuery) -> None:
     if not service:
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
-    token = db.revoke_service_link(service_id, int(user["telegram_id"]))
+    remote_result = await revoke_remote_subscription(db, service)
+    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
+        error = _remote_failure_text(remote_result)
+        await edit_or_answer(callback, header("⚠️ تغییر لینک ناموفق بود", service["name"]) + "لینک fake/local ساخته نشد؛ تغییر لینک باید از Pasarguard انجام شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(service))
+        return
+    if not settings.pasarguard_enabled:
+        token = db.revoke_service_link(service_id, int(user["telegram_id"]))
     service = db.get_service(service_id, int(user["telegram_id"]))
-    link = f"{SUBSCRIPTION_BASE_URL}/{token}"
-    await edit_or_answer(callback, header("🔄 لینک اشتراک تغییر کرد", service["name"]) + f"لینک قبلی دیگر قابل استفاده نیست.\n\nلینک جدید:\n<code>{h(link)}</code>\n\n<a href=\"{h(link)}\">پنل کاربری اشتراک</a> ❗️", service_details_kb(service))
+    link = subscription_link(service)
+    await edit_or_answer(callback, header("🔄 لینک اشتراک تغییر کرد", service["name"]) + f"لینک قبلی دیگر قابل استفاده نیست.\n\nلینک جدید:\n<code>{h(link or 'لینک واقعی Pasarguard ثبت نشده است')}</code>" + remote_result.notice(), service_details_kb(service))
 
 
 @router.callback_query(F.data.startswith("svc_settings:"))
@@ -2384,9 +2519,20 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
         await callback.answer("پکیج رایگان پیدا نشد.", show_alert=True)
         return
     service_name = f"{SERVICE_NAME_PREFIX}free_{str(telegram_id)[-5:]}"[:32]
-    service_id = db.create_service(telegram_id, service_name, test_plan, 0, is_test=True)
-    service = db.get_service(service_id, telegram_id)
-    await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس برای بررسی کیفیت اتصال ساخته شده است.\n\n" + service_text(service), service_details_kb(service))
+    service_id = db.create_service(telegram_id, service_name, test_plan, 0, is_test=True, status="provisioning" if settings.pasarguard_enabled else "active")
+    ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=None, is_test=True, paid_amount=0)
+    if not ok:
+        error = _remote_failure_text(remote_result)
+        await edit_or_answer(
+            callback,
+            header("⚠️ فعال‌سازی سرویس رایگان ناموفق بود", service_name)
+            + "سرویس رایگان به‌صورت fake فعال نشد؛ چون user واقعی Pasarguard ساخته نشد.\n\n"
+            + f"خطا: <code>{h(error)}</code>\n\n"
+            + "بعد از اصلاح template/permission در Pasarguard دوباره امتحان کنید یا با پشتیبانی تماس بگیرید.",
+            inline([[('🎫 پشتیبانی', 'ticket_new')], [('🏠 منوی اصلی', 'home')]]),
+        )
+        return
+    await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس واقعی در Pasarguard ساخته شده و برای بررسی کیفیت اتصال آماده است.\n\n" + service_text(service) + (remote_result.notice() if remote_result else ""), service_details_kb(service))
 
 
 @router.message(F.text == "💳 تراکنش‌ها")
@@ -2398,7 +2544,13 @@ async def transactions(message: Message) -> None:
         text += "هنوز تراکنشی ثبت نشده است."
     else:
         for i, order in enumerate(orders, 1):
-            status = "پرداخت شده ✅" if order["status"] == "paid" else "در انتظار ⏳"
+            status_map = {
+                "paid": "پرداخت شده ✅",
+                "pending": "در انتظار ⏳",
+                "provisioning": "در حال فعال‌سازی 🔄",
+                "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
+            }
+            status = status_map.get(str(order["status"]), h(order["status"]))
             payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
             text += f"{i}. <b>{status}</b>\n   🧾 شماره: <code>{order['id']}</code>\n   💰 مبلغ: <b>{fmt_money(payable)}</b>\n   📅 تاریخ: <code>{h(order['created_at'][:10])}</code>\n\n"
     await message.answer(text, reply_markup=back_home_kb())
@@ -2975,14 +3127,15 @@ async def admin_manual_service_amount_finish(message: Message, state: FSMContext
     if not service_id:
         await message.answer("❌ ساخت سرویس ناموفق بود.", reply_markup=admin_back_kb(f"adm_user:{uid}"))
         return
-    service = db.get_service(service_id)
-    remote_result = await create_remote_user_for_service(db, service, order_id=None)
-    service = db.get_service(service_id)
+    ok, remote_result, service = await provision_service_or_mark_failed(service_id, uid, order_id=None, is_test=False, paid_amount=amount)
     try:
-        await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service) + remote_result.notice(), reply_markup=service_details_kb(service))
+        if ok:
+            await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service) + (remote_result.notice() if remote_result else ""), reply_markup=service_details_kb(service))
+        else:
+            await message.bot.send_message(uid, header("⚠️ سرویس دستی ساخته شد اما فعال‌سازی ناموفق بود") + service_text(service), reply_markup=service_details_kb(service))
     except Exception:
         pass
-    await message.answer(header("✅ سرویس دستی ساخته شد") + admin_service_text(service) + remote_result.notice(), reply_markup=admin_service_kb(service))
+    await message.answer((header("✅ سرویس دستی ساخته شد") if ok else header("⚠️ سرویس دستی نیازمند بررسی است")) + admin_service_text(service) + (remote_result.notice() if remote_result else ""), reply_markup=admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_user_orders:"))
@@ -3041,13 +3194,20 @@ async def admin_order_pay(callback: CallbackQuery) -> None:
     oid = int(callback.data.split(":", 1)[1])
     service_id = set_order_paid_admin(oid, callback.from_user.id)
     order = get_order_any(oid)
+    remote_notice = ""
     if service_id:
         service = db.get_service(service_id)
+        if service and (('pasarguard_username' not in service.keys()) or (not service['pasarguard_username'])):
+            ok, remote_result, service = await provision_service_or_mark_failed(service_id, int(order["user_telegram_id"]), order_id=oid, is_test=False, paid_amount=max(int(order["amount"]) - int(order["discount_amount"]), 0))
+            remote_notice = remote_result.notice() if remote_result else ""
+            if not ok:
+                mark_order_terminal(oid, status="provisioning_failed", method="تأیید دستی ادمین", service_id=service_id, admin_note=_remote_failure_text(remote_result))
+                order = get_order_any(oid)
         try:
-            await callback.bot.send_message(int(order["user_telegram_id"]), header("✅ پرداخت شما تأیید شد") + service_text(service), reply_markup=service_details_kb(service))
+            await callback.bot.send_message(int(order["user_telegram_id"]), header("✅ پرداخت شما تأیید شد") + service_text(service) + remote_notice, reply_markup=service_details_kb(service))
         except Exception:
             pass
-    await edit_or_answer(callback, header("✅ سفارش تأیید شد") + admin_order_text(order), admin_order_kb(order))
+    await edit_or_answer(callback, header("✅ سفارش بررسی شد") + admin_order_text(order) + remote_notice, admin_order_kb(order))
 
 
 @router.callback_query(F.data == "adm_broadcast")

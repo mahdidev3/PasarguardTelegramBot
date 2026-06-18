@@ -1,51 +1,27 @@
-# HowTooSee / Pasarguard Bot — Phase 4.9
+# HowTooSee/Pasarguard Bot — Phase 4.10
 
-This checkpoint adds the full Pasarguard admin panel controls on top of Phase 4.8.
+This checkpoint turns user-facing service flows into real Pasarguard-backed flows while keeping payment itself in demo/manual mode.
 
-## Run
+## What changed
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-nano .env
-python main.py
-```
+- New purchases: payment can still be demo, but service activation now provisions a real Pasarguard user from the synced template.
+- Free service: no longer local-only when Pasarguard is enabled; it creates a real remote user from a free template.
+- Renew: applies the selected plan template to the existing remote user and resets usage.
+- Add volume: updates the remote `data_limit` instead of only changing local data.
+- Subscription link: when Pasarguard is enabled, the bot does not expose local/fake subscription URLs.
+- Coupons: user flow now validates DB/admin-created coupon records and no longer uses hardcoded demo coupons.
+- Admin mark-paid/manual service: also triggers provisioning and reports failures.
 
-## Pasarguard admin panel
+## Important production rules
 
-Telegram admin menu:
-
-```text
-👑 پنل مدیریت → 🔌 Pasarguard
-```
-
-Includes:
-
-- 📊 داشبورد Pasarguard
-- 📡 تست اتصال
-- 🧪 Dry-run سینک Templateها
-- ✅ اعمال Sync Templateها
-- 🔄 Sync سرویس‌ها از پنل
-- 🧪 Dry-run Reconcile فعلی
-- ✅ اعمال Reconcile فعلی
-- 🧭 Userهای Orphan
-- 📜 لاگ Sync
-- 🗃 Snapshotها
-
-`Reconcile فعلی` compares the current bot database desired state with the live Pasarguard panel. It does not require a backup file. The apply action still requires numeric confirmation and never performs real remote deletion.
-
-## Safety
-
-Keep dry-run enabled until you trust the report:
+Set these for real activation:
 
 ```env
-PASARGUARD_DRY_RUN=true
-```
-
-When applying real template/user changes:
-
-```env
+PASARGUARD_ENABLED=true
 PASARGUARD_DRY_RUN=false
+PASARGUARD_TEMPLATE_GROUP_IDS=<real group ids>
 ```
+
+If `PASARGUARD_ENABLED=true` and provisioning fails, the service will stay in `provisioning_failed` and no fake link will be shown.
+
+Payment gateways/card-to-card receipt flows are intentionally still demo/manual and will be handled later.
