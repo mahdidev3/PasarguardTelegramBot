@@ -50,6 +50,9 @@ from app.services.pasarguard_user_service import (
     revoke_remote_subscription,
     set_remote_user_status,
     sync_remote_user_from_local,
+    sync_remote_user_from_panel,
+    sync_all_remote_users_from_panel,
+    render_remote_bulk_sync_report,
     update_remote_user_limit,
 )
 from app.routers.plans import plans_router
@@ -1229,6 +1232,7 @@ def admin_service_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     lock_btn = ("🔓 فعال کردن سرویس", f"adm_svc_status:{sid}:active") if status != "active" else ("🔒 قفل سرویس", f"adm_svc_status:{sid}:suspended")
     return inline([
         [("🔗 تغییر لینک", f"adm_svc_revoke:{sid}"), lock_btn],
+        [("🔄 Sync از Pasarguard", f"adm_svc_pull:{sid}")],
         [("➕ ۵ گیگ", f"adm_svc_data:{sid}:5"), ("➕ ۱۰ گیگ", f"adm_svc_data:{sid}:10"), ("➕ ۲۰ گیگ", f"adm_svc_data:{sid}:20")],
         [("⏳ ۷ روز", f"adm_svc_days:{sid}:7"), ("⏳ ۳۰ روز", f"adm_svc_days:{sid}:30"), ("🧹 ریست مصرف", f"adm_svc_reset:{sid}")],
         [("🗑 حذف سرویس", f"adm_svc_status:{sid}:deleted")],
@@ -1357,6 +1361,8 @@ def admin_service_text(service: sqlite3.Row) -> str:
         + f"🔋 باقی‌مانده: <b>{fmt_number(round(left_gb, 2))} GB</b>\n"
         + f"⏳ باقی‌مانده زمانی: <b>{fmt_number(days_left)} روز</b>\n"
         + f"💳 پرداختی: <b>{fmt_money(int(service['paid_amount']))}</b>\n"
+        + (f"🔌 Pasarguard: <code>{h(service['pasarguard_username'])}</code> | <b>{h(service['pasarguard_sync_status'] or 'local')}</b>\n" if 'pasarguard_username' in service.keys() and service['pasarguard_username'] else "")
+        + (f"⚠️ خطای sync: <code>{h(service['pasarguard_sync_error'])}</code>\n" if 'pasarguard_sync_error' in service.keys() and service['pasarguard_sync_error'] else "")
         + f"🔗 لینک: <code>{h(subscription_link(service))}</code>"
     )
 
@@ -2085,7 +2091,11 @@ async def service_details(callback: CallbackQuery) -> None:
     if not service or service["status"] == "deleted":
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
-    await edit_or_answer(callback, service_text(service), service_details_kb(service))
+    # Phase 4.7: pull latest usage/status/expire/subscription_url from Pasarguard when available.
+    remote_result = await sync_remote_user_from_panel(db, service) if 'pasarguard_username' in service.keys() and service['pasarguard_username'] else None
+    service = db.get_service(int(service['id']), int(user["telegram_id"])) or service
+    notice = remote_result.notice() if remote_result and not remote_result.skipped and not remote_result.ok else ""
+    await edit_or_answer(callback, service_text(service) + notice, service_details_kb(service))
 
 
 @router.callback_query(F.data.startswith("addon_menu:"))
@@ -2795,7 +2805,38 @@ async def admin_service_details(callback: CallbackQuery) -> None:
     if not service:
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
-    await edit_or_answer(callback, admin_service_text(service), admin_service_kb(service))
+    remote_result = await sync_remote_user_from_panel(db, service) if 'pasarguard_username' in service.keys() and service['pasarguard_username'] else None
+    service = db.get_service(sid) or service
+    notice = remote_result.notice() if remote_result and not remote_result.skipped and not remote_result.ok else ""
+    await edit_or_answer(callback, admin_service_text(service) + notice, admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_pull:"))
+async def admin_service_pull_from_pasarguard(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services") and not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    sid = int(callback.data.split(":", 1)[1])
+    service = db.get_service(sid)
+    if not service:
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await callback.answer("در حال sync از Pasarguard…", show_alert=False)
+    remote_result = await sync_remote_user_from_panel(db, service)
+    admin_log(callback.from_user.id, "SERVICE_PULL_FROM_PASARGUARD", "service", sid, remote_result.error or remote_result.message)
+    service = db.get_service(sid) or service
+    await edit_or_answer(callback, header("🔄 نتیجه Sync از Pasarguard") + admin_service_text(service) + remote_result.notice(), admin_service_kb(service))
+
+
+@router.callback_query(F.data == "adm_pg_users_pull")
+async def admin_pasarguard_pull_all_services(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services") and not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await callback.answer("در حال sync سرویس‌ها از Pasarguard…", show_alert=False)
+    report = await sync_all_remote_users_from_panel(db, limit=500)
+    admin_log(callback.from_user.id, "PASARGUARD_PULL_ALL_USERS", "pasarguard", "users", f"synced={report.synced}; failed={report.failed}; skipped={report.skipped}")
+    await edit_or_answer(callback, header("🔄 نتیجه Sync سرویس‌ها از Pasarguard") + f"<pre>{h(render_remote_bulk_sync_report(report))}</pre>", admin_back_kb("adm_pasarguard"))
 
 
 @router.callback_query(F.data.startswith("adm_svc_status:"))

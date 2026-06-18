@@ -318,10 +318,24 @@ async def sync_plan_templates(admin_id: int | None = None, *, dry_run: bool | No
     return report
 
 
+def _action_label(action: TemplateSyncAction, *, dry_run: bool) -> str:
+    labels = {
+        "create": "ساخت template",
+        "update": "ویرایش template",
+        "orphan_remote": "template اضافه در پنل",
+    }
+    base = labels.get(action.action, action.action)
+    if dry_run and action.action in {"create", "update"}:
+        return f"قرار است {base} انجام شود"
+    if dry_run and action.action == "orphan_remote":
+        return "فقط گزارش: template اضافه در پنل"
+    return base
+
+
 def render_sync_report(report: TemplateSyncReport) -> str:
     lines = []
     lines.append(f"وضعیت اتصال: {'فعال' if report.enabled else 'غیرفعال'}")
-    lines.append(f"حالت: {'Dry-run / فقط گزارش' if report.dry_run else 'اعمال واقعی'}")
+    lines.append(f"حالت: {'Dry-run / فقط گزارش؛ هیچ تغییری در Pasarguard انجام نشده' if report.dry_run else 'اعمال واقعی'}")
     lines.append(f"تعداد پلن‌ها: {report.total_plans}")
     lines.append(f"templateهای پنل: {report.remote_count}")
     lines.append(f"templateهای تشخیص‌داده‌شده بات: {report.managed_remote_count}")
@@ -333,11 +347,17 @@ def render_sync_report(report: TemplateSyncReport) -> str:
     if report.actions:
         lines.append("\nعملیات‌ها:")
         for action in report.actions[:25]:
-            status = "✅" if action.ok else "❌"
-            applied = " | اعمال شد" if action.applied else ""
+            if report.dry_run:
+                status = "🧪" if action.ok else "❌"
+                applied = " | فقط گزارش"
+            else:
+                status = "✅" if action.ok else "❌"
+                applied = " | اعمال شد" if action.applied else " | اعمال نشد"
             detail = f" | {action.error}" if action.error else ""
             key = action.plan_key or "orphan"
-            lines.append(f"{status} {action.action} | {key} | {action.template_name}{applied}{detail}")
+            lines.append(f"{status} {_action_label(action, dry_run=report.dry_run)} | {key} | {action.template_name}{applied}{detail}")
         if len(report.actions) > 25:
             lines.append(f"… و {len(report.actions) - 25} مورد دیگر")
+    if report.dry_run and report.actions:
+        lines.append("\nیادآوری: این خروجی فقط برنامه تغییرات است؛ برای اعمال واقعی باید گزینه «اعمال Sync Templateها» را اجرا کنید.")
     return "\n".join(lines)

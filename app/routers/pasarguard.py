@@ -59,6 +59,7 @@ def pg_home_kb() -> InlineKeyboardMarkup:
         [("📡 تست اتصال", "adm_pg_health")],
         [("🧪 Dry-run سینک Templateها", "adm_pg_template_dryrun")],
         [("✅ اعمال Sync Templateها", "adm_pg_template_apply_start")],
+        [("🔄 Sync سرویس‌ها از پنل", "adm_pg_users_pull")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -75,7 +76,7 @@ async def pg_home(callback: CallbackQuery) -> None:
     text += f"Dry-run پیش‌فرض: <b>{'روشن ✅' if info.dry_run else 'خاموش ⚠️'}</b>\n"
     text += f"Marker بات: <code>{h(info.managed_prefix)}</code>\n"
     text += f"Group IDs برای template: <code>{h(','.join(map(str, info.group_ids)) or 'تنظیم نشده')}</code>\n\n"
-    text += "در این checkpoint فقط client، health check و sync پلن‌های بات با User Templateهای Pasarguard فعال شده است. ساخت user واقعی بعد از تست این بخش وصل می‌شود."
+    text += "این بخش اتصال Pasarguard، sync templateهای پلن، ساخت user واقعی از template، و sync مصرف/status/expire/link از پنل را مدیریت می‌کند."
     await edit_or_answer(callback, text, pg_home_kb())
 
 
@@ -92,7 +93,17 @@ async def pg_health(callback: CallbackQuery) -> None:
     text += f"پیام: <code>{h(message)}</code>\n"
     if details and details.get("admin"):
         admin = details.get("admin")
-        text += f"ادمین پنل: <code>{h(admin.get('username') if isinstance(admin, dict) else admin)}</code>\n"
+        if isinstance(admin, dict):
+            text += f"ادمین پنل: <code>{h(admin.get('username'))}</code>\n"
+            visible_bits = []
+            for key in ("is_sudo", "sudo", "is_superuser", "is_disabled", "status", "role"):
+                if key in admin:
+                    visible_bits.append(f"{key}={admin.get(key)}")
+            if visible_bits:
+                text += f"جزئیات دسترسی: <code>{h(' | '.join(visible_bits))}</code>\n"
+        else:
+            text += f"ادمین پنل: <code>{h(admin)}</code>\n"
+    text += "\nاگر health موفق است ولی ساخت template/user خطای 403 می‌دهد، مشکل از token نیست؛ اکانت ادمین Pasarguard permission کافی برای همان عملیات ندارد.\n"
     await edit_or_answer(callback, text, pg_home_kb())
 
 

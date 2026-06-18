@@ -44,3 +44,20 @@ Future Phase 4:
 - Connect service status/delete/refund to safe Pasarguard disable/enable updates.
 - Connect link revoke and usage reset to Pasarguard operations.
 - Keep `PASARGUARD_DRY_RUN=true` as a safe no-op mode.
+
+## Phase 4.7 checkpoint
+
+- Fix Pasarguard template sync report wording: dry-run now shows planned operations instead of successful real operations.
+- Improve 403 Pasarguard errors with explicit permission hints for user-template/user operations.
+- Add pull-sync from Pasarguard panel back into the bot:
+  - data_limit -> local service data_gb
+  - used_traffic -> local service data_used_mb
+  - expire -> local service expires_at
+  - status/is_disabled -> local service status
+  - subscription_url -> local service display link
+- Auto pull-sync when a user/admin opens service details if the service has a remote username.
+- Add admin per-service button: “Sync از Pasarguard”.
+- Add Pasarguard admin bulk pull-sync button for all services with remote username.
+
+Next Phase 4.8:
+- Pasarguard backup/restore real actual_state and desired_state with dry-run restore/reconcile.

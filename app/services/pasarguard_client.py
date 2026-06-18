@@ -27,6 +27,23 @@ class PasarguardAPIError(RuntimeError):
         self.response = response
 
 
+def _permission_hint(status_code: int, method: str, path: str, body: Any) -> str:
+    """Return a Persian operator-friendly hint for common Pasarguard permission failures."""
+    if status_code != 403:
+        return ""
+    if path.startswith("/api/user_template") or path.startswith("/api/user_templates"):
+        return (
+            "؛ احراز هویت موفق است اما این ادمین اجازه مدیریت User Template را ندارد. "
+            "یک ادمین sudo/super استفاده کن یا permission ساخت/ویرایش template را برای این اکانت فعال کن."
+        )
+    if path.startswith("/api/user"):
+        return (
+            "؛ احراز هویت موفق است اما این ادمین اجازه مدیریت User/User Subscription را ندارد. "
+            "permission ساخت/ویرایش/ریست کاربر را در Pasarguard بررسی کن."
+        )
+    return "؛ احراز هویت موفق است اما سطح دسترسی این ادمین برای این عملیات کافی نیست."
+
+
 @dataclass(frozen=True)
 class PasarguardConnectionInfo:
     enabled: bool
@@ -93,8 +110,9 @@ class PasarguardClient:
                         body = response.json()
                     except Exception:
                         body = response.text
+                    hint = _permission_hint(response.status_code, method, path, body)
                     raise PasarguardAPIError(
-                        f"Pasarguard API error {response.status_code} on {method} {path}",
+                        f"Pasarguard API error {response.status_code} on {method} {path}{hint}",
                         status_code=response.status_code,
                         response=body,
                     )

@@ -468,3 +468,191 @@ async def sync_remote_user_from_local(sqlite_db: Any, service: Mapping[str, Any]
         await _log_event(job_id, service_id, action, None, None, None, str(exc), plan_key=str(_row_get(service, "plan_key", "")))
     await _finish_job(job_id, result)
     return result
+
+# -----------------------------
+# Phase 4.7: pull-sync panel state back into the bot
+# -----------------------------
+@dataclass
+class RemoteBulkSyncReport:
+    total: int = 0
+    synced: int = 0
+    failed: int = 0
+    skipped: int = 0
+    errors: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.errors is None:
+            self.errors = []
+
+
+def _remote_status_to_local(remote: dict[str, Any]) -> str | None:
+    status = str(remote.get("status") or "").lower()
+    is_disabled = remote.get("is_disabled")
+    if status in {"active", "enabled", "enable"} or is_disabled is False:
+        return "active"
+    if status in {"disabled", "disable", "limited", "expired", "suspended"} or is_disabled is True:
+        return "suspended"
+    return None
+
+
+def _remote_bytes_to_gb(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return round(float(value) / BYTES_PER_GB, 6)
+    except Exception:
+        return None
+
+
+def _remote_bytes_to_mb_int(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        return int(float(value) / BYTES_PER_MB)
+    except Exception:
+        return None
+
+
+def _sqlite_apply_remote_panel_state(sqlite_db: Any, service: Mapping[str, Any], remote: dict[str, Any], *, status: str = "synced", error: str | None = None) -> None:
+    """Persist Pasarguard panel state into the legacy SQLite service row.
+
+    This is a pull-sync: it reads from Pasarguard and updates the bot's local
+    view of usage, limit, expire, status and subscription_url. It does not write
+    anything to Pasarguard.
+    """
+    service_id = int(_row_get(service, "id"))
+    username = str(remote.get("username") or _row_get(service, "pasarguard_username") or "") or None
+    _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=username, status=status, error=error)
+
+    data_gb = _remote_bytes_to_gb(remote.get("data_limit"))
+    used_mb = _remote_bytes_to_mb_int(remote.get("used_traffic"))
+    expire_dt = _parse_remote_expire(remote.get("expire"))
+    local_status = _remote_status_to_local(remote)
+
+    sets: list[str] = []
+    params: list[Any] = []
+    if data_gb is not None:
+        sets.append("data_gb = ?")
+        params.append(data_gb)
+    if used_mb is not None:
+        sets.append("data_used_mb = ?")
+        params.append(used_mb)
+    if expire_dt is not None:
+        sets.append("expires_at = ?")
+        params.append(expire_dt.isoformat(timespec="seconds"))
+    if local_status is not None:
+        sets.append("status = ?")
+        params.append(local_status)
+    if not sets:
+        return
+    params.append(service_id)
+    with sqlite_db.connect() as conn:
+        conn.execute(f"UPDATE services SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        conn.commit()
+
+
+async def sync_remote_user_from_panel(sqlite_db: Any, service: Mapping[str, Any]) -> RemoteServiceResult:
+    """Pull usage/status/expire/subscription_url from Pasarguard into the bot.
+
+    Unlike write operations, this is allowed while PASARGUARD_DRY_RUN=true
+    because it is read-only against the Pasarguard panel. It only updates the
+    bot's local database snapshot.
+    """
+    action = "sync_user_from_panel"
+    service_id = int(_row_get(service, "id"))
+    telegram_id = int(_row_get(service, "user_telegram_id", 0) or 0)
+    plan_key = str(_row_get(service, "plan_key", ""))
+    username = str(_row_get(service, "pasarguard_username") or "")
+    if not username:
+        return RemoteServiceResult(True, action, skipped=True, message="remote username ذخیره نشده؛ چیزی برای sync از پنل وجود ندارد.")
+    info = connection_info()
+    if not info.enabled:
+        return RemoteServiceResult(True, action, skipped=True, message="Pasarguard در env غیرفعال است؛ sync از پنل انجام نشد.", remote_username=username)
+
+    job_id = await _create_job(action, service_id)
+    try:
+        async with PasarguardClient() as client:
+            remote = await client.get_user_by_username(username)
+        if not isinstance(remote, dict):
+            remote = {}
+        actual_username = str(remote.get("username") or username)
+        template_id = _row_get(service, "pasarguard_template_id")
+        _sqlite_apply_remote_panel_state(sqlite_db, service, remote, status="synced_from_panel")
+        await _upsert_remote_user_mapping(
+            service_id=service_id,
+            telegram_id=telegram_id,
+            plan_key=plan_key,
+            username=actual_username,
+            template_id=int(template_id) if str(template_id or "").isdigit() else None,
+            remote=remote,
+            status="synced_from_panel",
+        )
+        result = RemoteServiceResult(
+            True,
+            action,
+            applied=True,
+            message="وضعیت مصرف/زمان/لینک از پنل خوانده و در بات ذخیره شد.",
+            remote_username=actual_username,
+            remote_user_id=_remote_id(remote),
+            subscription_url=remote.get("subscription_url"),
+            remote_state=remote,
+        )
+        await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=plan_key)
+    except Exception as exc:
+        msg = str(exc)
+        _sqlite_update_remote(sqlite_db, service_id, username=username, status="error", error=msg)
+        result = RemoteServiceResult(False, action, error=msg, remote_username=username)
+        await _log_event(job_id, service_id, action, None, None, None, msg, plan_key=plan_key)
+    await _finish_job(job_id, result)
+    return result
+
+
+async def sync_all_remote_users_from_panel(sqlite_db: Any, *, limit: int = 500) -> RemoteBulkSyncReport:
+    """Pull-sync all legacy SQLite services that already have a remote username."""
+    report = RemoteBulkSyncReport()
+    info = connection_info()
+    if not info.enabled:
+        report.skipped = 1
+        report.errors.append("Pasarguard در env غیرفعال است.")
+        return report
+    with sqlite_db.connect() as conn:
+        rows = list(
+            conn.execute(
+                """
+                SELECT * FROM services
+                WHERE pasarguard_username IS NOT NULL
+                  AND TRIM(pasarguard_username) != ''
+                  AND status != 'deleted'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        )
+    report.total = len(rows)
+    for row in rows:
+        result = await sync_remote_user_from_panel(sqlite_db, row)
+        if result.ok and result.applied:
+            report.synced += 1
+        elif result.skipped:
+            report.skipped += 1
+        else:
+            report.failed += 1
+            report.errors.append(f"#{_row_get(row, 'id')}: {result.error or result.message}")
+    return report
+
+
+def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
+    lines = [
+        f"تعداد سرویس‌های دارای remote username: {report.total}",
+        f"✅ sync شده: {report.synced}",
+        f"⏭ رد شده: {report.skipped}",
+        f"❌ خطا: {report.failed}",
+    ]
+    if report.errors:
+        lines.append("\nخطاها:")
+        for err in report.errors[:15]:
+            lines.append(f"• {err}")
+        if len(report.errors) > 15:
+            lines.append(f"… و {len(report.errors) - 15} خطای دیگر")
+    return "\n".join(lines)

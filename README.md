@@ -50,3 +50,9 @@ GRANT ALL PRIVILEGES ON DATABASE pasarguard_telegram_bot TO pasarguard_telegram_
 ### Phase 4.5/4.6 notes
 
 This checkpoint starts real service-user integration. Keep `PASARGUARD_DRY_RUN=true` for the first run. With dry-run on, Telegram purchase flows keep working but no remote Pasarguard user is created. After template sync works, set `PASARGUARD_DRY_RUN=false` to create/modify remote users.
+
+## Phase 4.7 notes
+
+Dry-run template sync is report-only and no longer displays the misleading green “create” wording. If Pasarguard returns 403 on template/user endpoints, the bot now shows a permission-oriented hint.
+
+Pasarguard pull-sync is read-only against Pasarguard and updates the bot’s local service row with real panel usage/status/expire/subscription URL. It can run even while `PASARGUARD_DRY_RUN=true`, because it does not write to Pasarguard.
