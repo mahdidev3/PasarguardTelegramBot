@@ -36,7 +36,11 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 from app.bootstrap import bootstrap_phase1
+from app.services.text_template_service import render_template_sync
 from app.routers.tickets import ticket_router
+from app.routers.broadcast import broadcast_router
+from app.routers.plans import plans_router
+from app.routers.settings import settings_router
 
 load_dotenv()
 
@@ -1134,7 +1138,8 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("👥 مدیریت کاربران", "adm_users"), ("📦 مدیریت سرویس‌ها", "adm_services")],
         [("🧾 سفارش‌ها", "adm_orders"), ("💰 کیف پول کاربران", "adm_wallet_start")],
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
-        [("📢 پیام همگانی", "adm_broadcast"), ("🔒 قفل بات", "adm_bot_lock")],
+        [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
+        [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
         [("📊 گزارش‌ها", "adm_reports")],
     ]
     if admin_has(admin_id, "*"):
@@ -1351,7 +1356,7 @@ def admin_order_text(order: sqlite3.Row) -> str:
 # -----------------------------
 def welcome_text(first_name: Optional[str] = None) -> str:
     name_part = f"، {h(first_name)}" if first_name else ""
-    return (
+    fallback = (
         f"🌍 <b>{h(BRAND_NAME)}</b>\n"
         f"<code>See beyond limits</code>\n\n"
         f"سلام{name_part} 👋\n"
@@ -1362,14 +1367,23 @@ def welcome_text(first_name: Optional[str] = None) -> str:
         "🔹 مناسب ایرانسل، همراه اول و مخابرات\n\n"
         f"📣 کانال رسمی: <a href=\"{h(CHANNEL_LINK)}\">@{h(CHANNEL_USERNAME)}</a>"
     )
+    return render_template_sync(
+        "welcome.body",
+        fallback,
+        first_name=h(first_name or ""),
+        first_name_part=name_part,
+        brand_name=h(BRAND_NAME),
+        channel_link=h(CHANNEL_LINK),
+        channel_username=h(CHANNEL_USERNAME),
+    )
 
 
 def menu_text() -> str:
-    return header("🏠 منوی اصلی") + "یکی از گزینه‌های پایین را انتخاب کنید."
+    return render_template_sync("menu.main", header("🏠 منوی اصلی") + "یکی از گزینه‌های پایین را انتخاب کنید.")
 
 
 def buy_text() -> str:
-    return header("🛒 خرید سرویس", "نوع سرویس را انتخاب کنید") + "پلن‌های آماده برای شروع سریع مناسب‌اند.\nپلن‌های سه‌ماهه برای استفاده پایدار و اقتصادی‌تر پیشنهاد می‌شوند."
+    return render_template_sync("buy.intro", header("🛒 خرید سرویس", "نوع سرویس را انتخاب کنید") + "پلن‌های آماده برای شروع سریع مناسب‌اند.\nپلن‌های سه‌ماهه برای استفاده پایدار و اقتصادی‌تر پیشنهاد می‌شوند.")
 
 
 def plan_category_text(category: str) -> str:
@@ -1379,7 +1393,7 @@ def plan_category_text(category: str) -> str:
 
 
 def free_service_text() -> str:
-    return header("🎁 سرویس رایگان", "اول نوع سرویس را انتخاب کنید") + "برای تست کیفیت، یک سرویس رایگان محدود می‌توانید فعال کنید.\nاین سرویس فقط یک‌بار برای هر حساب قابل دریافت است."
+    return render_template_sync("free.intro", header("🎁 سرویس رایگان", "اول نوع سرویس را انتخاب کنید") + "برای تست کیفیت، یک سرویس رایگان محدود می‌توانید فعال کنید.\nاین سرویس فقط یک‌بار برای هر حساب قابل دریافت است.")
 
 
 def free_package_text(service_type: str) -> str:
@@ -3260,8 +3274,11 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(AccessGuardMiddleware())
     dp.callback_query.middleware(AccessGuardMiddleware())
-    # Phase 1 routers must be included before the legacy catch-all router.
+    # Staged routers must be included before the legacy catch-all router.
     dp.include_router(ticket_router)
+    dp.include_router(plans_router)
+    dp.include_router(settings_router)
+    dp.include_router(broadcast_router)
     dp.include_router(router)
     logger.info("Bot started: @%s", BOT_USERNAME)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

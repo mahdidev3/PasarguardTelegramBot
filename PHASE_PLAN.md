@@ -1,44 +1,35 @@
-# Approved development phases
+# HowTooSee Bot Phase Plan
 
-The user wants to receive and test each phase before moving to the next one.
+## Current checkpoint: Phase 2
 
-## Phase 0 — Done
+Done in Phase 0:
+- Split project structure and kept the legacy runtime stable.
 
-- Clean project architecture.
-- Keep `python main.py` as entrypoint.
-- Prepare routers/services/repositories/keyboards/utils/schemas/migrations.
-
-## Phase 1 — Current
-
-- PostgreSQL foundation.
-- Database models.
+Done in Phase 1:
+- PostgreSQL/SQLAlchemy foundation.
+- Core models.
 - Complete ticket system.
-- Numeric second confirmation for dangerous admin actions.
+- Numeric second confirmation.
+- Ticket bugfixes for category selection, media viewing, assignee labels, and duplicate last-message rendering.
 
-### Current patch inside Phase 1
+Done in Phase 2:
+- Database-backed plan catalog.
+- Admin plan management.
+- Database-backed data-addon management.
+- Legacy buy catalog sync from PostgreSQL.
+- Editable text/message templates from admin panel.
+- Media/file/video/voice broadcast campaigns.
+- URL button support for broadcasts.
+- Broadcast preview and numeric confirmation before final send.
+- Broadcast delivery recipient tracking.
 
-- Ticket category flow fixed.
-- Ticket creation guidance improved.
-- Ticket media/file viewing for admins added.
-- Ticket assignee display fixed.
-- Duplicate first ticket message fixed.
-
-## Phase 2 — Next after user approval
-
-- Full plan management from database.
-- Editable texts/messages from admin panel.
-- Broadcast system with photo/file/custom buttons.
-
-## Phase 3
-
+Next Phase 3:
 - CSV/Excel exports.
 - Full backup.
 - Full restore.
-- Usage report in backups.
+- Usage report inside backup.
 
-## Phase 4 — Future only
-
-- Pasarguard backup adapter.
-- Pasarguard restore/reconcile adapter.
-- Create/update remote services.
-- Sync data usage and remaining time.
+Future Phase 4:
+- Pasarguard backup/restore adapter.
+- Pasarguard remote service create/update/reconcile.
+- Data usage/time remaining sync.
