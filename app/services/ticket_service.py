@@ -309,6 +309,49 @@ async def set_ticket_priority(ticket_id: int, priority: str, actor_telegram_id: 
         return True
 
 
+async def count_active_ticket_attachments(ticket_id: int) -> int:
+    async with session_scope() as session:
+        result = await session.execute(
+            select(func.count(TicketAttachment.id)).where(
+                TicketAttachment.ticket_id == ticket_id,
+                TicketAttachment.is_deleted.is_(False),
+                TicketAttachment.telegram_file_id.is_not(None),
+            )
+        )
+        return int(result.scalar_one() or 0)
+
+
+async def purge_ticket_attachments(ticket_id: int, actor_telegram_id: int | None = None, reason: str = "ticket_closed") -> int:
+    """Remove access to ticket files after close.
+
+    Telegram does not provide a Bot API method to delete a file from Telegram's
+    storage. What we can and should delete is the bot-side access token/file_id
+    and mark the attachment unavailable, so admins cannot re-open it from the
+    ticket after closure. Backups made before closure may still contain the file.
+    """
+    async with session_scope() as session:
+        result = await session.execute(
+            select(TicketAttachment).where(
+                TicketAttachment.ticket_id == ticket_id,
+                TicketAttachment.is_deleted.is_(False),
+            )
+        )
+        attachments = list(result.scalars().all())
+        for item in attachments:
+            item.is_deleted = True
+            item.deleted_at = datetime.now(TEHRAN_TZ)
+            item.delete_reason = reason
+            item.telegram_file_id = None
+        await session.execute(
+            update(TicketMessage)
+            .where(TicketMessage.ticket_id == ticket_id, TicketMessage.telegram_file_id.is_not(None))
+            .values(telegram_file_id=None)
+        )
+        if attachments:
+            session.add(TicketEvent(ticket_id=ticket_id, actor_telegram_id=actor_telegram_id, event_type="attachments_deleted", details=f"count={len(attachments)}, reason={reason}"))
+        return len(attachments)
+
+
 async def ticket_stats() -> TicketStats:
     async with session_scope() as session:
         async def count_where(status: str) -> int:

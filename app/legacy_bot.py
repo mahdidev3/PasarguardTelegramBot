@@ -39,6 +39,9 @@ from app.bootstrap import bootstrap_phase1
 from app.services.text_template_service import render_template_sync
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
+from app.routers.reports import reports_router
+from app.routers.backup import backup_router
+from app.services.scheduled_backup_service import start_auto_backup_scheduler
 from app.routers.plans import plans_router
 from app.routers.settings import settings_router
 
@@ -1140,7 +1143,7 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
         [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
-        [("📊 گزارش‌ها", "adm_reports")],
+        [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
     ]
     if admin_has(admin_id, "*"):
         rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
@@ -3155,8 +3158,8 @@ async def admin_coupon_list(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, text, admin_coupon_kb())
 
 
-@router.callback_query(F.data == "adm_reports")
-async def admin_reports(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "adm_reports_legacy")
+async def admin_reports_legacy(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "reports") and not require_admin_id(callback.from_user.id, "dashboard"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
@@ -3279,9 +3282,15 @@ async def main() -> None:
     dp.include_router(plans_router)
     dp.include_router(settings_router)
     dp.include_router(broadcast_router)
+    dp.include_router(reports_router)
+    dp.include_router(backup_router)
     dp.include_router(router)
+    auto_backup_task = start_auto_backup_scheduler(bot)
     logger.info("Bot started: @%s", BOT_USERNAME)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        auto_backup_task.cancel()
 
 
 if __name__ == "__main__":

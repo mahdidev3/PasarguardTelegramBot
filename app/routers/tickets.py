@@ -45,6 +45,8 @@ from app.services.ticket_service import (
     is_admin,
     list_admin_tickets,
     list_user_tickets,
+    purge_ticket_attachments,
+    count_active_ticket_attachments,
     set_ticket_priority,
     set_ticket_status,
     ticket_stats,
@@ -405,8 +407,10 @@ async def ticket_user_close(callback: CallbackQuery) -> None:
     if not ticket or ticket.user_telegram_id != callback.from_user.id:
         await callback.answer("تیکت پیدا نشد.", show_alert=True)
         return
+    deleted_count = await purge_ticket_attachments(ticket_id, callback.from_user.id, reason="closed_by_user")
     await set_ticket_status(ticket_id, "closed", callback.from_user.id)
-    await edit_or_answer(callback, header("✅ تیکت بسته شد") + f"تیکت <code>#{ticket_id}</code> بسته شد.", ticket_home_kb())
+    extra = f"\n\n🧹 فایل‌های مربوط به این تیکت از دسترس ربات پاک شد: <b>{deleted_count}</b> مورد." if deleted_count else ""
+    await edit_or_answer(callback, header("✅ تیکت بسته شد") + f"تیکت <code>#{ticket_id}</code> بسته شد." + extra, ticket_home_kb())
 
 
 # -----------------------------
@@ -586,10 +590,11 @@ async def admin_ticket_close_ask(callback: CallbackQuery, state: FSMContext) -> 
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     ticket_id = int(callback.data.split(":", 1)[1])
+    file_count = await count_active_ticket_attachments(ticket_id)
     confirmation = await create_confirmation(
         admin_telegram_id=callback.from_user.id,
         action="ticket_close",
-        payload={"ticket_id": ticket_id},
+        payload={"ticket_id": ticket_id, "file_count": file_count},
         ttl_minutes=5,
     )
     await state.set_state(TicketStates.waiting_confirm_code)
@@ -598,6 +603,7 @@ async def admin_ticket_close_ask(callback: CallbackQuery, state: FSMContext) -> 
         callback,
         header("⚠️ تأیید دوم عددی")
         + f"برای بستن تیکت <code>#{ticket_id}</code> کد زیر را وارد کنید:\n\n"
+        + f"⚠️ با بستن تیکت، فایل‌ها/عکس‌ها/ویدیوها/ویس‌های مربوط به این تیکت از دسترس ربات پاک می‌شوند. تعداد فایل فعال: <b>{file_count}</b>\n\n"
         + f"<code>{confirmation.code}</code>\n\n"
         + "این کد تا ۵ دقیقه معتبر است.",
         confirm_cancel_kb(f"adm_ticket:{ticket_id}"),
@@ -618,10 +624,11 @@ async def admin_confirmation_finish(message: Message, state: FSMContext) -> None
         return
     if action == "ticket_close":
         ticket_id = int(payload["ticket_id"])
+        deleted_count = await purge_ticket_attachments(ticket_id, message.from_user.id, reason="closed_by_admin")
         await set_ticket_status(ticket_id, "closed", message.from_user.id)
-        await audit_log(message.from_user.id, "TICKET_CLOSE_CONFIRMED", "ticket", ticket_id)
+        await audit_log(message.from_user.id, "TICKET_CLOSE_CONFIRMED", "ticket", ticket_id, f"deleted_files={deleted_count}")
         await state.clear()
-        await message.answer(header("✅ تیکت بسته شد") + f"تیکت <code>#{ticket_id}</code> با تأیید عددی بسته شد.", reply_markup=admin_ticket_home_kb())
+        await message.answer(header("✅ تیکت بسته شد") + f"تیکت <code>#{ticket_id}</code> با تأیید عددی بسته شد.\n\n🧹 فایل‌های پاک‌شده از دسترس ربات: <b>{deleted_count}</b>", reply_markup=admin_ticket_home_kb())
         return
     await state.clear()
     await message.answer("کد تأیید ثبت شد، اما عملیات شناخته نشد.", reply_markup=admin_ticket_home_kb())
@@ -637,19 +644,24 @@ async def admin_ticket_files(callback: CallbackQuery) -> None:
     if not ticket:
         await callback.answer("تیکت پیدا نشد.", show_alert=True)
         return
-    file_messages = [m for m in sorted(ticket.messages, key=lambda item: item.id) if m.telegram_file_id]
+    file_messages = [m for m in sorted(ticket.messages, key=lambda item: item.id) if m.message_type in {"photo", "document", "video", "voice", "audio"}]
+    active_file_messages = [m for m in file_messages if m.telegram_file_id]
     text = header("📎 فایل‌های تیکت", f"#{ticket_id}")
     if not file_messages:
         text += "فایلی برای این تیکت ثبت نشده است."
         await edit_or_answer(callback, text, admin_ticket_view_kb(ticket_id))
         return
-    text += "برای دیدن فایل، روی مورد موردنظر بزنید. ربات همان فایل/عکس/ویدیو/ویس را برای شما ارسال می‌کند.\n\n"
+    if not active_file_messages:
+        text += "فایل‌های این تیکت قبلاً هنگام بستن تیکت پاک شده‌اند و دیگر در دسترس نیستند. اگر روی هر مورد بزنید، پیام عدم دسترسی نمایش داده می‌شود.\n\n"
+    else:
+        text += "برای دیدن فایل، روی مورد موردنظر بزنید. ربات همان فایل/عکس/ویدیو/ویس را برای شما ارسال می‌کند. موارد پاک‌شده دیگر قابل مشاهده نیستند.\n\n"
     for msg in file_messages[:25]:
         name = msg.file_name or msg.message_type
         body = (msg.body or "").strip()
         if len(body) > 80:
             body = body[:80] + "…"
-        text += f"• پیام <code>#{msg.id}</code> | <b>{h(msg.message_type)}</b> | {h(name)}"
+        availability = "✅ موجود" if msg.telegram_file_id else "🗑 پاک‌شده"
+        text += f"• پیام <code>#{msg.id}</code> | <b>{h(msg.message_type)}</b> | {h(name)} | {availability}"
         if body:
             text += f" — {h(body)}"
         text += "\n"
@@ -672,9 +684,12 @@ async def admin_ticket_file_send(callback: CallbackQuery) -> None:
     if not ticket:
         await callback.answer("تیکت پیدا نشد.", show_alert=True)
         return
-    msg = next((m for m in ticket.messages if m.id == message_id and m.telegram_file_id), None)
+    msg = next((m for m in ticket.messages if m.id == message_id), None)
     if not msg:
         await callback.answer("فایل پیدا نشد.", show_alert=True)
+        return
+    if not msg.telegram_file_id:
+        await callback.answer("این فایل دیگر در دسترس نیست؛ احتمالاً بعد از بسته‌شدن تیکت پاک شده است.", show_alert=True)
         return
     caption = msg.body or f"فایل تیکت #{ticket_id} | پیام #{message_id}"
     if len(caption) > 1024:
