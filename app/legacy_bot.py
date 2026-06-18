@@ -1566,6 +1566,14 @@ def service_settings_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     ])
 
 
+def freeze_confirm_kb(service_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ بله، فریز شود", f"freeze_yes:{service_id}")],
+        [("❌ منصرف شدم", f"svc_settings:{service_id}")],
+        [("🏠 منوی اصلی", "home")],
+    ])
+
+
 def delete_confirm_kb(service_id: int) -> InlineKeyboardMarkup:
     return inline([[("✅ بله، حذف شود", f"delete_yes:{service_id}")], [("❌ منصرف شدم", f"svc_settings:{service_id}")]])
 
