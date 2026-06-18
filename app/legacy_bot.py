@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
 
 from aiogram import Bot, Dispatcher, F, Router
 try:
@@ -81,7 +81,7 @@ REFERRAL_COMMISSION_PERCENT = int(os.getenv("REFERRAL_COMMISSION_PERCENT", "10")
 REFERRED_DISCOUNT_PERCENT = int(os.getenv("REFERRED_DISCOUNT_PERCENT", "5"))
 FREE_TEST_MB = int(os.getenv("FREE_TEST_MB", "150"))
 WALLET_MIN_TOPUP = int(os.getenv("WALLET_MIN_TOPUP", "50000"))
-SERVICE_NAME_PREFIX = "howtosee_"
+SERVICE_NAME_PREFIX = os.getenv("SERVICE_NAME_PREFIX", "howtosee_").strip()
 ADMIN_CHAT_IDS_RAW = os.getenv("ADMIN_CHAT_IDS", "").strip()
 
 
@@ -129,6 +129,9 @@ class DataAddon:
 # by app.services.plan_service.sync_legacy_catalog_from_db(). They must exist before
 # bootstrap runs because the staged legacy buy flow still reads them directly.
 PLANS: dict[str, Plan] = {}
+# Dynamic paid plan categories, populated from PostgreSQL.
+# key -> {title, description, sort_order, is_active}
+PLAN_CATEGORIES: dict[str, dict[str, Any]] = {}
 DATA_ADDON_PACKAGES: dict[str, DataAddon] = {}
 FREE_TEST_PLANS: dict[str, Plan] = {}
 
@@ -192,8 +195,11 @@ def make_token() -> str:
 
 
 def make_service_name(telegram_id: int) -> str:
-    suffix = str(telegram_id)[-5:]
-    return f"{SERVICE_NAME_PREFIX}{suffix}_{random.randint(10, 99)}"
+    # Keep the generated tail numeric-only. If SERVICE_NAME_PREFIX is empty,
+    # the generated service name is only digits. Pasarguard template prefix can
+    # still be controlled separately with PASARGUARD_USERNAME_PREFIX.
+    suffix = f"{str(telegram_id)[-5:]}{random.randint(10, 99)}"
+    return f"{SERVICE_NAME_PREFIX}{suffix}"[:48]
 
 
 def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
@@ -201,7 +207,7 @@ def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
     value = (raw or "").strip()
     if not value:
         return False, "", "نام نمی‌تواند خالی باشد. اگر نام دلخواه نمی‌خواهید، از دکمه ساخت خودکار استفاده کنید."
-    if value.lower().startswith(SERVICE_NAME_PREFIX):
+    if SERVICE_NAME_PREFIX and value.lower().startswith(SERVICE_NAME_PREFIX.lower()):
         return False, "", f"لطفاً بخش <code>{SERVICE_NAME_PREFIX}</code> را وارد نکنید؛ ربات خودش آن را اول نام می‌گذارد."
     if len(value) < 3 or len(value) > 20:
         return False, "", "نام باید بین ۳ تا ۲۰ کاراکتر باشد."
@@ -210,10 +216,22 @@ def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
     return True, f"{SERVICE_NAME_PREFIX}{value}", ""
 
 
+def normalize_subscription_url(raw: str | None) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        return value
+    base = (settings.pasarguard_base_url or "").rstrip("/")
+    if base:
+        return urljoin(base + "/", value.lstrip("/"))
+    return value
+
+
 def subscription_link(service: sqlite3.Row) -> str:
     try:
         if "pasarguard_subscription_url" in service.keys() and service["pasarguard_subscription_url"]:
-            return str(service["pasarguard_subscription_url"])
+            return normalize_subscription_url(str(service["pasarguard_subscription_url"]))
     except Exception:
         pass
     # Phase 4.10: when Pasarguard is enabled, production services must not expose fake/local subscription URLs.
@@ -1056,13 +1074,26 @@ def back_home_kb() -> InlineKeyboardMarkup:
     return inline([[("🏠 منوی اصلی", "home")]])
 
 
+def paid_plan_categories() -> list[tuple[str, str, str]]:
+    used = {p.category for p in PLANS.values() if not str(p.category).startswith("free:")}
+    items: list[tuple[int, str, str, str]] = []
+    for key, meta in PLAN_CATEGORIES.items():
+        if key in used and bool(meta.get("is_active", True)):
+            items.append((int(meta.get("sort_order", 100)), key, str(meta.get("title") or key), str(meta.get("description") or "")))
+    # If a plan uses a category that has no category row yet, still expose it.
+    for key in sorted(used - set(PLAN_CATEGORIES.keys())):
+        items.append((999, key, key, ""))
+    items.sort(key=lambda item: (item[0], item[1]))
+    return [(key, title, description) for _sort, key, title, description in items]
+
+
 def buy_type_kb() -> InlineKeyboardMarkup:
-    return inline([
-        [("🛍 پلن‌های آماده یک‌ماهه", "buy_cat:monthly")],
-        [("💎 پلن‌های حرفه‌ای سه‌ماهه", "buy_cat:quarterly")],
-        [("🎁 سرویس رایگان", "free_test_menu")],
-        [("🏠 منوی اصلی", "home")],
-    ])
+    rows: list[list[tuple[str, str]]] = []
+    for key, title, _description in paid_plan_categories():
+        rows.append([(title, f"buy_cat:{key}")])
+    rows.append([("🎁 سرویس رایگان", "free_test_menu")])
+    rows.append([("🏠 منوی اصلی", "home")])
+    return inline(rows)
 
 
 def plans_kb(category: str) -> InlineKeyboardMarkup:
@@ -1123,17 +1154,19 @@ def services_kb(services: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 
 def service_details_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     sid = int(service["id"])
+    keyboard: list[list[InlineKeyboardButton]] = []
+    link = subscription_link(service)
+    if link:
+        keyboard.append([InlineKeyboardButton(text="🌐 پنل اشتراکی", url=link)])
     if service["is_test"]:
-        return inline([
-            [("🔗 لینک اشتراک", f"sub_link:{sid}")],
-            [("⬅️ سرویس‌های من", "my_services"), ("🏠 منوی اصلی", "home")],
-        ])
-    return inline([
-        [("🔗 لینک اشتراک", f"sub_link:{sid}"), ("🔄 تغییر لینک", f"revoke:{sid}")],
-        [("♻️ تمدید سرویس", f"renew_warn:{sid}"), ("📈 افزایش حجم", f"addon_menu:{sid}")],
-        [("⚙️ تنظیمات اشتراک", f"svc_settings:{sid}")],
-        [("⬅️ سرویس‌های من", "my_services"), ("🏠 منوی اصلی", "home")],
-    ])
+        keyboard.append([InlineKeyboardButton(text="🔗 لینک کامل اشتراک", callback_data=f"sub_link:{sid}")])
+        keyboard.append([InlineKeyboardButton(text="⬅️ سرویس‌های من", callback_data="my_services"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="home")])
+        return InlineKeyboardMarkup(inline_keyboard=keyboard)
+    keyboard.append([InlineKeyboardButton(text="🔗 لینک کامل اشتراک", callback_data=f"sub_link:{sid}"), InlineKeyboardButton(text="🔄 تغییر لینک", callback_data=f"revoke:{sid}")])
+    keyboard.append([InlineKeyboardButton(text="♻️ تمدید سرویس", callback_data=f"renew_warn:{sid}"), InlineKeyboardButton(text="📈 افزایش حجم", callback_data=f"addon_menu:{sid}")])
+    keyboard.append([InlineKeyboardButton(text="⚙️ تنظیمات اشتراک", callback_data=f"svc_settings:{sid}")])
+    keyboard.append([InlineKeyboardButton(text="⬅️ سرویس‌های من", callback_data="my_services"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def addon_packages_kb(service_id: int) -> InlineKeyboardMarkup:
@@ -1143,11 +1176,11 @@ def addon_packages_kb(service_id: int) -> InlineKeyboardMarkup:
 
 
 def renew_type_kb(service_id: int) -> InlineKeyboardMarkup:
-    return inline([
-        [("🛍 پلن‌های آماده یک‌ماهه", f"renew_cat:{service_id}:monthly")],
-        [("💎 پلن‌های حرفه‌ای سه‌ماهه", f"renew_cat:{service_id}:quarterly")],
-        [("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")],
-    ])
+    rows: list[list[tuple[str, str]]] = []
+    for key, title, _description in paid_plan_categories():
+        rows.append([(title, f"renew_cat:{service_id}:{key}")])
+    rows.append([("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
 
 
 def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
@@ -1465,9 +1498,10 @@ def buy_text() -> str:
 
 
 def plan_category_text(category: str) -> str:
-    if category == "monthly":
-        return header("🛍 پلن‌های آماده یک‌ماهه", "فعال‌سازی سریع و ساده") + "یکی از حجم‌های زیر را انتخاب کنید:"
-    return header("💎 پلن‌های حرفه‌ای سه‌ماهه", "اقتصادی‌تر برای استفاده بلندمدت") + "یکی از پلن‌های سه‌ماهه زیر را انتخاب کنید:"
+    meta = PLAN_CATEGORIES.get(category, {})
+    title = str(meta.get("title") or category)
+    description = str(meta.get("description") or "پلن موردنظر را انتخاب کنید")
+    return header(title, description) + "یکی از پلن‌های زیر را انتخاب کنید:"
 
 
 def free_service_text() -> str:
@@ -1498,10 +1532,11 @@ def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int
             f"<i>این تخفیف چون با لینک دعوت وارد ربات شدید، روی خرید اول شما اعمال شده است.</i>\n"
         )
     text += f"✅ مبلغ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
+    prefix_rule = f"• ربات خودش ابتدای نام را <code>{SERVICE_NAME_PREFIX}</code> می‌گذارد\n" if SERVICE_NAME_PREFIX else "• پیشوند داخلی برای نام سرویس غیرفعال است\n"
     text += (
         "یک نام دلخواه برای اشتراک وارد کنید یا دکمه ساخت خودکار را بزنید.\n\n"
         f"قانون نام‌گذاری:\n"
-        f"• ربات خودش ابتدای نام را <code>{SERVICE_NAME_PREFIX}</code> می‌گذارد\n"
+        + prefix_rule +
         "• فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است\n"
         "• طول نام دلخواه باید بین ۳ تا ۲۰ کاراکتر باشد"
     )
@@ -1603,8 +1638,8 @@ def service_text(service: sqlite3.Row) -> str:
     status_label = status_map.get(str(service["status"] or ""), h(service["status"]))
     type_label = "\n🎁 نوع: <b>سرویس رایگان</b>" if service["is_test"] else ""
     link_block = (
-        f"🔗 لینک اشتراک:\n<code>{h(link)}</code>\n\n"
-        f'📊 برای بررسی وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده، از این بخش استفاده کنید:\n<a href="{h(link)}">پنل کاربری اشتراک</a> ❗️\n\n'
+        f"🔗 لینک کامل اشتراک:\n<code>{h(link)}</code>\n\n"
+        f'📊 برای بررسی وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده، از این بخش استفاده کنید:\n<a href="{h(link)}">پنل اشتراکی</a> ❗️\n\n'
         if link else
         "🔗 لینک اشتراک:\n<code>در انتظار دریافت لینک واقعی Pasarguard</code>\n\n"
     )
@@ -1630,10 +1665,10 @@ def sub_link_text(service: sqlite3.Row) -> str:
     if not link:
         return header("🔗 لینک اشتراک", service["name"]) + "هنوز لینک واقعی Pasarguard برای این سرویس ثبت نشده است. لطفاً از جزئیات سرویس گزینه sync را بزنید یا با پشتیبانی تماس بگیرید."
     return (
-        header("🔗 لینک اشتراک", service["name"])
+        header("🔗 لینک کامل اشتراک", service["name"])
         + f"<code>{h(link)}</code>\n\n"
         + "برای کپی کردن، روی لینک بالا لمس کنید.\n\n"
-        + f'📊 وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده را می‌توانید از اینجا ببینید:\n<a href="{h(link)}">پنل کاربری اشتراک</a> ❗️'
+        + f'📊 وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده را می‌توانید از اینجا ببینید:\n<a href="{h(link)}">پنل اشتراکی</a> ❗️'
     )
 
 
@@ -2399,7 +2434,9 @@ async def rename_start(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(RenameStates.waiting_new_name)
     await state.update_data(service_id=service_id)
-    await edit_or_answer(callback, header("✏️ تغییر نام اشتراک", service["name"]) + f"نام جدید را بدون <code>{SERVICE_NAME_PREFIX}</code> وارد کنید.\n\nفقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.\nطول نام: ۳ تا ۲۰ کاراکتر", inline([[("❌ لغو", f"svc_settings:{service_id}"), ("🏠 منوی اصلی", "home")]]))
+    prefix_note = f"نام جدید را بدون <code>{SERVICE_NAME_PREFIX}</code> وارد کنید." if SERVICE_NAME_PREFIX else "نام جدید را وارد کنید."
+    await edit_or_answer(callback, header("✏️ تغییر نام اشتراک", service["name"]) + f"{prefix_note}\n\nفقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.\nطول نام: ۳ تا ۲۰ کاراکتر", inline([[("❌ لغو", f"svc_settings:{service_id}"), ("🏠 منوی اصلی", "home")]]))
+
 
 
 @router.message(RenameStates.waiting_new_name)
@@ -2530,7 +2567,7 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
     if not test_plan:
         await callback.answer("پکیج رایگان پیدا نشد.", show_alert=True)
         return
-    service_name = f"{SERVICE_NAME_PREFIX}free_{str(telegram_id)[-5:]}"[:32]
+    service_name = make_service_name(telegram_id)
     service_id = db.create_service(telegram_id, service_name, test_plan, 0, is_test=True, status="provisioning" if settings.pasarguard_enabled else "active")
     ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=None, is_test=True, paid_amount=0)
     if not ok:

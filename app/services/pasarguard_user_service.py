@@ -13,6 +13,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
+from urllib.parse import urljoin
 
 from sqlalchemy import select, update
 
@@ -24,6 +25,18 @@ from app.services.pasarguard_template_service import managed_marker, sync_plan_t
 
 BYTES_PER_GB = 1024 * 1024 * 1024
 BYTES_PER_MB = 1024 * 1024
+
+
+def normalize_subscription_url(raw: Any) -> str | None:
+    value = str(raw or "").strip()
+    if not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        return value
+    base = (settings.pasarguard_base_url or "").rstrip("/")
+    if base:
+        return urljoin(base + "/", value.lstrip("/"))
+    return value
 
 
 @dataclass
@@ -106,14 +119,13 @@ def _parse_remote_expire(value: Any) -> datetime | None:
 
 def sanitize_remote_username(value: str, telegram_id: int, service_id: int) -> str:
     raw = (value or "").strip().lower()
-    raw = re.sub(r"[^a-z0-9_\-]+", "_", raw).strip("_")
+    raw = re.sub(r"[^a-z0-9]+", "", raw)
     if not raw:
-        raw = f"hts_{telegram_id}_{service_id}"
-    if not raw.startswith("hts_") and not raw.startswith("howtosee_"):
-        raw = f"hts_{raw}"
-    # keep enough uniqueness at the end
+        raw = f"{telegram_id % 100000}{service_id}"
+    # For auto-generated numeric names, keep the tail digits-only.
+    # If an operator sets PASARGUARD_USERNAME_PREFIX, the panel may still add it via template.
     if len(raw) > 48:
-        raw = f"{raw[:32]}_{telegram_id % 100000}_{service_id}"
+        raw = f"{raw[:32]}{telegram_id % 100000}{service_id}"
     return raw[:64]
 
 
@@ -191,7 +203,7 @@ async def _upsert_remote_user_mapping(
     error: str | None = None,
 ) -> None:
     rid = _remote_id(remote)
-    subscription_url = str((remote or {}).get("subscription_url") or "") or None
+    subscription_url = normalize_subscription_url((remote or {}).get("subscription_url"))
     async with session_scope() as session:
         item = (await session.execute(select(PasarguardUser).where(PasarguardUser.service_id == service_id))).scalar_one_or_none()
         if item is None:
@@ -240,7 +252,7 @@ async def ensure_template_for_plan(plan_key: str) -> tuple[int | None, CatalogPl
 def _sqlite_update_remote(sqlite_db: Any, service_id: int, *, remote: dict[str, Any] | None = None, username: str | None = None, template_id: int | None = None, status: str = "synced", error: str | None = None) -> None:
     remote = remote or {}
     remote_user_id = _remote_id(remote)
-    subscription_url = str(remote.get("subscription_url") or "") or None
+    subscription_url = normalize_subscription_url(remote.get("subscription_url"))
     if username is None:
         username = str(remote.get("username") or "") or None
     # Keep this SQL local to legacy sqlite; PostgreSQL mappings are handled above.
@@ -302,7 +314,7 @@ async def create_remote_user_for_service(sqlite_db: Any, service: Mapping[str, A
         actual_username = str(remote.get("username") or username)
         _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=actual_username, template_id=template_id, status="synced")
         await _upsert_remote_user_mapping(service_id=service_id, telegram_id=telegram_id, plan_key=plan_key, username=actual_username, template_id=template_id, remote=remote, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message="user واقعی از template ساخته شد.", remote_username=actual_username, remote_user_id=_remote_id(remote), subscription_url=remote.get("subscription_url"), remote_state=remote)
+        result = RemoteServiceResult(True, action, applied=True, message="user واقعی از template ساخته شد.", remote_username=actual_username, remote_user_id=_remote_id(remote), subscription_url=normalize_subscription_url(remote.get("subscription_url")), remote_state=remote)
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=plan_key)
     except Exception as exc:
         msg = str(exc)
@@ -334,7 +346,7 @@ async def apply_template_to_remote_user(sqlite_db: Any, service: Mapping[str, An
         actual_username = str(remote.get("username") or username)
         _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=actual_username, template_id=template_id, status="synced")
         await _upsert_remote_user_mapping(service_id=service_id, telegram_id=telegram_id, plan_key=plan_key, username=actual_username, template_id=template_id, remote=remote, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message="remote user با template جدید بروزرسانی شد.", remote_username=actual_username, remote_user_id=_remote_id(remote), subscription_url=remote.get("subscription_url"), remote_state=remote)
+        result = RemoteServiceResult(True, action, applied=True, message="remote user با template جدید بروزرسانی شد.", remote_username=actual_username, remote_user_id=_remote_id(remote), subscription_url=normalize_subscription_url(remote.get("subscription_url")), remote_state=remote)
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=plan_key)
     except Exception as exc:
         result = RemoteServiceResult(False, action, error=str(exc), remote_username=username)
@@ -360,7 +372,7 @@ async def update_remote_user_limit(sqlite_db: Any, service: Mapping[str, Any]) -
         async with PasarguardClient() as client:
             remote = await client.update_user_by_username(username, {"data_limit": total_bytes})
         _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=username, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message="حجم remote user بروزرسانی شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=remote.get("subscription_url"), remote_state=remote)
+        result = RemoteServiceResult(True, action, applied=True, message="حجم remote user بروزرسانی شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=normalize_subscription_url(remote.get("subscription_url")), remote_state=remote)
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=str(_row_get(service, "plan_key", "")))
     except Exception as exc:
         result = RemoteServiceResult(False, action, error=str(exc), remote_username=username)
@@ -386,7 +398,7 @@ async def set_remote_user_status(sqlite_db: Any, service: Mapping[str, Any], sta
         async with PasarguardClient() as client:
             remote = await client.update_user_by_username(username, {"status": remote_status})
         _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=username, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message=f"وضعیت remote user روی {remote_status} تنظیم شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=remote.get("subscription_url"), remote_state=remote)
+        result = RemoteServiceResult(True, action, applied=True, message=f"وضعیت remote user روی {remote_status} تنظیم شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=normalize_subscription_url(remote.get("subscription_url")), remote_state=remote)
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=str(_row_get(service, "plan_key", "")))
     except Exception as exc:
         result = RemoteServiceResult(False, action, error=str(exc), remote_username=username)
@@ -443,7 +455,7 @@ async def revoke_remote_subscription(sqlite_db: Any, service: Mapping[str, Any])
         if not isinstance(user, dict):
             user = {}
         _sqlite_update_remote(sqlite_db, service_id, remote=user, username=username, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message="لینک remote user تغییر کرد.", remote_username=username, remote_user_id=_remote_id(user), subscription_url=user.get("subscription_url"), remote_state=user)
+        result = RemoteServiceResult(True, action, applied=True, message="لینک remote user تغییر کرد.", remote_username=username, remote_user_id=_remote_id(user), subscription_url=normalize_subscription_url(user.get("subscription_url")), remote_state=user)
         await _log_event(job_id, service_id, action, str(_remote_id(user) or ""), None, user, plan_key=str(_row_get(service, "plan_key", "")))
     except Exception as exc:
         result = RemoteServiceResult(False, action, error=str(exc), remote_username=username)
@@ -474,7 +486,7 @@ async def sync_remote_user_from_local(sqlite_db: Any, service: Mapping[str, Any]
         async with PasarguardClient() as client:
             remote = await client.update_user_by_username(username, payload)
         _sqlite_update_remote(sqlite_db, service_id, remote=remote, username=username, status="synced")
-        result = RemoteServiceResult(True, action, applied=True, message="حجم/زمان/وضعیت remote user با سرویس داخلی sync شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=remote.get("subscription_url"), remote_state=remote)
+        result = RemoteServiceResult(True, action, applied=True, message="حجم/زمان/وضعیت remote user با سرویس داخلی sync شد.", remote_username=username, remote_user_id=_remote_id(remote), subscription_url=normalize_subscription_url(remote.get("subscription_url")), remote_state=remote)
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=str(_row_get(service, "plan_key", "")))
     except Exception as exc:
         result = RemoteServiceResult(False, action, error=str(exc), remote_username=username)
@@ -577,7 +589,7 @@ def _service_panel_diffs(service: Mapping[str, Any], remote: dict[str, Any]) -> 
     if remote_status and local_status and remote_status != local_status:
         changes.append(f"وضعیت: بات {local_status} → پنل {remote_status}")
 
-    remote_url = str(remote.get("subscription_url") or "")
+    remote_url = normalize_subscription_url(remote.get("subscription_url")) or ""
     local_url = str(_row_get(service, "pasarguard_subscription_url") or "")
     if remote_url and remote_url != local_url:
         changes.append("لینک اشتراک از پنل بروزرسانی شد")
@@ -667,7 +679,7 @@ async def sync_remote_user_from_panel(sqlite_db: Any, service: Mapping[str, Any]
             changes=changes,
             remote_username=actual_username,
             remote_user_id=_remote_id(remote),
-            subscription_url=remote.get("subscription_url"),
+            subscription_url=normalize_subscription_url(remote.get("subscription_url")),
             remote_state=remote,
         )
         await _log_event(job_id, service_id, action, str(_remote_id(remote) or ""), None, remote, plan_key=plan_key)

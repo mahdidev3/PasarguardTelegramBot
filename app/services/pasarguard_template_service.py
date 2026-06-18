@@ -71,10 +71,10 @@ def template_name_for_plan(plan: CatalogPlan) -> str:
 
 
 def username_suffix_for_plan(plan: CatalogPlan) -> str:
-    base = f"_{normalize_key(plan.key)}"
-    custom = settings.pasarguard_username_suffix or ""
-    suffix = f"{base}{custom}"
-    return suffix[:20]
+    # Do not append the plan key (for example _m_10) to Pasarguard usernames.
+    # The plan/template relation is stored in the bot DB and user note instead.
+    # Operators can still set a global suffix explicitly with PASARGUARD_USERNAME_SUFFIX.
+    return (settings.pasarguard_username_suffix or "")[:20]
 
 
 def desired_payload_for_plan(plan: CatalogPlan) -> dict[str, Any]:

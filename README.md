@@ -31,3 +31,27 @@ Payment gateways/card-to-card receipt flows are intentionally still demo/manual 
 - Fixed legacy catalog bridge globals (`PLANS`, `FREE_TEST_PLANS`, `DATA_ADDON_PACKAGES`, `FREE_SERVICE_TYPES`) that were accidentally removed during Phase 4.10 user-flow refactor.
 - The buy plan/category flow can now read the DB-synced plan dictionaries again after bootstrap.
 
+
+## Phase 4.10.1 — Subscription Link, Username, Dynamic Categories Hotfix
+
+This patch fixes three production user-flow issues before continuing:
+
+- Subscription URLs returned by Pasarguard are normalized to a full URL using `PASARGUARD_BASE_URL` when the API returns a relative path such as `/sub/...`.
+- Service details and the subscription page now expose a clickable `پنل اشتراکی` link/button that points to the full subscription URL.
+- Pasarguard templates no longer append the plan key to usernames, so new users will not get suffixes like `_m_10`. Operators can still set a global suffix with `PASARGUARD_USERNAME_SUFFIX`, but the default is empty.
+- Auto-generated service-name tails are numeric-only. `SERVICE_NAME_PREFIX` is now read from env, so it can be set to an empty string if fully numeric service names are desired.
+- Plan categories are now dynamic. Admins can create/edit/enable/disable categories from the plan management panel, and user buy/renew menus are generated from database categories instead of hardcoded `monthly`/`quarterly` buttons.
+
+Recommended env for no extra username prefixes/suffixes:
+
+```env
+SERVICE_NAME_PREFIX=
+PASARGUARD_USERNAME_PREFIX=
+PASARGUARD_USERNAME_SUFFIX=
+```
+
+After changing template username prefix/suffix rules, run:
+
+`👑 پنل مدیریت → 🔌 Pasarguard → 🧪 Dry-run سینک Templateها`
+
+Then apply template sync after reviewing the diff.

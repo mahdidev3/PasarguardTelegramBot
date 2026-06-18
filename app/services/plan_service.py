@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any
 
 from sqlalchemy import desc, select
@@ -114,6 +115,43 @@ async def list_categories(active_only: bool = True) -> list[PlanCategory]:
         return list((await session.execute(stmt)).scalars().all())
 
 
+async def upsert_category_from_line(line: str, admin_id: int) -> tuple[bool, str]:
+    """Parse and save a category line: key | title | description | sort_order | active."""
+    parts = [p.strip() for p in (line or "").split("|")]
+    if len(parts) < 4:
+        return False, "فرمت اشتباه است. نمونه: key | title | description | sort_order | active"
+    key, title, description, sort_s = parts[:4]
+    active_s = parts[4] if len(parts) >= 5 else "1"
+    if not re.fullmatch(r"[A-Za-z0-9_\-:]{2,80}", key or ""):
+        return False, "کلید دسته فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره، آندرلاین یا : باشد."
+    if not title:
+        return False, "عنوان دسته نمی‌تواند خالی باشد."
+    try:
+        sort_order = int(sort_s.replace(",", ""))
+    except ValueError:
+        return False, "sort_order باید عدد باشد."
+    is_active = str(active_s).strip().lower() not in {"0", "false", "no", "off", "غیرفعال"}
+    async with session_scope() as session:
+        item = (await session.execute(select(PlanCategory).where(PlanCategory.key == key))).scalar_one_or_none()
+        if item is None:
+            item = PlanCategory(key=key)
+            session.add(item)
+        item.title = title
+        item.description = description
+        item.sort_order = sort_order
+        item.is_active = is_active
+    return True, f"دسته <code>{key}</code> ذخیره شد."
+
+
+async def set_category_active(category_key: str, active: bool, admin_id: int) -> bool:
+    async with session_scope() as session:
+        item = (await session.execute(select(PlanCategory).where(PlanCategory.key == category_key))).scalar_one_or_none()
+        if item is None:
+            return False
+        item.is_active = active
+        return True
+
+
 async def list_plans(active_only: bool = False) -> list[CatalogPlan]:
     async with session_scope() as session:
         stmt = select(CatalogPlan).order_by(CatalogPlan.category, CatalogPlan.sort_order, CatalogPlan.id)
@@ -165,6 +203,9 @@ async def upsert_plan_from_line(line: str, admin_id: int) -> tuple[bool, str]:
         plan.category = category
         plan.badge = badge
         plan.is_active = True
+        existing_category = (await session.execute(select(PlanCategory).where(PlanCategory.key == category))).scalar_one_or_none()
+        if existing_category is None:
+            session.add(PlanCategory(key=category, title=category, description="", sort_order=100, is_active=True))
         plan.updated_by = admin_id
         if snapshot:
             session.add(CatalogPlanVersion(plan_key=key, snapshot_json=snapshot, changed_by=admin_id, change_note="admin upsert"))
@@ -228,8 +269,18 @@ async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
     """Push DB catalog into the old legacy dictionaries until all buy flow is refactored."""
     plans = await list_plans(active_only=True)
     addons = await list_addons(active_only=True)
+    categories = await list_categories(active_only=True)
     async with session_scope() as session:
         free_plans = list((await session.execute(select(FreeTestPlanDB).where(FreeTestPlanDB.is_active.is_(True)).order_by(FreeTestPlanDB.sort_order))).scalars().all())
+    if hasattr(legacy_module, "PLAN_CATEGORIES"):
+        legacy_module.PLAN_CATEGORIES.clear()
+        for c in categories:
+            legacy_module.PLAN_CATEGORIES[c.key] = {
+                "title": c.title,
+                "description": c.description or "",
+                "sort_order": int(c.sort_order or 100),
+                "is_active": bool(c.is_active),
+            }
     if hasattr(legacy_module, "Plan"):
         legacy_module.PLANS.clear()
         for p in plans:

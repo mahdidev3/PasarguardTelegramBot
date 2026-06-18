@@ -35,3 +35,11 @@
 - Fixed legacy catalog bridge globals (`PLANS`, `FREE_TEST_PLANS`, `DATA_ADDON_PACKAGES`, `FREE_SERVICE_TYPES`) that were accidentally removed during Phase 4.10 user-flow refactor.
 - The buy plan/category flow can now read the DB-synced plan dictionaries again after bootstrap.
 
+
+### Phase 4.10.1 — User-flow polish before next hardening step
+
+- Normalize Pasarguard relative subscription paths to full URLs.
+- Make `پنل اشتراکی` clickable in service detail/subscription views.
+- Remove plan-key username suffix from Pasarguard templates.
+- Make generated service-name tail numeric-only and env-controlled.
+- Add dynamic plan category management to admin panel and user buy/renew menus.

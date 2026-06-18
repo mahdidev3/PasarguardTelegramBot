@@ -13,10 +13,13 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKe
 from app.services.admin_audit_service import audit_log
 from app.services.plan_service import (
     list_addons,
+    list_categories,
     list_plans,
+    set_category_active,
     set_plan_active,
     sync_legacy_catalog_from_db,
     upsert_addon_from_line,
+    upsert_category_from_line,
     upsert_plan_from_line,
 )
 from app.services.ticket_service import is_admin
@@ -27,6 +30,7 @@ plans_router = Router(name="phase2_plans")
 class PlanStates(StatesGroup):
     waiting_plan_line = State()
     waiting_addon_line = State()
+    waiting_category_line = State()
 
 
 def h(value: Any) -> str:
@@ -45,6 +49,7 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def plans_home_kb() -> InlineKeyboardMarkup:
     return inline([
         [("📋 لیست پلن‌ها", "adm_plans_list"), ("➕ ساخت/ویرایش پلن", "adm_plans_add")],
+        [("🗂 دسته‌بندی‌ها", "adm_categories_list"), ("➕ ساخت/ویرایش دسته", "adm_categories_add")],
         [("📈 بسته‌های حجم", "adm_addons_list"), ("➕ ساخت/ویرایش حجم", "adm_addons_add")],
         [("🔄 همگام‌سازی با خرید", "adm_plans_sync")],
         [("👑 منوی ادمین", "adm_home")],
@@ -66,6 +71,24 @@ def plan_view_kb(key: str, active: bool) -> InlineKeyboardMarkup:
         [toggle],
         [("✏️ ویرایش با خط جدید", "adm_plans_add")],
         [("⬅️ لیست پلن‌ها", "adm_plans_list"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def category_list_kb(categories: list[Any]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for c in categories[:40]:
+        icon = "✅" if c.is_active else "⛔"
+        rows.append([(f"{icon} {c.key} | {c.title}", f"adm_category_view:{c.key}")])
+    rows.append([("⬅️ بازگشت", "adm_plans"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def category_view_kb(key: str, active: bool) -> InlineKeyboardMarkup:
+    toggle = ("⛔ غیرفعال کردن", f"adm_category_active:{key}:0") if active else ("✅ فعال کردن", f"adm_category_active:{key}:1")
+    return inline([
+        [toggle],
+        [("✏️ ویرایش با خط جدید", "adm_categories_add")],
+        [("⬅️ لیست دسته‌ها", "adm_categories_list"), ("👑 منوی ادمین", "adm_home")],
     ])
 
 
@@ -168,6 +191,86 @@ async def admin_plans_add_finish(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await audit_log(message.from_user.id, "PLAN_UPSERT", "plan", None, message.text)
+    await sync_legacy()
+    await message.answer(header("✅ ذخیره شد") + result, reply_markup=plans_home_kb())
+
+
+@plans_router.callback_query(F.data == "adm_categories_list")
+async def admin_categories_list(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    categories = await list_categories(active_only=False)
+    plans = await list_plans(active_only=False)
+    counts: dict[str, int] = {}
+    for p in plans:
+        counts[p.category] = counts.get(p.category, 0) + 1
+    text = header("🗂 دسته‌بندی‌های پلن")
+    if not categories:
+        text += "هنوز دسته‌ای در دیتابیس نیست."
+    else:
+        for c in categories:
+            icon = "✅" if c.is_active else "⛔"
+            text += f"{icon} <code>{h(c.key)}</code> | <b>{h(c.title)}</b> | sort={c.sort_order} | پلن‌ها: {counts.get(c.key, 0)}\n"
+            if c.description:
+                text += f"   <i>{h(c.description)}</i>\n"
+    await edit_or_answer(callback, text, category_list_kb(categories))
+
+
+@plans_router.callback_query(F.data.startswith("adm_category_view:"))
+async def admin_category_view(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    cats = [c for c in await list_categories(active_only=False) if c.key == key]
+    if not cats:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    c = cats[0]
+    text = header("🗂 جزئیات دسته", c.key)
+    text += f"عنوان: <b>{h(c.title)}</b>\nتوضیح: <b>{h(c.description)}</b>\nترتیب: <code>{c.sort_order}</code>\nوضعیت: <b>{'فعال' if c.is_active else 'غیرفعال'}</b>"
+    await edit_or_answer(callback, text, category_view_kb(c.key, bool(c.is_active)))
+
+
+@plans_router.callback_query(F.data.startswith("adm_category_active:"))
+async def admin_category_active(callback: CallbackQuery) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, key, active_s = callback.data.split(":")
+    ok = await set_category_active(key, active_s == "1", callback.from_user.id)
+    if ok:
+        await audit_log(callback.from_user.id, "CATEGORY_SET_ACTIVE", "plan_category", key, f"active={active_s}")
+        await sync_legacy()
+        await callback.answer("وضعیت دسته تغییر کرد.", show_alert=True)
+    else:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+    await admin_categories_list(callback)
+
+
+@plans_router.callback_query(F.data == "adm_categories_add")
+async def admin_categories_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not await is_admin(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(PlanStates.waiting_category_line)
+    text = header("➕ ساخت/ویرایش دسته‌بندی پلن")
+    text += "فرمت را دقیقاً این‌طور بفرستید:\n\n<code>key | title | description | sort_order | active</code>\n\nنمونه:\n<code>semiannual | 🏆 پلن‌های شش‌ماهه | اقتصادی برای استفاده طولانی | 30 | 1</code>"
+    await edit_or_answer(callback, text, inline([[("❌ لغو", "adm_plans"), ("👑 منوی ادمین", "adm_home")]]))
+
+
+@plans_router.message(PlanStates.waiting_category_line)
+async def admin_categories_add_finish(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not await is_admin(message.from_user.id):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, result = await upsert_category_from_line(message.text or "", message.from_user.id)
+    if not ok:
+        await message.answer("❌ " + result)
+        return
+    await state.clear()
+    await audit_log(message.from_user.id, "CATEGORY_UPSERT", "plan_category", None, message.text)
     await sync_legacy()
     await message.answer(header("✅ ذخیره شد") + result, reply_markup=plans_home_kb())
 
