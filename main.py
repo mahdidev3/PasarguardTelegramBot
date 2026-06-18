@@ -15,6 +15,10 @@ from typing import Any, Optional
 from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F, Router
+try:
+    from aiogram import BaseMiddleware
+except Exception:  # aiogram fallback
+    from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -52,6 +56,19 @@ REFERRED_DISCOUNT_PERCENT = int(os.getenv("REFERRED_DISCOUNT_PERCENT", "5"))
 FREE_TEST_MB = int(os.getenv("FREE_TEST_MB", "150"))
 WALLET_MIN_TOPUP = int(os.getenv("WALLET_MIN_TOPUP", "50000"))
 SERVICE_NAME_PREFIX = "howtosee_"
+ADMIN_CHAT_IDS_RAW = os.getenv("ADMIN_CHAT_IDS", "").strip()
+
+
+def parse_id_set(value: str) -> set[int]:
+    ids: set[int] = set()
+    for part in re.split(r"[,\s]+", value or ""):
+        part = normalize_digits(part.strip()) if "normalize_digits" in globals() else part.strip()
+        if part.lstrip("-").isdigit():
+            ids.add(int(part))
+    return ids
+
+
+BOOTSTRAP_SUPER_ADMIN_IDS = parse_id_set(ADMIN_CHAT_IDS_RAW)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and set your bot token.")
@@ -479,7 +496,421 @@ class DB:
             conn.commit()
 
 
+# -----------------------------
+# Admin / management persistence
+# -----------------------------
+def ensure_admin_schema() -> None:
+    """Create admin tables and migrate older bot.db files safely."""
+    with closing(db.connect()) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS admins (
+                telegram_id INTEGER PRIMARY KEY,
+                role TEXT NOT NULL DEFAULT 'support',
+                added_by INTEGER,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_telegram_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                target_type TEXT,
+                target_id TEXT,
+                details TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS coupons (
+                code TEXT PRIMARY KEY,
+                percent INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'all',
+                target_user_ids TEXT,
+                usage_limit INTEGER,
+                per_user_limit INTEGER NOT NULL DEFAULT 1,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                stack_with_referral INTEGER NOT NULL DEFAULT 1,
+                max_discount_percent INTEGER NOT NULL DEFAULT 40,
+                active INTEGER NOT NULL DEFAULT 1,
+                expires_at TEXT,
+                created_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS coupon_usages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL,
+                discount_amount INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(code, order_id)
+            );
+            """
+        )
+        for table, column, ddl in [
+            ("users", "status", "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+            ("users", "locked_reason", "ALTER TABLE users ADD COLUMN locked_reason TEXT"),
+            ("users", "locked_notice", "ALTER TABLE users ADD COLUMN locked_notice TEXT"),
+            ("users", "admin_note", "ALTER TABLE users ADD COLUMN admin_note TEXT"),
+            ("users", "deleted_at", "ALTER TABLE users ADD COLUMN deleted_at TEXT"),
+            ("services", "admin_note", "ALTER TABLE services ADD COLUMN admin_note TEXT"),
+            ("services", "locked_reason", "ALTER TABLE services ADD COLUMN locked_reason TEXT"),
+            ("orders", "coupon_code", "ALTER TABLE orders ADD COLUMN coupon_code TEXT"),
+            ("orders", "coupon_discount", "ALTER TABLE orders ADD COLUMN coupon_discount INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT"),
+        ]:
+            cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if column not in cols:
+                conn.execute(ddl)
+        for admin_id in BOOTSTRAP_SUPER_ADMIN_IDS:
+            conn.execute(
+                """
+                INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
+                VALUES (?, 'super', NULL, 1, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET role = 'super', is_active = 1
+                """,
+                (admin_id, now_iso()),
+            )
+        defaults = {
+            "bot_locked": "0",
+            "bot_lock_message": "🛠 ربات موقتاً در حال بروزرسانی است. لطفاً کمی بعد دوباره تلاش کنید.",
+            "broadcast_enabled": "1",
+            "free_test_enabled": "1",
+            "coupon_enabled": "1",
+            "purchase_enabled": "1",
+        }
+        for key, value in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now_iso()),
+            )
+        for code, coupon in DEMO_COUPONS.items():
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO coupons
+                (code, percent, title, scope, target_user_ids, usage_limit, per_user_limit, used_count,
+                 stack_with_referral, max_discount_percent, active, expires_at, created_by, created_at)
+                VALUES (?, ?, ?, 'all', NULL, NULL, 1, 0, 1, 40, 1, NULL, NULL, ?)
+                """,
+                (code, coupon.percent, coupon.title, now_iso()),
+            )
+        conn.commit()
+
+
+def setting_get(key: str, default: str = "") -> str:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+
+
+def setting_set(key: str, value: str) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, value, now_iso()),
+        )
+        conn.commit()
+
+
+ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
+    "super": {"*"},
+    "sales": {"dashboard", "users", "services", "orders", "wallet", "manual_service", "broadcast"},
+    "support": {"dashboard", "users", "services", "orders", "direct_message"},
+    "marketing": {"dashboard", "broadcast", "coupons", "reports"},
+}
+
+
+def admin_role(telegram_id: int) -> Optional[str]:
+    if telegram_id in BOOTSTRAP_SUPER_ADMIN_IDS:
+        return "super"
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT role FROM admins WHERE telegram_id = ? AND is_active = 1", (telegram_id,)).fetchone()
+        return str(row["role"]) if row else None
+
+
+def is_admin_id(telegram_id: Optional[int]) -> bool:
+    return bool(telegram_id and admin_role(int(telegram_id)))
+
+
+def admin_has(telegram_id: int, permission: str) -> bool:
+    role = admin_role(telegram_id)
+    if not role:
+        return False
+    perms = ADMIN_ROLE_PERMISSIONS.get(role, set())
+    return "*" in perms or permission in perms
+
+
+def require_admin_id(telegram_id: int, permission: str = "dashboard") -> bool:
+    return is_admin_id(telegram_id) and admin_has(telegram_id, permission)
+
+
+def admin_log(admin_id: int, action: str, target_type: str = "", target_id: Any = "", details: str = "") -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "INSERT INTO admin_logs (admin_telegram_id, action, target_type, target_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (admin_id, action, target_type, str(target_id or ""), details, now_iso()),
+        )
+        conn.commit()
+
+
+def row_has(row: Optional[sqlite3.Row], key: str) -> bool:
+    return bool(row is not None and key in row.keys())
+
+
+def db_count(query: str, params: tuple[Any, ...] = ()) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute(query, params).fetchone()
+        if row is None:
+            return 0
+        return int(row[0])
+
+
+def db_sum(query: str, params: tuple[Any, ...] = ()) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute(query, params).fetchone()
+        if row is None or row[0] is None:
+            return 0
+        return int(row[0])
+
+
+def find_users_admin(query: str, limit: int = 8) -> list[sqlite3.Row]:
+    q = normalize_digits((query or "").strip()).lstrip("@")
+    with closing(db.connect()) as conn:
+        if q.isdigit():
+            return list(conn.execute("SELECT * FROM users WHERE telegram_id = ? LIMIT ?", (int(q), limit)).fetchall())
+        like = f"%{q}%"
+        return list(conn.execute("SELECT * FROM users WHERE username LIKE ? OR first_name LIKE ? ORDER BY id DESC LIMIT ?", (like, like, limit)).fetchall())
+
+
+def get_user_admin(telegram_id: int) -> Optional[sqlite3.Row]:
+    return db.get_user(telegram_id)
+
+
+def update_user_status(telegram_id: int, status: str, reason: str = "", notice: str = "") -> None:
+    with closing(db.connect()) as conn:
+        deleted_at = now_iso() if status == "deleted" else None
+        conn.execute(
+            "UPDATE users SET status = ?, locked_reason = ?, locked_notice = ?, deleted_at = COALESCE(?, deleted_at) WHERE telegram_id = ?",
+            (status, reason or None, notice or None, deleted_at, telegram_id),
+        )
+        conn.commit()
+
+
+def set_user_note(telegram_id: int, note: str) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE users SET admin_note = ? WHERE telegram_id = ?", (note, telegram_id))
+        conn.commit()
+
+
+def list_all_users(limit: int = 100000, only_active: bool = False, buyers_only: bool = False, no_purchase: bool = False) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        where = ["COALESCE(status, 'active') != 'deleted'"]
+        if only_active:
+            where.append("COALESCE(status, 'active') = 'active'")
+        if buyers_only:
+            where.append("first_purchase_done = 1")
+        if no_purchase:
+            where.append("first_purchase_done = 0")
+        sql = "SELECT * FROM users WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
+        return list(conn.execute(sql, (limit,)).fetchall())
+
+
+def get_order_any(order_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+
+
+def list_orders_admin(limit: int = 20, status: Optional[str] = None) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        if status:
+            return list(conn.execute("SELECT * FROM orders WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)).fetchall())
+        return list(conn.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,)).fetchall())
+
+
+def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید دستی ادمین") -> Optional[int]:
+    order = get_order_any(order_id)
+    if not order or order["status"] == "paid":
+        return None
+    telegram_id = int(order["user_telegram_id"])
+    plan_key = str(order["plan_key"])
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    service_id: Optional[int] = None
+    if plan_key in PLANS:
+        service_name = make_service_name(telegram_id)
+        service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False)
+    elif plan_key.startswith("addon:"):
+        _, package_key, service_id_s = plan_key.split(":")
+        pkg = DATA_ADDON_PACKAGES.get(package_key)
+        service_id = int(service_id_s)
+        if pkg:
+            db.add_data_to_service(service_id, telegram_id, pkg.data_gb)
+    elif plan_key.startswith("renew:"):
+        _, pkey, service_id_s = plan_key.split(":")
+        service_id = int(service_id_s)
+        if pkey in PLANS:
+            db.renew_service(service_id, telegram_id, PLANS[pkey], payable)
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, service_id = COALESCE(?, service_id) WHERE id = ?", (method, service_id, order_id))
+        conn.commit()
+    finalize_coupon_usage(order_id, telegram_id)
+    admin_log(admin_id, "ORDER_MARK_PAID", "order", order_id, f"method={method}")
+    return service_id
+
+
+def admin_update_service_status(service_id: int, status: str, reason: str = "") -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE services SET status = ?, locked_reason = ? WHERE id = ?", (status, reason or None, service_id))
+        conn.commit()
+
+
+def admin_add_days_to_service(service_id: int, days: int) -> None:
+    service = db.get_service(service_id)
+    if not service:
+        return
+    expires = datetime.fromisoformat(service["expires_at"])
+    base = max(expires, datetime.now(TEHRAN_TZ))
+    new_expires = base + timedelta(days=days)
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE services SET expires_at = ?, status = 'active' WHERE id = ?", (new_expires.isoformat(timespec="seconds"), service_id))
+        conn.commit()
+
+
+def admin_add_data_to_service(service_id: int, data_gb: float) -> None:
+    service = db.get_service(service_id)
+    if not service:
+        return
+    db.add_data_to_service(service_id, int(service["user_telegram_id"]), data_gb)
+
+
+def create_manual_service_for_user(telegram_id: int, plan_key: str, paid_amount: int, admin_id: int) -> Optional[int]:
+    user = db.get_user(telegram_id)
+    plan = PLANS.get(plan_key)
+    if not user or not plan:
+        return None
+    order_id = db.create_order(telegram_id, plan_key, plan.price, max(plan.price - paid_amount, 0), 0, "paid", "ساخت دستی ادمین")
+    service_id = db.create_service(telegram_id, make_service_name(telegram_id), plan, paid_amount, is_test=False)
+    db.update_order_service(order_id, service_id)
+    admin_log(admin_id, "MANUAL_SERVICE_CREATE", "user", telegram_id, f"plan={plan_key}, paid={paid_amount}, order={order_id}, service={service_id}")
+    return service_id
+
+
+def coupon_row(code: str) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM coupons WHERE code = ?", (code.upper(),)).fetchone()
+
+
+def coupon_usage_count(code: str, telegram_id: Optional[int] = None) -> int:
+    with closing(db.connect()) as conn:
+        if telegram_id is None:
+            row = conn.execute("SELECT COUNT(*) AS c FROM coupon_usages WHERE code = ?", (code.upper(),)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS c FROM coupon_usages WHERE code = ? AND user_telegram_id = ?", (code.upper(), telegram_id)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row) -> tuple[Optional[sqlite3.Row], str]:
+    if setting_get("coupon_enabled", "1") != "1":
+        return None, "سیستم کد تخفیف فعلاً غیرفعال است."
+    code = (code or "").strip().upper()
+    row = coupon_row(code)
+    if not row or not int(row["active"]):
+        return None, "این کد تخفیف معتبر نیست یا غیرفعال شده است."
+    if row["expires_at"]:
+        try:
+            if datetime.fromisoformat(str(row["expires_at"])) < datetime.now(TEHRAN_TZ):
+                return None, "مهلت استفاده از این کد تخفیف تمام شده است."
+        except ValueError:
+            pass
+    usage_limit = row["usage_limit"]
+    if usage_limit is not None and int(row["used_count"]) >= int(usage_limit):
+        return None, "ظرفیت استفاده از این کد تخفیف تکمیل شده است."
+    if int(row["per_user_limit"] or 1) <= coupon_usage_count(code, telegram_id):
+        return None, "شما قبلاً از این کد تخفیف استفاده کرده‌اید."
+    scope = str(row["scope"] or "all")
+    targets = [x.strip() for x in str(row["target_user_ids"] or "").split(",") if x.strip()]
+    if scope in {"user", "users"} and str(telegram_id) not in targets:
+        return None, "این کد تخفیف مخصوص حساب شما نیست."
+    if scope == "first_purchase":
+        user = db.get_user(telegram_id)
+        if user and int(user["first_purchase_done"]):
+            return None, "این کد فقط برای خرید اول قابل استفاده است."
+    return row, ""
+
+
+def save_order_coupon(order_id: int, telegram_id: int, code: str, coupon_discount: int, total_discount: int) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "UPDATE orders SET coupon_code = ?, coupon_discount = ?, discount_amount = ? WHERE id = ? AND user_telegram_id = ? AND status = 'pending'",
+            (code.upper(), coupon_discount, total_discount, order_id, telegram_id),
+        )
+        conn.commit()
+
+
+def finalize_coupon_usage(order_id: int, telegram_id: int) -> None:
+    order = db.get_order(order_id, telegram_id)
+    if not order or not row_has(order, "coupon_code") or not order["coupon_code"]:
+        return
+    code = str(order["coupon_code"]).upper()
+    discount = int(order["coupon_discount"] or 0)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO coupon_usages (code, user_telegram_id, order_id, discount_amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (code, telegram_id, order_id, discount, now_iso()),
+        )
+        conn.execute("UPDATE coupons SET used_count = (SELECT COUNT(*) FROM coupon_usages WHERE code = ?) WHERE code = ?", (code, code))
+        conn.commit()
+
+
+def create_coupon_admin(code: str, percent: int, title: str, scope: str, target_user_ids: str, usage_limit: Optional[int], expires_days: Optional[int], admin_id: int) -> None:
+    expires_at = None
+    if expires_days and expires_days > 0:
+        expires_at = (datetime.now(TEHRAN_TZ) + timedelta(days=expires_days)).isoformat(timespec="seconds")
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO coupons
+            (code, percent, title, scope, target_user_ids, usage_limit, per_user_limit, used_count,
+             stack_with_referral, max_discount_percent, active, expires_at, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1, 40, 1, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                percent = excluded.percent,
+                title = excluded.title,
+                scope = excluded.scope,
+                target_user_ids = excluded.target_user_ids,
+                usage_limit = excluded.usage_limit,
+                active = 1,
+                expires_at = excluded.expires_at
+            """,
+            (code.upper(), percent, title, scope, target_user_ids or None, usage_limit, expires_at, admin_id, now_iso()),
+        )
+        conn.commit()
+    admin_log(admin_id, "COUPON_UPSERT", "coupon", code.upper(), f"percent={percent}, scope={scope}, limit={usage_limit}, expires_days={expires_days}")
+
+
+def disable_coupon_admin(code: str, admin_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        cur = conn.execute("UPDATE coupons SET active = 0 WHERE code = ?", (code.upper(),))
+        conn.commit()
+    if cur.rowcount:
+        admin_log(admin_id, "COUPON_DISABLE", "coupon", code.upper(), "")
+        return True
+    return False
+
+
 db = DB(DATABASE_PATH)
+ensure_admin_schema()
 router = Router()
 
 
@@ -502,17 +933,34 @@ class WalletStates(StatesGroup):
     waiting_amount = State()
 
 
+class AdminStates(StatesGroup):
+    waiting_user_search = State()
+    waiting_wallet_amount = State()
+    waiting_wallet_reason = State()
+    waiting_direct_message = State()
+    waiting_broadcast_message = State()
+    waiting_bot_lock_message = State()
+    waiting_coupon_line = State()
+    waiting_disable_coupon = State()
+    waiting_add_admin_line = State()
+    waiting_user_note = State()
+    waiting_manual_service_amount = State()
+
+
 # -----------------------------
 # Keyboards
 # -----------------------------
-def main_menu_kb() -> ReplyKeyboardMarkup:
+def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text="🛒 خرید سرویس")],
+        [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 سرویس رایگان")],
+        [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
+        [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
+    ]
+    if is_admin_id(telegram_id):
+        rows.append([KeyboardButton(text="👑 پنل مدیریت")])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🛒 خرید سرویس")],
-            [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 سرویس رایگان")],
-            [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
-            [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
-        ],
+        keyboard=rows,
         resize_keyboard=True,
         input_field_placeholder="یک گزینه را انتخاب کنید…",
     )
@@ -675,6 +1123,225 @@ def referral_back_kb(invite_link: str, invite_text: str) -> InlineKeyboardMarkup
 
 
 # -----------------------------
+# Admin keyboards / text
+# -----------------------------
+def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [
+        [("👥 مدیریت کاربران", "adm_users"), ("📦 مدیریت سرویس‌ها", "adm_services")],
+        [("🧾 سفارش‌ها", "adm_orders"), ("💰 کیف پول کاربران", "adm_wallet_start")],
+        [("🎟 کدهای تخفیف", "adm_coupons"), ("📢 پیام همگانی", "adm_broadcast")],
+        [("🔒 قفل بات", "adm_bot_lock"), ("📊 گزارش‌ها", "adm_reports")],
+    ]
+    if admin_has(admin_id, "*"):
+        rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
+    rows.append([("🏠 منوی اصلی کاربر", "home")])
+    return inline(rows)
+
+
+def admin_back_kb(back: str = "adm_home") -> InlineKeyboardMarkup:
+    return inline([[('⬅️ بازگشت', back), ('👑 منوی ادمین', 'adm_home')]])
+
+
+def admin_users_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("🔎 جستجوی کاربر", "adm_user_search")],
+        [("🆕 آخرین کاربران", "adm_recent_users"), ("🛒 کاربران خریدار", "adm_buyer_users")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_user_result_kb(users: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for u in users:
+        label = f"👤 {u['telegram_id']}"
+        if u["username"]:
+            label += f" | @{u['username']}"
+        rows.append([(label, f"adm_user:{u['telegram_id']}")])
+    rows.append([("⬅️ بازگشت", "adm_users"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
+    uid = int(user["telegram_id"])
+    status = str(user["status"] if row_has(user, "status") else "active")
+    lock_btn = ("🔓 باز کردن کاربر", f"adm_user_unlock:{uid}") if status != "active" else ("🔒 قفل با اطلاع", f"adm_user_lock_notify:{uid}")
+    return inline([
+        [("📦 سرویس‌های کاربر", f"adm_user_services:{uid}"), ("🧾 سفارش‌ها", f"adm_user_orders:{uid}")],
+        [("💰 تغییر کیف پول", f"adm_user_wallet:{uid}"), ("✉️ پیام مستقیم", f"adm_user_msg:{uid}")],
+        [lock_btn, ("🔕 قفل بی‌صدا", f"adm_user_lock_silent:{uid}")],
+        [("🚫 بلاک با اطلاع", f"adm_user_ban_notify:{uid}"), ("🚫 بلاک بی‌صدا", f"adm_user_ban_silent:{uid}")],
+        [("🗑 حذف کاربر", f"adm_user_delete:{uid}"), ("🎁 ریست تست رایگان", f"adm_user_reset_free:{uid}")],
+        [("📝 یادداشت ادمین", f"adm_user_note:{uid}"), ("➕ ساخت سرویس دستی", f"adm_manual_service:{uid}")],
+        [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_service_list_kb(services: list[sqlite3.Row], back: str) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for s in services[:25]:
+        icon = "🟢" if s["status"] == "active" else "⛔"
+        rows.append([(f"{icon} #{s['id']} | {s['name']}", f"adm_service:{s['id']}")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_service_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
+    sid = int(service["id"])
+    uid = int(service["user_telegram_id"])
+    status = str(service["status"])
+    lock_btn = ("🔓 فعال کردن سرویس", f"adm_svc_status:{sid}:active") if status != "active" else ("🔒 قفل سرویس", f"adm_svc_status:{sid}:suspended")
+    return inline([
+        [("🔗 تغییر لینک", f"adm_svc_revoke:{sid}"), lock_btn],
+        [("➕ ۵ گیگ", f"adm_svc_data:{sid}:5"), ("➕ ۱۰ گیگ", f"adm_svc_data:{sid}:10"), ("➕ ۲۰ گیگ", f"adm_svc_data:{sid}:20")],
+        [("⏳ ۷ روز", f"adm_svc_days:{sid}:7"), ("⏳ ۳۰ روز", f"adm_svc_days:{sid}:30"), ("🧹 ریست مصرف", f"adm_svc_reset:{sid}")],
+        [("🗑 حذف سرویس", f"adm_svc_status:{sid}:deleted")],
+        [("⬅️ سرویس‌های کاربر", f"adm_user_services:{uid}"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_orders_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("⏳ در انتظار پرداخت", "adm_orders_pending"), ("✅ پرداخت‌شده", "adm_orders_paid")],
+        [("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_order_list_kb(orders: list[sqlite3.Row], back: str = "adm_orders") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for o in orders:
+        rows.append([(f"#{o['id']} | {o['status']} | {fmt_money(max(int(o['amount']) - int(o['discount_amount']), 0))}", f"adm_order:{o['id']}")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_order_kb(order: sqlite3.Row) -> InlineKeyboardMarkup:
+    oid = int(order["id"])
+    uid = int(order["user_telegram_id"])
+    rows: list[list[tuple[str, str]]] = []
+    if order["status"] != "paid":
+        rows.append([("✅ تأیید دستی پرداخت", f"adm_order_pay:{oid}")])
+    rows.append([("👤 پروفایل کاربر", f"adm_user:{uid}"), ("🧾 سفارش‌های کاربر", f"adm_user_orders:{uid}")])
+    rows.append([("⬅️ سفارش‌ها", "adm_orders"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_coupon_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("➕ ساخت/ویرایش کد", "adm_coupon_add"), ("⛔ غیرفعال کردن کد", "adm_coupon_disable")],
+        [("📋 کدهای فعال", "adm_coupon_list")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_bot_lock_kb() -> InlineKeyboardMarkup:
+    locked = setting_get("bot_locked", "0") == "1"
+    toggle = ("🔓 باز کردن بات", "adm_bot_unlock") if locked else ("🔒 قفل کردن بات", "adm_bot_lock_on")
+    return inline([
+        [toggle],
+        [("✏️ تغییر پیام قفل", "adm_bot_lock_msg")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_admins_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("➕ اضافه کردن ادمین", "adm_admin_add"), ("📋 لیست ادمین‌ها", "adm_admin_list")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_manual_service_plans_kb(uid: int) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for p in PLANS.values():
+        rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_manual_service_plan:{uid}:{p.key}")])
+    rows.append([("⬅️ پروفایل کاربر", f"adm_user:{uid}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_dashboard_text(admin_id: int) -> str:
+    today = datetime.now(TEHRAN_TZ).date().isoformat()
+    total_users = db_count("SELECT COUNT(*) FROM users WHERE COALESCE(status, 'active') != 'deleted'")
+    active_services = db_count("SELECT COUNT(*) FROM services WHERE status = 'active'")
+    pending_orders = db_count("SELECT COUNT(*) FROM orders WHERE status = 'pending'")
+    orders_today = db_count("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (today,))
+    sales_today = db_sum("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid' AND created_at >= ?", (today,))
+    coupons_active = db_count("SELECT COUNT(*) FROM coupons WHERE active = 1")
+    role = admin_role(admin_id) or "unknown"
+    locked = "قفل 🔒" if setting_get("bot_locked", "0") == "1" else "باز 🔓"
+    return (
+        header("👑 پنل مدیریت", f"سطح دسترسی: {role}")
+        + f"👥 کاربران کل: <b>{fmt_number(total_users)}</b>\n"
+        + f"📦 سرویس‌های فعال: <b>{fmt_number(active_services)}</b>\n"
+        + f"🧾 سفارش‌های در انتظار: <b>{fmt_number(pending_orders)}</b>\n"
+        + f"💳 سفارش‌های امروز: <b>{fmt_number(orders_today)}</b>\n"
+        + f"💰 فروش امروز: <b>{fmt_money(sales_today)}</b>\n"
+        + f"🎟 کدهای فعال: <b>{fmt_number(coupons_active)}</b>\n"
+        + f"🔒 وضعیت بات: <b>{locked}</b>\n\n"
+        + "از دکمه‌های زیر یک بخش را انتخاب کنید."
+    )
+
+
+def admin_user_text(user: sqlite3.Row) -> str:
+    services = [s for s in db.list_services(int(user["telegram_id"])) if s["status"] != "deleted"]
+    orders = db.list_orders(int(user["telegram_id"]), 5)
+    stats = db.referral_stats(int(user["telegram_id"]))
+    status = user["status"] if row_has(user, "status") else "active"
+    username = f"@{user['username']}" if user["username"] else "ثبت نشده"
+    note = user["admin_note"] if row_has(user, "admin_note") and user["admin_note"] else "ندارد"
+    return (
+        header("👤 پروفایل کاربر", str(user["telegram_id"]))
+        + f"👤 یوزرنیم: <b>{h(username)}</b>\n"
+        + f"🪪 نام: <b>{h(user['first_name'] or 'ثبت نشده')}</b>\n"
+        + f"📅 عضویت: <code>{h(user['created_at'][:10])}</code>\n"
+        + f"⛔ وضعیت: <b>{h(status)}</b>\n"
+        + f"💰 کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n"
+        + f"📦 سرویس‌های غیرحذف‌شده: <b>{fmt_number(len(services))}</b>\n"
+        + f"🧾 سفارش‌های اخیر: <b>{fmt_number(len(orders))}</b>\n"
+        + f"💎 دعوت موفق: <b>{fmt_number(stats['rewarded'])}</b>\n"
+        + f"🎁 تست رایگان: <b>{'استفاده شده' if user['free_test_used'] else 'استفاده نشده'}</b>\n"
+        + f"📝 یادداشت: <i>{h(note)}</i>"
+    )
+
+
+def admin_service_text(service: sqlite3.Row) -> str:
+    expires = datetime.fromisoformat(service["expires_at"])
+    days_left = max((expires - datetime.now(TEHRAN_TZ)).days, 0)
+    used_gb = int(service["data_used_mb"]) / 1024
+    left_gb = max(float(service["data_gb"]) - used_gb, 0)
+    return (
+        header("📦 مدیریت سرویس", service["name"])
+        + f"🆔 سرویس: <code>{service['id']}</code>\n"
+        + f"👤 کاربر: <code>{service['user_telegram_id']}</code>\n"
+        + f"🟢 وضعیت: <b>{h(service['status'])}</b>\n"
+        + f"🏷 پلن: <b>{h(service['plan_title'])}</b>\n"
+        + f"📊 کل حجم: <b>{fmt_number(float(service['data_gb']))} GB</b>\n"
+        + f"📉 مصرف‌شده: <b>{fmt_number(round(used_gb, 2))} GB</b>\n"
+        + f"🔋 باقی‌مانده: <b>{fmt_number(round(left_gb, 2))} GB</b>\n"
+        + f"⏳ باقی‌مانده زمانی: <b>{fmt_number(days_left)} روز</b>\n"
+        + f"💳 پرداختی: <b>{fmt_money(int(service['paid_amount']))}</b>\n"
+        + f"🔗 لینک: <code>{h(subscription_link(service))}</code>"
+    )
+
+
+def admin_order_text(order: sqlite3.Row) -> str:
+    coupon = order["coupon_code"] if row_has(order, "coupon_code") and order["coupon_code"] else "ندارد"
+    return (
+        header("🧾 جزئیات سفارش", f"#{order['id']}")
+        + f"👤 کاربر: <code>{order['user_telegram_id']}</code>\n"
+        + f"📦 پلن/نوع: <code>{h(order['plan_key'])}</code>\n"
+        + f"💰 مبلغ اصلی: <b>{fmt_money(int(order['amount']))}</b>\n"
+        + f"🎟 تخفیف: <b>{fmt_money(int(order['discount_amount']))}</b>\n"
+        + f"✅ قابل پرداخت: <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b>\n"
+        + f"📌 وضعیت: <b>{h(order['status'])}</b>\n"
+        + f"💳 روش: <b>{h(order['payment_method'])}</b>\n"
+        + f"🎟 کد: <b>{h(coupon)}</b>\n"
+        + f"📅 تاریخ: <code>{h(order['created_at'])}</code>"
+    )
+
+
+
+# -----------------------------
 # Message builders
 # -----------------------------
 def welcome_text(first_name: Optional[str] = None) -> str:
@@ -744,8 +1411,15 @@ def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int
     return text, plan.price, referral_discount, total_discount, payable
 
 
-def order_discount_details(order_id: int, order: sqlite3.Row) -> dict[str, Any]:
-    return order_discounts.get(order_id, {"referral": 0, "coupon": 0, "coupon_code": None})
+def order_discount_details(order_id: int, order: Optional[sqlite3.Row]) -> dict[str, Any]:
+    cached = order_discounts.get(order_id)
+    if cached:
+        return cached
+    if order and row_has(order, "coupon_discount"):
+        coupon_discount = int(order["coupon_discount"] or 0)
+        referral_discount = max(int(order["discount_amount"] or 0) - coupon_discount, 0)
+        return {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": order["coupon_code"]}
+    return {"referral": 0, "coupon": 0, "coupon_code": None}
 
 
 def discount_lines(details: dict[str, Any]) -> str:
@@ -759,7 +1433,7 @@ def discount_lines(details: dict[str, Any]) -> str:
 
 
 def payment_text(plan: Plan, service_name: str, order_id: int, amount: int, discount: int, wallet_balance: int) -> str:
-    details = order_discount_details(order_id, db.get_order(order_id, 0) if False else None)  # only to keep signature simple
+    details = order_discount_details(order_id, get_order_any(order_id))
     payable = max(amount - discount, 0)
     text = header("💳 انتخاب روش پرداخت", service_name)
     text += f"📦 پلن: <b>{h(plan.title)}</b>\n"
@@ -997,6 +1671,61 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
         await target.answer(text, reply_markup=markup)
 
 
+
+# -----------------------------
+# Global access guards
+# -----------------------------
+def user_block_message(user_row: sqlite3.Row) -> Optional[str]:
+    status = str(user_row["status"] if row_has(user_row, "status") else "active")
+    if status == "active":
+        return None
+    notice = user_row["locked_notice"] if row_has(user_row, "locked_notice") else None
+    if notice:
+        return str(notice)
+    if status == "locked":
+        return "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
+    if status == "banned":
+        return "🚫 دسترسی شما به ربات محدود شده است."
+    if status == "deleted":
+        return "این حساب از سیستم حذف شده است."
+    return None
+
+
+class AccessGuardMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
+        from_user = getattr(event, "from_user", None)
+        if from_user is None:
+            return await handler(event, data)
+        telegram_id = int(from_user.id)
+        if is_admin_id(telegram_id):
+            return await handler(event, data)
+        if setting_get("bot_locked", "0") == "1":
+            msg = setting_get("bot_lock_message", "🛠 ربات موقتاً در حال بروزرسانی است.")
+            if isinstance(event, CallbackQuery):
+                await event.answer(msg, show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(msg)
+            return None
+        user_row = db.get_user(telegram_id)
+        if user_row:
+            block_msg = user_block_message(user_row)
+            if block_msg:
+                if isinstance(event, CallbackQuery):
+                    await event.answer(block_msg, show_alert=True)
+                elif isinstance(event, Message):
+                    await event.answer(block_msg)
+                return None
+        return await handler(event, data)
+
+
+def is_purchase_open() -> bool:
+    return setting_get("purchase_enabled", "1") == "1"
+
+
+def is_free_test_open() -> bool:
+    return setting_get("free_test_enabled", "1") == "1"
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -1011,16 +1740,16 @@ async def start(message: Message, state: FSMContext) -> None:
             "🎁 شما با لینک دعوت وارد شدید.\n"
             f"برای خرید اول، <b>{REFERRED_DISCOUNT_PERCENT}٪ تخفیف</b> روی سفارش شما اعمال می‌شود.\n\n"
             "این تخفیف هنگام انتخاب پلن، داخل خلاصه سفارش نمایش داده می‌شود.",
-            reply_markup=main_menu_kb(),
+            reply_markup=main_menu_kb(message.from_user.id if message.from_user else None),
         )
-    await message.answer(welcome_text(message.from_user.first_name if message.from_user else None), reply_markup=main_menu_kb(), disable_web_page_preview=True)
+    await message.answer(welcome_text(message.from_user.first_name if message.from_user else None), reply_markup=main_menu_kb(message.from_user.id if message.from_user else None), disable_web_page_preview=True)
 
 
 @router.message(Command("menu"))
 async def menu_cmd(message: Message, state: FSMContext) -> None:
     await state.clear()
     ensure_from_message(message)
-    await message.answer(menu_text(), reply_markup=main_menu_kb())
+    await message.answer(menu_text(), reply_markup=main_menu_kb(message.from_user.id if message.from_user else None))
 
 
 @router.callback_query(F.data == "home")
@@ -1028,7 +1757,7 @@ async def home_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     ensure_from_callback(callback)
     if callback.message:
-        await callback.message.answer(menu_text(), reply_markup=main_menu_kb())
+        await callback.message.answer(menu_text(), reply_markup=main_menu_kb(callback.from_user.id if callback.from_user else None))
     await callback.answer()
 
 
@@ -1036,6 +1765,9 @@ async def home_cb(callback: CallbackQuery, state: FSMContext) -> None:
 async def buy_msg(message: Message, state: FSMContext) -> None:
     await state.clear()
     ensure_from_message(message)
+    if not is_purchase_open() and not is_admin_id(message.from_user.id if message.from_user else None):
+        await message.answer("🛒 خرید سرویس فعلاً غیرفعال است.", reply_markup=back_home_kb())
+        return
     await message.answer(buy_text(), reply_markup=buy_type_kb())
 
 
@@ -1043,6 +1775,9 @@ async def buy_msg(message: Message, state: FSMContext) -> None:
 async def buy_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     ensure_from_callback(callback)
+    if not is_purchase_open() and not is_admin_id(callback.from_user.id):
+        await callback.answer("خرید سرویس فعلاً غیرفعال است.", show_alert=True)
+        return
     await edit_or_answer(callback, buy_text(), buy_type_kb())
 
 
@@ -1198,6 +1933,7 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
     with closing(db.connect()) as conn:
         conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, order_id))
         conn.commit()
+    finalize_coupon_usage(order_id, telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, order_id, payable)
     service = db.get_service(service_id, telegram_id)
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
@@ -1233,6 +1969,7 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
     with closing(db.connect()) as conn:
         conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, int(order["id"])))
         conn.commit()
+    finalize_coupon_usage(int(order["id"]), telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
     service = db.get_service(service_id, telegram_id)
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
@@ -1266,6 +2003,7 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
     with closing(db.connect()) as conn:
         conn.execute("UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?", (method, wallet_used, int(order["id"])))
         conn.commit()
+    finalize_coupon_usage(int(order["id"]), telegram_id)
     reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
     service = db.get_service(service_id, telegram_id)
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
@@ -1532,6 +2270,9 @@ async def delete_yes(callback: CallbackQuery) -> None:
 @router.message(F.text == "🎁 سرویس رایگان")
 async def free_test_msg(message: Message) -> None:
     user = ensure_from_message(message)
+    if not is_free_test_open() and not is_admin_id(message.from_user.id if message.from_user else None):
+        await message.answer("🎁 سرویس رایگان فعلاً غیرفعال است.", reply_markup=back_home_kb())
+        return
     await show_free_service_menu(message, int(user["telegram_id"]))
 
 
@@ -1688,15 +2429,831 @@ async def referral_stats(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, text, referral_back_kb(invite_link, invite_text))
 
 
+
+# -----------------------------
+# Admin routes (no /admin command; hidden menu button only)
+# -----------------------------
+async def show_admin_home(target: Message | CallbackQuery, admin_id: int) -> None:
+    text = admin_dashboard_text(admin_id)
+    markup = admin_home_kb(admin_id)
+    if isinstance(target, CallbackQuery):
+        await edit_or_answer(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+@router.message(F.text == "👑 پنل مدیریت")
+async def admin_panel_msg(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    ensure_from_message(message)
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "dashboard"):
+        await message.answer("دسترسی مدیریت برای شما فعال نیست.", reply_markup=main_menu_kb(message.from_user.id if message.from_user else None))
+        return
+    await show_admin_home(message, int(message.from_user.id))
+
+
+@router.callback_query(F.data == "adm_home")
+async def admin_home_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "dashboard"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await show_admin_home(callback, int(callback.from_user.id))
+
+
+@router.callback_query(F.data == "adm_users")
+async def admin_users(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("👥 مدیریت کاربران") + "کاربر را جستجو کنید یا از لیست‌های آماده استفاده کنید.", admin_users_kb())
+
+
+@router.callback_query(F.data == "adm_user_search")
+async def admin_user_search_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_user_search)
+    await edit_or_answer(callback, header("🔎 جستجوی کاربر") + "چت‌آیدی، یوزرنیم، یا نام کاربر را وارد کنید.", admin_back_kb("adm_users"))
+
+
+@router.message(AdminStates.waiting_user_search)
+async def admin_user_search_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "users"):
+        await message.answer("دسترسی ندارید.")
+        return
+    users = find_users_admin(message.text or "")
+    await state.clear()
+    if not users:
+        await message.answer(header("🔎 نتیجه جستجو") + "کاربری پیدا نشد.", reply_markup=admin_back_kb("adm_users"))
+        return
+    await message.answer(header("🔎 نتیجه جستجو") + f"{fmt_number(len(users))} کاربر پیدا شد:", reply_markup=admin_user_result_kb(users))
+
+
+@router.callback_query(F.data.in_({"adm_recent_users", "adm_buyer_users"}))
+async def admin_user_lists(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    users = list_all_users(limit=10, buyers_only=callback.data == "adm_buyer_users")
+    title = "🆕 آخرین کاربران" if callback.data == "adm_recent_users" else "🛒 کاربران خریدار"
+    await edit_or_answer(callback, header(title) + "برای مدیریت، یکی را انتخاب کنید.", admin_user_result_kb(users))
+
+
+@router.callback_query(F.data.startswith("adm_user:"))
+async def admin_user_profile(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    user = get_user_admin(uid)
+    if not user:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_user_text(user), admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_lock_notify:"))
+async def admin_user_lock_notify(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    notice = "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
+    update_user_status(uid, "locked", "locked by admin", notice)
+    admin_log(callback.from_user.id, "USER_LOCK_NOTIFY", "user", uid, notice)
+    try:
+        await callback.bot.send_message(uid, notice)
+    except Exception:
+        pass
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر با اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_lock_silent:"))
+async def admin_user_lock_silent(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "locked", "silent lock by admin", "")
+    admin_log(callback.from_user.id, "USER_LOCK_SILENT", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر بدون اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_unlock:"))
+async def admin_user_unlock(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "active", "", "")
+    admin_log(callback.from_user.id, "USER_UNLOCK", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ کاربر باز شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_ban_notify:"))
+async def admin_user_ban_notify(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    notice = "🚫 دسترسی شما به ربات محدود شده است."
+    update_user_status(uid, "banned", "banned by admin", notice)
+    admin_log(callback.from_user.id, "USER_BAN_NOTIFY", "user", uid, "")
+    try:
+        await callback.bot.send_message(uid, notice)
+    except Exception:
+        pass
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ کاربر بلاک شد") + "کاربر با اطلاع‌رسانی بلاک شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_ban_silent:"))
+async def admin_user_ban_silent(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "banned", "silent ban by admin", "")
+    admin_log(callback.from_user.id, "USER_BAN_SILENT", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ کاربر بلاک شد") + "کاربر بدون اطلاع‌رسانی بلاک شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_delete:"))
+async def admin_user_delete(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "deleted", "deleted by admin", "")
+    admin_log(callback.from_user.id, "USER_DELETE", "user", uid, "soft delete")
+    await edit_or_answer(callback, header("🗑 کاربر حذف شد") + "کاربر به‌صورت نرم از سیستم حذف شد و در گزارش‌ها باقی می‌ماند.", admin_back_kb("adm_users"))
+
+
+@router.callback_query(F.data.startswith("adm_user_reset_free:"))
+async def admin_user_reset_free(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE users SET free_test_used = 0 WHERE telegram_id = ?", (uid,))
+        conn.commit()
+    admin_log(callback.from_user.id, "USER_RESET_FREE_TEST", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("🎁 تست رایگان ریست شد") + "کاربر دوباره می‌تواند سرویس رایگان دریافت کند.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_wallet:"))
+async def admin_wallet_start_for_user(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "wallet"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    await state.set_state(AdminStates.waiting_wallet_amount)
+    await state.update_data(target_user_id=uid)
+    await edit_or_answer(callback, header("💰 تغییر کیف پول") + "مبلغ را با علامت وارد کنید.\nمثلاً: <code>+100000</code> یا <code>-50000</code>", admin_back_kb(f"adm_user:{uid}"))
+
+
+@router.message(AdminStates.waiting_wallet_amount)
+async def admin_wallet_amount_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "wallet"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = normalize_digits(message.text or "").replace("٬", "").replace(",", "").strip()
+    if not re.fullmatch(r"[+-]?\d+", raw):
+        await message.answer("❌ مبلغ معتبر نیست. مثال: <code>+100000</code>")
+        return
+    await state.update_data(wallet_amount=int(raw))
+    await state.set_state(AdminStates.waiting_wallet_reason)
+    await message.answer("دلیل تغییر کیف پول را وارد کنید. این دلیل در تراکنش ثبت می‌شود.")
+
+
+@router.message(AdminStates.waiting_wallet_reason)
+async def admin_wallet_reason_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "wallet"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    amount = int(data["wallet_amount"])
+    reason = (message.text or "اصلاح دستی ادمین").strip()
+    db.add_wallet(uid, amount, "admin_adjustment", reason, message.from_user.id if message.from_user else None)
+    admin_log(message.from_user.id, "WALLET_ADJUST", "user", uid, f"amount={amount}, reason={reason}")
+    await state.clear()
+    user = get_user_admin(uid)
+    await message.answer(header("✅ کیف پول تغییر کرد") + f"مبلغ <b>{fmt_money(amount)}</b> ثبت شد.\nموجودی جدید: <b>{fmt_money(int(user['wallet_balance']))}</b>", reply_markup=admin_user_kb(user))
+
+
+@router.callback_query(F.data == "adm_wallet_start")
+async def admin_wallet_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "wallet"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_user_search)
+    await edit_or_answer(callback, header("💰 کیف پول کاربران") + "اول کاربر را با چت‌آیدی یا یوزرنیم جستجو کنید، سپس گزینه تغییر کیف پول را بزنید.", admin_back_kb("adm_home"))
+
+
+@router.callback_query(F.data.startswith("adm_user_msg:"))
+async def admin_direct_msg_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "direct_message") and not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    await state.set_state(AdminStates.waiting_direct_message)
+    await state.update_data(target_user_id=uid)
+    await edit_or_answer(callback, header("✉️ پیام مستقیم") + "متن پیام را وارد کنید. پیام از طرف ربات برای کاربر ارسال می‌شود.", admin_back_kb(f"adm_user:{uid}"))
+
+
+@router.message(AdminStates.waiting_direct_message)
+async def admin_direct_msg_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "direct_message") and not require_admin_id(message.from_user.id if message.from_user else 0, "users"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    text = message.html_text or message.text or ""
+    try:
+        await message.bot.send_message(uid, text)
+        admin_log(message.from_user.id, "DIRECT_MESSAGE", "user", uid, text[:500])
+        await state.clear()
+        user = get_user_admin(uid)
+        await message.answer(header("✅ پیام ارسال شد") + "پیام مستقیم برای کاربر ارسال شد.", reply_markup=admin_user_kb(user))
+    except Exception as e:
+        await message.answer(f"❌ ارسال پیام ناموفق بود: <code>{h(e)}</code>")
+
+
+@router.callback_query(F.data.startswith("adm_user_note:"))
+async def admin_user_note_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    await state.set_state(AdminStates.waiting_user_note)
+    await state.update_data(target_user_id=uid)
+    await edit_or_answer(callback, header("📝 یادداشت ادمین") + "یادداشت داخلی این کاربر را وارد کنید.", admin_back_kb(f"adm_user:{uid}"))
+
+
+@router.message(AdminStates.waiting_user_note)
+async def admin_user_note_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "users"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    note = message.text or ""
+    set_user_note(uid, note)
+    admin_log(message.from_user.id, "USER_NOTE", "user", uid, note[:500])
+    await state.clear()
+    user = get_user_admin(uid)
+    await message.answer(header("✅ یادداشت ذخیره شد"), reply_markup=admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_services:"))
+async def admin_user_services(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services") and not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    services = db.list_services(uid)
+    await edit_or_answer(callback, header("📦 سرویس‌های کاربر", str(uid)) + ("سرویسی پیدا نشد." if not services else "یکی از سرویس‌ها را انتخاب کنید."), admin_service_list_kb(services, f"adm_user:{uid}"))
+
+
+@router.callback_query(F.data == "adm_services")
+async def admin_services(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    with closing(db.connect()) as conn:
+        services = list(conn.execute("SELECT * FROM services ORDER BY id DESC LIMIT 20").fetchall())
+    await edit_or_answer(callback, header("📦 مدیریت سرویس‌ها") + "آخرین سرویس‌ها:", admin_service_list_kb(services, "adm_home"))
+
+
+@router.callback_query(F.data.startswith("adm_service:"))
+async def admin_service_details(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services") and not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    sid = int(callback.data.split(":", 1)[1])
+    service = db.get_service(sid)
+    if not service:
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_status:"))
+async def admin_service_status(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, _, sid_s, status = callback.data.split(":")
+    sid = int(sid_s)
+    admin_update_service_status(sid, status, f"set by admin {callback.from_user.id}")
+    admin_log(callback.from_user.id, "SERVICE_STATUS", "service", sid, status)
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ وضعیت سرویس تغییر کرد") + admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_revoke:"))
+async def admin_service_revoke(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    sid = int(callback.data.split(":", 1)[1])
+    service = db.get_service(sid)
+    if not service:
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    db.revoke_service_link(sid, int(service["user_telegram_id"]))
+    admin_log(callback.from_user.id, "SERVICE_REVOKE_LINK", "service", sid, "")
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ لینک سرویس تغییر کرد") + admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_data:"))
+async def admin_service_add_data(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, _, sid_s, gb_s = callback.data.split(":")
+    sid = int(sid_s)
+    gb = float(gb_s)
+    admin_add_data_to_service(sid, gb)
+    admin_log(callback.from_user.id, "SERVICE_ADD_DATA", "service", sid, f"+{gb}GB")
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ حجم اضافه شد") + admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_days:"))
+async def admin_service_add_days(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, _, sid_s, days_s = callback.data.split(":")
+    sid = int(sid_s)
+    days = int(days_s)
+    admin_add_days_to_service(sid, days)
+    admin_log(callback.from_user.id, "SERVICE_ADD_DAYS", "service", sid, f"+{days} days")
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ زمان اضافه شد") + admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_svc_reset:"))
+async def admin_service_reset_usage(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "services"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    sid = int(callback.data.split(":", 1)[1])
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE services SET data_used_mb = 0 WHERE id = ?", (sid,))
+        conn.commit()
+    admin_log(callback.from_user.id, "SERVICE_RESET_USAGE", "service", sid, "")
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ مصرف ریست شد") + admin_service_text(service), admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_manual_service:"))
+async def admin_manual_service_start(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "manual_service"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    await edit_or_answer(callback, header("➕ ساخت سرویس دستی") + "پلن موردنظر را انتخاب کنید. بعد از انتخاب پلن، مبلغ پرداخت‌شده را می‌پرسیم.", admin_manual_service_plans_kb(uid))
+
+
+@router.callback_query(F.data.startswith("adm_manual_service_plan:"))
+async def admin_manual_service_plan(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "manual_service"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    _, _, uid_s, plan_key = callback.data.split(":")
+    uid = int(uid_s)
+    if plan_key not in PLANS:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_manual_service_amount)
+    await state.update_data(target_user_id=uid, plan_key=plan_key)
+    plan = PLANS[plan_key]
+    await edit_or_answer(callback, header("💳 مبلغ پرداخت‌شده") + f"پلن: <b>{h(plan.title)}</b>\nقیمت اصلی: <b>{fmt_money(plan.price)}</b>\n\nمبلغ پرداخت‌شده را وارد کنید. برای هدیه عدد <code>0</code> بزنید.", admin_back_kb(f"adm_user:{uid}"))
+
+
+@router.message(AdminStates.waiting_manual_service_amount)
+async def admin_manual_service_amount_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "manual_service"):
+        await message.answer("دسترسی ندارید.")
+        return
+    amount = parse_amount(message.text or "")
+    if amount is None:
+        await message.answer("❌ مبلغ معتبر نیست. فقط عدد وارد کنید.")
+        return
+    data = await state.get_data()
+    uid = int(data["target_user_id"])
+    plan_key = str(data["plan_key"])
+    service_id = create_manual_service_for_user(uid, plan_key, amount, message.from_user.id if message.from_user else 0)
+    await state.clear()
+    if not service_id:
+        await message.answer("❌ ساخت سرویس ناموفق بود.", reply_markup=admin_back_kb(f"adm_user:{uid}"))
+        return
+    service = db.get_service(service_id)
+    try:
+        await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service), reply_markup=service_details_kb(service))
+    except Exception:
+        pass
+    await message.answer(header("✅ سرویس دستی ساخته شد") + admin_service_text(service), reply_markup=admin_service_kb(service))
+
+
+@router.callback_query(F.data.startswith("adm_user_orders:"))
+async def admin_user_orders(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    orders = db.list_orders(uid, 20)
+    await edit_or_answer(callback, header("🧾 سفارش‌های کاربر", str(uid)) + ("سفارشی پیدا نشد." if not orders else "یکی از سفارش‌ها را انتخاب کنید."), admin_order_list_kb(orders, f"adm_user:{uid}"))
+
+
+@router.callback_query(F.data == "adm_orders")
+async def admin_orders(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("🧾 مدیریت سفارش‌ها") + "یک دسته را انتخاب کنید.", admin_orders_kb())
+
+
+@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_paid", "adm_orders_latest"}))
+async def admin_orders_list(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    status = None
+    title = "آخرین سفارش‌ها"
+    if callback.data == "adm_orders_pending":
+        status = "pending"
+        title = "سفارش‌های در انتظار"
+    elif callback.data == "adm_orders_paid":
+        status = "paid"
+        title = "سفارش‌های پرداخت‌شده"
+    orders = list_orders_admin(20, status)
+    await edit_or_answer(callback, header("🧾 " + title) + ("سفارشی پیدا نشد." if not orders else "برای جزئیات انتخاب کنید."), admin_order_list_kb(orders, "adm_orders"))
+
+
+@router.callback_query(F.data.startswith("adm_order:"))
+async def admin_order_details(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    oid = int(callback.data.split(":", 1)[1])
+    order = get_order_any(oid)
+    if not order:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_order_text(order), admin_order_kb(order))
+
+
+@router.callback_query(F.data.startswith("adm_order_pay:"))
+async def admin_order_pay(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    oid = int(callback.data.split(":", 1)[1])
+    service_id = set_order_paid_admin(oid, callback.from_user.id)
+    order = get_order_any(oid)
+    if service_id:
+        service = db.get_service(service_id)
+        try:
+            await callback.bot.send_message(int(order["user_telegram_id"]), header("✅ پرداخت شما تأیید شد") + service_text(service), reply_markup=service_details_kb(service))
+        except Exception:
+            pass
+    await edit_or_answer(callback, header("✅ سفارش تأیید شد") + admin_order_text(order), admin_order_kb(order))
+
+
+@router.callback_query(F.data == "adm_broadcast")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "broadcast"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_broadcast_message)
+    await edit_or_answer(callback, header("📢 پیام همگانی") + "متن پیام همگانی را وارد کنید.\n\nبعد از ارسال متن، ربات اول پیش‌نمایش و دکمه تأیید را نشان می‌دهد.", admin_back_kb("adm_home"))
+
+
+@router.message(AdminStates.waiting_broadcast_message)
+async def admin_broadcast_preview(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "broadcast"):
+        await message.answer("دسترسی ندارید.")
+        return
+    text = message.html_text or message.text or ""
+    await state.update_data(broadcast_text=text)
+    targets = list_all_users(only_active=True)
+    await message.answer(
+        header("📢 پیش‌نمایش پیام همگانی")
+        + text
+        + f"\n\n👥 تعداد مخاطب فعال: <b>{fmt_number(len(targets))}</b>\nآیا ارسال شود؟",
+        reply_markup=inline([[('✅ ارسال به کاربران فعال', 'adm_broadcast_send:active')], [('🧪 ارسال تست به خودم', 'adm_broadcast_test')], [('❌ لغو', 'adm_home')]]),
+    )
+
+
+@router.callback_query(F.data == "adm_broadcast_test")
+async def admin_broadcast_test(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "broadcast"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get("broadcast_text")
+    if not text:
+        await callback.answer("پیام پیدا نشد.", show_alert=True)
+        return
+    await callback.bot.send_message(callback.from_user.id, str(text))
+    await callback.answer("پیام تست ارسال شد.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm_broadcast_send:"))
+async def admin_broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "broadcast"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get("broadcast_text")
+    if not text:
+        await callback.answer("پیام پیدا نشد.", show_alert=True)
+        return
+    users = list_all_users(only_active=True)
+    ok = 0
+    fail = 0
+    await callback.answer("ارسال شروع شد...", show_alert=True)
+    for u in users:
+        try:
+            await callback.bot.send_message(int(u["telegram_id"]), str(text))
+            ok += 1
+            await asyncio.sleep(0.035)
+        except Exception:
+            fail += 1
+    await state.clear()
+    admin_log(callback.from_user.id, "BROADCAST", "users", "active", f"ok={ok}, fail={fail}, text={str(text)[:500]}")
+    await edit_or_answer(callback, header("✅ پیام همگانی ارسال شد") + f"موفق: <b>{fmt_number(ok)}</b>\nناموفق: <b>{fmt_number(fail)}</b>", admin_home_kb(callback.from_user.id))
+
+
+@router.callback_query(F.data == "adm_bot_lock")
+async def admin_bot_lock(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    locked = "قفل 🔒" if setting_get("bot_locked", "0") == "1" else "باز 🔓"
+    await edit_or_answer(callback, header("🔒 قفل بات") + f"وضعیت فعلی: <b>{locked}</b>\n\nپیام قفل فعلی:\n<code>{h(setting_get('bot_lock_message'))}</code>", admin_bot_lock_kb())
+
+
+@router.callback_query(F.data == "adm_bot_lock_on")
+async def admin_bot_lock_on(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    setting_set("bot_locked", "1")
+    admin_log(callback.from_user.id, "BOT_LOCK", "bot", "global", "")
+    await edit_or_answer(callback, header("🔒 بات قفل شد") + "از این لحظه فقط ادمین‌ها می‌توانند از ربات استفاده کنند.", admin_bot_lock_kb())
+
+
+@router.callback_query(F.data == "adm_bot_unlock")
+async def admin_bot_unlock(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    setting_set("bot_locked", "0")
+    admin_log(callback.from_user.id, "BOT_UNLOCK", "bot", "global", "")
+    await edit_or_answer(callback, header("🔓 بات باز شد") + "کاربران عادی دوباره می‌توانند از ربات استفاده کنند.", admin_bot_lock_kb())
+
+
+@router.callback_query(F.data == "adm_bot_lock_msg")
+async def admin_bot_lock_msg_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_bot_lock_message)
+    await edit_or_answer(callback, header("✏️ تغییر پیام قفل") + "پیام جدیدی که کاربران هنگام قفل بودن بات می‌بینند را وارد کنید.", admin_back_kb("adm_bot_lock"))
+
+
+@router.message(AdminStates.waiting_bot_lock_message)
+async def admin_bot_lock_msg_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    text = message.html_text or message.text or ""
+    setting_set("bot_lock_message", text)
+    admin_log(message.from_user.id, "BOT_LOCK_MESSAGE", "bot", "global", text[:500])
+    await state.clear()
+    await message.answer(header("✅ پیام قفل ذخیره شد") + f"<code>{h(text)}</code>", reply_markup=admin_bot_lock_kb())
+
+
+@router.callback_query(F.data == "adm_coupons")
+async def admin_coupons(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("🎟 مدیریت کد تخفیف") + "کد عمومی، اختصاصی یا خرید اول بسازید و مصرف آن را کنترل کنید.", admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_add")
+async def admin_coupon_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_coupon_line)
+    sample = "VIP30 | 30 | all | 100 | 30\nUSER20 | 20 | users:123456,987654 | 10 | 7\nFIRST15 | 15 | first_purchase | 200 | 14"
+    await edit_or_answer(callback, header("➕ ساخت/ویرایش کد") + "فرمت را دقیق وارد کنید:\n<code>CODE | percent | scope | usage_limit | expires_days</code>\n\nScope می‌تواند <code>all</code>، <code>first_purchase</code> یا <code>users:ID1,ID2</code> باشد.\n\nنمونه:\n<code>" + h(sample) + "</code>", admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_line)
+async def admin_coupon_add_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    parts = [p.strip() for p in (message.text or "").split("|")]
+    if len(parts) < 5:
+        await message.answer("❌ فرمت اشتباه است. نمونه: <code>VIP30 | 30 | all | 100 | 30</code>")
+        return
+    code = parts[0].upper()
+    percent = parse_amount(parts[1])
+    scope_raw = parts[2]
+    usage_limit = parse_amount(parts[3])
+    expires_days = parse_amount(parts[4])
+    if not code or percent is None or percent <= 0 or percent > 90:
+        await message.answer("❌ کد یا درصد معتبر نیست.")
+        return
+    scope = scope_raw
+    targets = ""
+    if scope_raw.startswith("users:"):
+        scope = "users"
+        targets = scope_raw.replace("users:", "", 1).replace(" ", "")
+    if scope not in {"all", "users", "first_purchase"}:
+        await message.answer("❌ Scope معتبر نیست. از all، first_purchase یا users:ID1,ID2 استفاده کنید.")
+        return
+    create_coupon_admin(code, int(percent), f"کد تخفیف {code}", scope, targets, usage_limit, expires_days, message.from_user.id if message.from_user else 0)
+    await state.clear()
+    await message.answer(header("✅ کد تخفیف ذخیره شد") + f"کد <code>{h(code)}</code> با تخفیف <b>{percent}%</b> فعال شد.", reply_markup=admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_disable")
+async def admin_coupon_disable_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_disable_coupon)
+    await edit_or_answer(callback, header("⛔ غیرفعال کردن کد") + "کد تخفیف را وارد کنید.", admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_disable_coupon)
+async def admin_coupon_disable_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    code = (message.text or "").strip().upper()
+    ok = disable_coupon_admin(code, message.from_user.id if message.from_user else 0)
+    await state.clear()
+    await message.answer((header("✅ کد غیرفعال شد") if ok else header("❌ کد پیدا نشد")) + f"<code>{h(code)}</code>", reply_markup=admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_list")
+async def admin_coupon_list(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    with closing(db.connect()) as conn:
+        coupons = list(conn.execute("SELECT * FROM coupons ORDER BY created_at DESC LIMIT 20").fetchall())
+    text = header("📋 کدهای تخفیف")
+    if not coupons:
+        text += "کدی ثبت نشده است."
+    else:
+        for c in coupons:
+            active = "✅" if int(c["active"]) else "⛔"
+            limit = c["usage_limit"] if c["usage_limit"] is not None else "∞"
+            text += f"{active} <code>{h(c['code'])}</code> — {c['percent']}٪ — مصرف: {fmt_number(int(c['used_count']))}/{h(limit)} — scope: <code>{h(c['scope'])}</code>\n"
+    await edit_or_answer(callback, text, admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_reports")
+async def admin_reports(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "reports") and not require_admin_id(callback.from_user.id, "dashboard"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    today = datetime.now(TEHRAN_TZ).date().isoformat()
+    week = (datetime.now(TEHRAN_TZ) - timedelta(days=7)).date().isoformat()
+    month = (datetime.now(TEHRAN_TZ) - timedelta(days=30)).date().isoformat()
+    total_users = db_count("SELECT COUNT(*) FROM users")
+    users_today = db_count("SELECT COUNT(*) FROM users WHERE created_at >= ?", (today,))
+    active_services = db_count("SELECT COUNT(*) FROM services WHERE status = 'active'")
+    sales_today = db_sum("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid' AND created_at >= ?", (today,))
+    sales_week = db_sum("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid' AND created_at >= ?", (week,))
+    sales_month = db_sum("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid' AND created_at >= ?", (month,))
+    coupon_usages = db_count("SELECT COUNT(*) FROM coupon_usages")
+    rewarded_refs = db_count("SELECT COUNT(*) FROM referrals WHERE rewarded = 1")
+    text = (
+        header("📊 گزارش‌ها")
+        + f"👥 کاربران کل: <b>{fmt_number(total_users)}</b>\n"
+        + f"🆕 کاربران امروز: <b>{fmt_number(users_today)}</b>\n"
+        + f"📦 سرویس‌های فعال: <b>{fmt_number(active_services)}</b>\n"
+        + f"💰 فروش امروز: <b>{fmt_money(sales_today)}</b>\n"
+        + f"💰 فروش ۷ روز: <b>{fmt_money(sales_week)}</b>\n"
+        + f"💰 فروش ۳۰ روز: <b>{fmt_money(sales_month)}</b>\n"
+        + f"🎟 مصرف کد تخفیف: <b>{fmt_number(coupon_usages)}</b>\n"
+        + f"💎 دعوت موفق: <b>{fmt_number(rewarded_refs)}</b>"
+    )
+    await edit_or_answer(callback, text, admin_back_kb("adm_home"))
+
+
+@router.callback_query(F.data == "adm_admins")
+async def admin_admins(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("👮 مدیریت ادمین‌ها") + "ادمین جدید اضافه کنید یا لیست ادمین‌ها را ببینید.", admin_admins_kb())
+
+
+@router.callback_query(F.data == "adm_admin_add")
+async def admin_admin_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_add_admin_line)
+    await edit_or_answer(callback, header("➕ اضافه کردن ادمین") + "فرمت:\n<code>chat_id | role</code>\n\nRole: <code>super</code>، <code>sales</code>، <code>support</code>، <code>marketing</code>", admin_back_kb("adm_admins"))
+
+
+@router.message(AdminStates.waiting_add_admin_line)
+async def admin_admin_add_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    parts = [p.strip() for p in (message.text or "").split("|")]
+    if len(parts) < 2:
+        await message.answer("❌ فرمت اشتباه است. نمونه: <code>123456789 | support</code>")
+        return
+    uid_s = normalize_digits(parts[0])
+    role = parts[1].lower()
+    if not uid_s.isdigit() or role not in ADMIN_ROLE_PERMISSIONS:
+        await message.answer("❌ چت‌آیدی یا سطح دسترسی معتبر نیست.")
+        return
+    uid = int(uid_s)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET role = excluded.role, is_active = 1
+            """,
+            (uid, role, message.from_user.id if message.from_user else None, now_iso()),
+        )
+        conn.commit()
+    admin_log(message.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
+    await state.clear()
+    await message.answer(header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.", reply_markup=admin_admins_kb())
+
+
+@router.callback_query(F.data == "adm_admin_list")
+async def admin_admin_list(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    with closing(db.connect()) as conn:
+        rows = list(conn.execute("SELECT * FROM admins ORDER BY created_at DESC LIMIT 50").fetchall())
+    text = header("📋 لیست ادمین‌ها")
+    for a in rows:
+        active = "✅" if int(a["is_active"]) else "⛔"
+        text += f"{active} <code>{a['telegram_id']}</code> — <b>{h(a['role'])}</b> — {h(a['created_at'][:10])}\n"
+    await edit_or_answer(callback, text, admin_admins_kb())
+
+
+@router.callback_query(F.data == "adm_logs")
+async def admin_logs(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    with closing(db.connect()) as conn:
+        rows = list(conn.execute("SELECT * FROM admin_logs ORDER BY id DESC LIMIT 20").fetchall())
+    text = header("📜 آخرین لاگ‌های ادمین")
+    if not rows:
+        text += "لاگی ثبت نشده است."
+    else:
+        for r in rows:
+            text += f"#{r['id']} | <code>{r['admin_telegram_id']}</code> | <b>{h(r['action'])}</b> | {h(r['target_type'])}:{h(r['target_id'])} | <code>{h(r['created_at'][:16])}</code>\n"
+    await edit_or_answer(callback, text, admin_back_kb("adm_home"))
+
+
 @router.message()
 async def unknown(message: Message, state: FSMContext) -> None:
     ensure_from_message(message)
-    await message.answer("گزینه موردنظر را از منوی پایین انتخاب کنید 👇", reply_markup=main_menu_kb())
+    await message.answer("گزینه موردنظر را از منوی پایین انتخاب کنید 👇", reply_markup=main_menu_kb(message.from_user.id if message.from_user else None))
 
 
 async def main() -> None:
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.middleware(AccessGuardMiddleware())
+    dp.callback_query.middleware(AccessGuardMiddleware())
     dp.include_router(router)
     logger.info("Bot started: @%s", BOT_USERNAME)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
