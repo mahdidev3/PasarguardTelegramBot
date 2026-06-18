@@ -1,0 +1,17 @@
+[Unit]
+Description=PasarGuard Persian Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pasarguard-telegram-bot
+EnvironmentFile=/opt/pasarguard-telegram-bot/.env
+ExecStart=/opt/pasarguard-telegram-bot/.venv/bin/python /opt/pasarguard-telegram-bot/main.py
+Restart=always
+RestartSec=5
+User=telegrambot
+Group=telegrambot
+
+[Install]
+WantedBy=multi-user.target
