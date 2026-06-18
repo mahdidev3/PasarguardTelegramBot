@@ -1,6 +1,8 @@
-# HowTooSee Bot — Phase 2
+# HowTooSee / Pasarguard Bot — Phase 4.9
 
-Run:
+This checkpoint adds the full Pasarguard admin panel controls on top of Phase 4.8.
+
+## Run
 
 ```bash
 python -m venv .venv
@@ -11,54 +13,39 @@ nano .env
 python main.py
 ```
 
-Phase 2 adds:
+## Pasarguard admin panel
 
-- DB-backed plan management from admin panel.
-- Data-addon management.
-- Sync of active PostgreSQL plans into the legacy buying flow.
-- Editable text templates from admin panel.
-- Broadcast campaigns with text/photo/video/document/voice/audio and URL buttons.
-- Broadcast preview and numeric confirmation before final send.
+Telegram admin menu:
 
-Admin entry is still not `/admin`. Admins see `👑 پنل مدیریت` in the main menu.
-
-Important:
-
-- `DATABASE_URL` is required.
-- A fresh PostgreSQL DB is expected.
-- `bot.db` is not part of the new data architecture and is not preserved.
-- Real Pasarguard API connection is intentionally not added yet.
-
-PostgreSQL quick setup:
-
-```bash
-sudo apt update
-sudo apt install postgresql postgresql-contrib
-sudo -u postgres createuser pasarguard_telegram_bot
-sudo -u postgres createdb pasarguard_telegram_bot
-sudo -u postgres psql
+```text
+👑 پنل مدیریت → 🔌 Pasarguard
 ```
 
-Inside psql:
+Includes:
 
-```sql
-ALTER USER pasarguard_telegram_bot WITH PASSWORD 'YOUR_STRONG_PASSWORD';
-GRANT ALL PRIVILEGES ON DATABASE pasarguard_telegram_bot TO pasarguard_telegram_bot;
-\q
+- 📊 داشبورد Pasarguard
+- 📡 تست اتصال
+- 🧪 Dry-run سینک Templateها
+- ✅ اعمال Sync Templateها
+- 🔄 Sync سرویس‌ها از پنل
+- 🧪 Dry-run Reconcile فعلی
+- ✅ اعمال Reconcile فعلی
+- 🧭 Userهای Orphan
+- 📜 لاگ Sync
+- 🗃 Snapshotها
+
+`Reconcile فعلی` compares the current bot database desired state with the live Pasarguard panel. It does not require a backup file. The apply action still requires numeric confirmation and never performs real remote deletion.
+
+## Safety
+
+Keep dry-run enabled until you trust the report:
+
+```env
+PASARGUARD_DRY_RUN=true
 ```
 
-### Phase 4.5/4.6 notes
+When applying real template/user changes:
 
-This checkpoint starts real service-user integration. Keep `PASARGUARD_DRY_RUN=true` for the first run. With dry-run on, Telegram purchase flows keep working but no remote Pasarguard user is created. After template sync works, set `PASARGUARD_DRY_RUN=false` to create/modify remote users.
-
-### Phase 4.8 Pasarguard checkpoint backup/restore
-
-When `PASARGUARD_ENABLED=true`, complete backups contain:
-
-- `external/pasarguard_desired_templates.jsonl`
-- `external/pasarguard_desired_state.jsonl`
-- `external/pasarguard_actual_templates.jsonl`
-- `external/pasarguard_actual_users.jsonl`
-- `external/pasarguard_summary.json`
-
-During restore, the bot first shows a dry-run reconcile report. After numeric confirmation, it restores the bot databases and then reconciles Pasarguard. Keep `PASARGUARD_DRY_RUN=true` for report-only restore testing. Set it to `false` only when you want the bot to actually create/update remote templates/users.
+```env
+PASARGUARD_DRY_RUN=false
+```

@@ -1,58 +1,29 @@
-# HowTooSee Bot Phase Plan
+# HowTooSee / Pasarguard Bot Phase Plan
 
-## Current checkpoint: Phase 2
+## Completed
+- Phase 0: multi-file architecture cleanup.
+- Phase 1: PostgreSQL/SQLAlchemy foundation, database models, complete ticket system, numeric second confirmation.
+- Phase 1.1: ticket bugfixes, attachment viewing, attachment cleanup on close.
+- Phase 2: DB-managed plans, editable texts, broadcast with media/file/custom buttons.
+- Phase 3: CSV/Excel exports, full backup, full restore, usage reports.
+- Phase 3.1: scheduled backups, real ticket media backup, ticket media access cleanup on close.
+- Phase 4.0-4.4: Pasarguard health/auth client, sync models, template governance, plan-to-template sync.
+- Phase 4.5-4.6: real purchase integration via Pasarguard templates, remote user creation, renewal/addon/status/link/reset remote operations.
+- Phase 4.7: pull sync usage/status/expire/subscription URL from Pasarguard to bot and template drift detection.
+- Phase 4.8: Pasarguard backup/restore checkpoint with actual_state, desired_state, dry-run restore/reconcile.
+- Phase 4.9: full Pasarguard admin panel controls: overview, health, template sync, user sync, current-state reconcile, orphan users, sync logs, remote snapshots.
 
-Done in Phase 0:
-- Split project structure and kept the legacy runtime stable.
+## Next possible hardening after Phase 4.9
+- Permission-aware UI based on current admin details if Pasarguard exposes exact permissions.
+- Import orphan users into bot records, only after explicit admin confirmation.
+- Scheduled Pasarguard reconcile, disabled by default.
+- More exact usage restore if Pasarguard adds safe API for setting non-zero usage.
 
-Done in Phase 1:
-- PostgreSQL/SQLAlchemy foundation.
-- Core models.
-- Complete ticket system.
-- Numeric second confirmation.
-- Ticket bugfixes for category selection, media viewing, assignee labels, and duplicate last-message rendering.
-
-Done in Phase 2:
-- Database-backed plan catalog.
-- Admin plan management.
-- Database-backed data-addon management.
-- Legacy buy catalog sync from PostgreSQL.
-- Editable text/message templates from admin panel.
-- Media/file/video/voice broadcast campaigns.
-- URL button support for broadcasts.
-- Broadcast preview and numeric confirmation before final send.
-- Broadcast delivery recipient tracking.
-
-Next Phase 3:
-- CSV/Excel exports.
-- Full backup.
-- Full restore.
-- Usage report inside backup.
-
-Future Phase 4:
-- Pasarguard backup/restore adapter.
-- Pasarguard remote service create/update/reconcile.
-- Data usage/time remaining sync.
-
-## Phase 4.5/4.6 checkpoint
-
-- Connect paid service creation to Pasarguard `create_user_from_template`.
-- Store remote username, remote id, template id, subscription URL and sync status in legacy SQLite service rows and PostgreSQL mapping tables.
-- Prefer Pasarguard subscription URL in user/admin service displays.
-- Connect renewal to Pasarguard template re-apply.
-- Connect addon volume changes to Pasarguard data_limit updates.
-- Connect service status/delete/refund to safe Pasarguard disable/enable updates.
-- Connect link revoke and usage reset to Pasarguard operations.
-- Keep `PASARGUARD_DRY_RUN=true` as a safe no-op mode.
-
-## Phase 4.8 — Pasarguard backup/restore checkpoint
-
-Status: implemented in this package.
-
-- Backups now include Pasarguard actual templates/users when `PASARGUARD_ENABLED=true`.
-- Backups include desired Pasarguard templates/users derived from bot plans/services.
-- Restore upload shows a Pasarguard dry-run reconcile report before confirmation.
-- Confirmed restore runs database restore first, then Pasarguard reconcile.
-- With `PASARGUARD_DRY_RUN=true`, reconcile only reports actions.
-- With `PASARGUARD_DRY_RUN=false`, reconcile creates/updates templates/users and never remote-deletes users.
-- Exact non-zero usage restore is reported when the API cannot safely set usage exactly; zero usage is restored with reset.
+## Project rules
+- Use Pasarguard templates for bot-created users.
+- Every Pasarguard user created by the bot must have data_limit/traffic configured.
+- Bot-managed templates must be recognizable by marker/prefix/name mapping.
+- Bot plans and Pasarguard templates must stay synced.
+- Bot services and Pasarguard users must stay synced.
+- No real remote deletion by default; use disable/suspend unless explicitly changed later.
+- Dangerous operations require numeric confirmation.
