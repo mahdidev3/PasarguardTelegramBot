@@ -43,6 +43,7 @@ from app.routers.reports import reports_router
 from app.routers.backup import backup_router
 from app.routers.pasarguard import pasarguard_router
 from app.services.scheduled_backup_service import start_auto_backup_scheduler
+from app.services.pasarguard_template_service import render_sync_report, sync_plan_templates
 from app.services.pasarguard_user_service import (
     apply_template_to_remote_user,
     create_remote_user_for_service,
@@ -2835,8 +2836,20 @@ async def admin_pasarguard_pull_all_services(callback: CallbackQuery) -> None:
         return
     await callback.answer("در حال sync سرویس‌ها از Pasarguard…", show_alert=False)
     report = await sync_all_remote_users_from_panel(db, limit=500)
-    admin_log(callback.from_user.id, "PASARGUARD_PULL_ALL_USERS", "pasarguard", "users", f"synced={report.synced}; failed={report.failed}; skipped={report.skipped}")
-    await edit_or_answer(callback, header("🔄 نتیجه Sync سرویس‌ها از Pasarguard") + f"<pre>{h(render_remote_bulk_sync_report(report))}</pre>", admin_back_kb("adm_pasarguard"))
+    # Also run a read-only template reconcile so manual edits/deletes in the panel are visible from this button.
+    template_report = await sync_plan_templates(callback.from_user.id, dry_run=True)
+    admin_log(
+        callback.from_user.id,
+        "PASARGUARD_PULL_ALL_USERS",
+        "pasarguard",
+        "users",
+        f"synced={report.synced}; changed={report.changed}; failed={report.failed}; skipped={report.skipped}; template_actions={template_report.action_count}",
+    )
+    text = header("🔄 نتیجه Sync سرویس‌ها و Templateها از Pasarguard")
+    text += "<b>سرویس‌ها / Userها:</b>\n" + f"<pre>{h(render_remote_bulk_sync_report(report))}</pre>"
+    text += "\n<b>Templateها / پلن‌ها:</b>\n" + f"<pre>{h(render_sync_report(template_report))}</pre>"
+    text += "\n<i>بخش Templateها فقط dry-run است؛ اگر template حذف/تغییر شده باشد اینجا گزارش می‌شود، اما برای ساخت/اصلاح واقعی باید «اعمال Sync Templateها» را بزنید.</i>"
+    await edit_or_answer(callback, text, admin_back_kb("adm_pasarguard"))
 
 
 @router.callback_query(F.data.startswith("adm_svc_status:"))

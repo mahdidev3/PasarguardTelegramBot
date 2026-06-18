@@ -108,6 +108,10 @@ def _remote_id(remote: dict[str, Any] | None) -> int | None:
         return None
 
 
+def _plan_had_remote_binding(plan: CatalogPlan) -> bool:
+    return bool(getattr(plan, "pasarguard_template_id", None) or getattr(plan, "pasarguard_template_name", None))
+
+
 def diff_template(remote: dict[str, Any], desired: dict[str, Any]) -> dict[str, Any]:
     changes: dict[str, Any] = {}
     for key in ["name", "data_limit", "expire_duration", "username_prefix", "username_suffix", "group_ids", "data_limit_reset_strategy", "is_disabled"]:
@@ -264,7 +268,19 @@ async def sync_plan_templates(admin_id: int | None = None, *, dry_run: bool | No
                 rid = _remote_id(remote)
 
                 if remote is None:
-                    action = TemplateSyncAction(plan.key, "create", desired["name"], details={"desired": desired})
+                    missing_existing = _plan_had_remote_binding(plan)
+                    action_name = "recreate_missing_remote" if missing_existing else "create"
+                    action = TemplateSyncAction(
+                        plan.key,
+                        action_name,
+                        desired["name"],
+                        remote_template_id=int(plan.pasarguard_template_id) if getattr(plan, "pasarguard_template_id", None) else None,
+                        details={
+                            "desired": desired,
+                            "previous_template_id": getattr(plan, "pasarguard_template_id", None),
+                            "previous_template_name": getattr(plan, "pasarguard_template_name", None),
+                        },
+                    )
                     if not desired.get("group_ids"):
                         action.ok = False
                         action.error = "PASARGUARD_TEMPLATE_GROUP_IDS خالی است؛ ساخت template واقعی ممکن نیست."
@@ -277,9 +293,9 @@ async def sync_plan_templates(admin_id: int | None = None, *, dry_run: bool | No
                         except Exception as exc:
                             action.ok = False
                             action.error = str(exc)
-                            await upsert_local_template_mapping(plan, None, "error", str(exc))
-                    else:
-                        await upsert_local_template_mapping(plan, None, "dry_run_create")
+                            # Keep the previous local binding visible for debugging instead of silently erasing it.
+                            await upsert_local_template_mapping(plan, None, "missing_remote_error" if missing_existing else "error", str(exc))
+                    # Dry-run must not rewrite local template_id. It is a report only.
                     report.actions.append(action)
                     await log_sync_event(job_id, action, None, remote or desired)
                     continue
@@ -321,11 +337,12 @@ async def sync_plan_templates(admin_id: int | None = None, *, dry_run: bool | No
 def _action_label(action: TemplateSyncAction, *, dry_run: bool) -> str:
     labels = {
         "create": "ساخت template",
+        "recreate_missing_remote": "ساخت دوباره template حذف‌شده از پنل",
         "update": "ویرایش template",
         "orphan_remote": "template اضافه در پنل",
     }
     base = labels.get(action.action, action.action)
-    if dry_run and action.action in {"create", "update"}:
+    if dry_run and action.action in {"create", "update", "recreate_missing_remote"}:
         return f"قرار است {base} انجام شود"
     if dry_run and action.action == "orphan_remote":
         return "فقط گزارش: template اضافه در پنل"

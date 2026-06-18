@@ -37,11 +37,15 @@ class RemoteServiceResult:
     remote_user_id: int | None = None
     subscription_url: str | None = None
     remote_state: dict[str, Any] | None = None
+    changes: list[str] | None = None
     error: str | None = None
 
     def notice(self) -> str:
+        change_text = ""
+        if self.changes:
+            change_text = "\n" + "\n".join(f"• {item}" for item in self.changes[:8])
         if self.ok and self.applied:
-            return f"\n\n🔌 Pasarguard: {self.message or 'عملیات remote با موفقیت انجام شد.'}"
+            return f"\n\n🔌 Pasarguard: {self.message or 'عملیات remote با موفقیت انجام شد.'}{change_text}"
         if self.skipped:
             return f"\n\n🔌 Pasarguard: {self.message}"
         if not self.ok:
@@ -75,6 +79,16 @@ def _remote_id(remote: dict[str, Any] | None) -> int | None:
         return int(raw) if raw is not None else None
     except Exception:
         return None
+
+
+def _normalize_remote_user_payload(remote: Any) -> dict[str, Any]:
+    """Accept Pasarguard responses that may wrap the user under data/user keys."""
+    if isinstance(remote, dict):
+        for key in ("user", "data", "result"):
+            if isinstance(remote.get(key), dict) and (remote[key].get("username") or remote[key].get("id")):
+                return dict(remote[key])
+        return dict(remote)
+    return {}
 
 
 def _parse_remote_expire(value: Any) -> datetime | None:
@@ -476,13 +490,18 @@ async def sync_remote_user_from_local(sqlite_db: Any, service: Mapping[str, Any]
 class RemoteBulkSyncReport:
     total: int = 0
     synced: int = 0
+    changed: int = 0
+    unchanged: int = 0
     failed: int = 0
     skipped: int = 0
+    changed_items: list[str] | None = None
     errors: list[str] | None = None
 
     def __post_init__(self) -> None:
         if self.errors is None:
             self.errors = []
+        if self.changed_items is None:
+            self.changed_items = []
 
 
 def _remote_status_to_local(remote: dict[str, Any]) -> str | None:
@@ -511,6 +530,59 @@ def _remote_bytes_to_mb_int(value: Any) -> int | None:
         return int(float(value) / BYTES_PER_MB)
     except Exception:
         return None
+
+
+def _fmt_gb(value: float | None) -> str:
+    if value is None:
+        return "نامشخص"
+    return f"{value:g}GB"
+
+
+def _fmt_mb(value: int | None) -> str:
+    if value is None:
+        return "نامشخص"
+    return f"{value}MB"
+
+
+def _service_panel_diffs(service: Mapping[str, Any], remote: dict[str, Any]) -> list[str]:
+    """Return human-readable differences before applying panel state locally."""
+    changes: list[str] = []
+
+    remote_data_gb = _remote_bytes_to_gb(remote.get("data_limit"))
+    local_data_raw = _row_get(service, "data_gb")
+    try:
+        local_data_gb = round(float(local_data_raw), 6) if local_data_raw is not None else None
+    except Exception:
+        local_data_gb = None
+    if remote_data_gb is not None and local_data_gb is not None and abs(remote_data_gb - local_data_gb) > 0.001:
+        changes.append(f"حجم کل: بات {_fmt_gb(local_data_gb)} → پنل {_fmt_gb(remote_data_gb)}")
+
+    remote_used_mb = _remote_bytes_to_mb_int(remote.get("used_traffic"))
+    local_used_raw = _row_get(service, "data_used_mb")
+    try:
+        local_used_mb = int(local_used_raw) if local_used_raw is not None else None
+    except Exception:
+        local_used_mb = None
+    if remote_used_mb is not None and local_used_mb is not None and remote_used_mb != local_used_mb:
+        changes.append(f"مصرف: بات {_fmt_mb(local_used_mb)} → پنل {_fmt_mb(remote_used_mb)}")
+
+    remote_expire = _parse_remote_expire(remote.get("expire"))
+    local_expire_raw = _row_get(service, "expires_at")
+    local_expire = _parse_remote_expire(local_expire_raw)
+    if remote_expire and local_expire and abs((remote_expire - local_expire).total_seconds()) > 60:
+        changes.append(f"انقضا: بات {local_expire.isoformat(timespec='seconds')} → پنل {remote_expire.isoformat(timespec='seconds')}")
+
+    remote_status = _remote_status_to_local(remote)
+    local_status = str(_row_get(service, "status", "") or "")
+    if remote_status and local_status and remote_status != local_status:
+        changes.append(f"وضعیت: بات {local_status} → پنل {remote_status}")
+
+    remote_url = str(remote.get("subscription_url") or "")
+    local_url = str(_row_get(service, "pasarguard_subscription_url") or "")
+    if remote_url and remote_url != local_url:
+        changes.append("لینک اشتراک از پنل بروزرسانی شد")
+
+    return changes
 
 
 def _sqlite_apply_remote_panel_state(sqlite_db: Any, service: Mapping[str, Any], remote: dict[str, Any], *, status: str = "synced", error: str | None = None) -> None:
@@ -573,8 +645,8 @@ async def sync_remote_user_from_panel(sqlite_db: Any, service: Mapping[str, Any]
     try:
         async with PasarguardClient() as client:
             remote = await client.get_user_by_username(username)
-        if not isinstance(remote, dict):
-            remote = {}
+        remote = _normalize_remote_user_payload(remote)
+        changes = _service_panel_diffs(service, remote)
         actual_username = str(remote.get("username") or username)
         template_id = _row_get(service, "pasarguard_template_id")
         _sqlite_apply_remote_panel_state(sqlite_db, service, remote, status="synced_from_panel")
@@ -591,7 +663,8 @@ async def sync_remote_user_from_panel(sqlite_db: Any, service: Mapping[str, Any]
             True,
             action,
             applied=True,
-            message="وضعیت مصرف/زمان/لینک از پنل خوانده و در بات ذخیره شد.",
+            message="وضعیت مصرف/زمان/لینک از پنل خوانده و در بات ذخیره شد." if changes else "وضعیت خوانده شد؛ اختلافی با دیتابیس بات پیدا نشد.",
+            changes=changes,
             remote_username=actual_username,
             remote_user_id=_remote_id(remote),
             subscription_url=remote.get("subscription_url"),
@@ -634,6 +707,11 @@ async def sync_all_remote_users_from_panel(sqlite_db: Any, *, limit: int = 500) 
         result = await sync_remote_user_from_panel(sqlite_db, row)
         if result.ok and result.applied:
             report.synced += 1
+            if result.changes:
+                report.changed += 1
+                report.changed_items.append(f"#{_row_get(row, 'id')} | {result.remote_username or _row_get(row, 'pasarguard_username')}: " + "؛ ".join(result.changes[:5]))
+            else:
+                report.unchanged += 1
         elif result.skipped:
             report.skipped += 1
         else:
@@ -645,10 +723,18 @@ async def sync_all_remote_users_from_panel(sqlite_db: Any, *, limit: int = 500) 
 def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
     lines = [
         f"تعداد سرویس‌های دارای remote username: {report.total}",
-        f"✅ sync شده: {report.synced}",
+        f"✅ خوانده‌شده از پنل: {report.synced}",
+        f"🔁 دارای اختلاف و بروزرسانی‌شده: {report.changed}",
+        f"➖ بدون اختلاف: {report.unchanged}",
         f"⏭ رد شده: {report.skipped}",
         f"❌ خطا: {report.failed}",
     ]
+    if report.changed_items:
+        lines.append("\nتغییرات تشخیص‌داده‌شده:")
+        for item in report.changed_items[:15]:
+            lines.append(f"• {item}")
+        if len(report.changed_items) > 15:
+            lines.append(f"… و {len(report.changed_items) - 15} مورد دیگر")
     if report.errors:
         lines.append("\nخطاها:")
         for err in report.errors[:15]:
