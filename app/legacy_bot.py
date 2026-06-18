@@ -83,6 +83,7 @@ FREE_TEST_MB = int(os.getenv("FREE_TEST_MB", "150"))
 WALLET_MIN_TOPUP = int(os.getenv("WALLET_MIN_TOPUP", "50000"))
 SERVICE_NAME_PREFIX = os.getenv("SERVICE_NAME_PREFIX", "howtosee_").strip()
 ADMIN_CHAT_IDS_RAW = os.getenv("ADMIN_CHAT_IDS", "").strip()
+SALES_ADMIN_CHAT_IDS_RAW = os.getenv("SALES_ADMIN_CHAT_IDS", "").strip()
 
 
 def parse_id_set(value: str) -> set[int]:
@@ -95,6 +96,7 @@ def parse_id_set(value: str) -> set[int]:
 
 
 BOOTSTRAP_SUPER_ADMIN_IDS = parse_id_set(ADMIN_CHAT_IDS_RAW)
+SALES_ADMIN_CHAT_IDS = parse_id_set(SALES_ADMIN_CHAT_IDS_RAW)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and set your bot token.")
@@ -246,8 +248,8 @@ def subscription_link_or_pending_text(service: sqlite3.Row) -> str:
         return link
     status = str(service["status"] or "")
     if status in {"provisioning", "provisioning_failed"}:
-        return "لینک واقعی هنوز از Pasarguard دریافت نشده است."
-    return "لینک واقعی Pasarguard برای این سرویس ثبت نشده است."
+        return "لینک اشتراک هنوز آماده نشده است."
+    return "لینک اشتراک برای این سرویس هنوز ثبت نشده است."
 
 
 # -----------------------------
@@ -410,6 +412,11 @@ class DB:
     def update_order_service(self, order_id: int, service_id: int) -> None:
         with closing(self.connect()) as conn:
             conn.execute("UPDATE orders SET service_id = ? WHERE id = ?", (service_id, order_id))
+            conn.commit()
+
+    def update_order_service_name(self, order_id: int, telegram_id: int, service_name: str) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("UPDATE orders SET service_name = ? WHERE id = ? AND user_telegram_id = ?", (service_name, order_id, telegram_id))
             conn.commit()
 
     def get_order(self, order_id: int, telegram_id: int) -> Optional[sqlite3.Row]:
@@ -605,6 +612,37 @@ def ensure_admin_schema() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(code, order_id)
             );
+
+            CREATE TABLE IF NOT EXISTS payment_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_number TEXT NOT NULL,
+                owner_name TEXT NOT NULL,
+                bank_name TEXT,
+                note TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS payment_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                card_id INTEGER,
+                amount INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'waiting_receipt',
+                receipt_file_id TEXT,
+                receipt_file_unique_id TEXT,
+                receipt_file_type TEXT,
+                receipt_message_id INTEGER,
+                receipt_chat_id INTEGER,
+                user_caption TEXT,
+                admin_note TEXT,
+                reviewed_by INTEGER,
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         for table, column, ddl in [
@@ -626,6 +664,10 @@ def ensure_admin_schema() -> None:
             ("orders", "coupon_code", "ALTER TABLE orders ADD COLUMN coupon_code TEXT"),
             ("orders", "coupon_discount", "ALTER TABLE orders ADD COLUMN coupon_discount INTEGER NOT NULL DEFAULT 0"),
             ("orders", "admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT"),
+            ("orders", "service_name", "ALTER TABLE orders ADD COLUMN service_name TEXT"),
+            ("orders", "receipt_id", "ALTER TABLE orders ADD COLUMN receipt_id INTEGER"),
+            ("payment_cards", "note", "ALTER TABLE payment_cards ADD COLUMN note TEXT"),
+            ("payment_receipts", "admin_note", "ALTER TABLE payment_receipts ADD COLUMN admin_note TEXT"),
         ]:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if column not in cols:
@@ -636,6 +678,15 @@ def ensure_admin_schema() -> None:
                 INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
                 VALUES (?, 'super', NULL, 1, ?)
                 ON CONFLICT(telegram_id) DO UPDATE SET role = 'super', is_active = 1
+                """,
+                (admin_id, now_iso()),
+            )
+        for admin_id in SALES_ADMIN_CHAT_IDS:
+            conn.execute(
+                """
+                INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
+                VALUES (?, 'sales', NULL, 1, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET role = CASE WHEN role = 'super' THEN role ELSE 'sales' END, is_active = 1
                 """,
                 (admin_id, now_iso()),
             )
@@ -797,7 +848,7 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     service_id: Optional[int] = None
     if plan_key in PLANS:
-        service_name = make_service_name(telegram_id)
+        service_name = (order["service_name"] if row_has(order, "service_name") and order["service_name"] else make_service_name(telegram_id))
         service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     elif plan_key.startswith("addon:"):
         _, package_key, service_id_s = plan_key.split(":")
@@ -1008,6 +1059,246 @@ def disable_coupon_admin(code: str, admin_id: int) -> bool:
     return False
 
 
+# -----------------------------
+# Card-to-card payment helpers
+# -----------------------------
+def normalize_card_number(value: str) -> str:
+    return re.sub(r"\D+", "", normalize_digits(value or ""))
+
+
+def format_card_number(card_number: str) -> str:
+    digits = normalize_card_number(card_number)
+    return "-".join(digits[i:i + 4] for i in range(0, len(digits), 4)) if digits else ""
+
+
+def list_payment_cards(active_only: bool = False) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        if active_only:
+            return list(conn.execute("SELECT * FROM payment_cards WHERE is_active = 1 ORDER BY id DESC").fetchall())
+        return list(conn.execute("SELECT * FROM payment_cards ORDER BY id DESC").fetchall())
+
+
+def get_payment_card(card_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM payment_cards WHERE id = ?", (card_id,)).fetchone()
+
+
+def choose_payment_card() -> Optional[sqlite3.Row]:
+    cards = list_payment_cards(active_only=True)
+    if not cards:
+        return None
+    return random.choice(cards)
+
+
+def add_payment_card_admin(card_number: str, owner_name: str, bank_name: str = "", note: str = "", active: int = 1) -> int:
+    digits = normalize_card_number(card_number)
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO payment_cards (card_number, owner_name, bank_name, note, is_active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (digits, owner_name.strip(), bank_name.strip(), note.strip(), 1 if active else 0, now_iso(), now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def toggle_payment_card_admin(card_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT is_active FROM payment_cards WHERE id = ?", (card_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute("UPDATE payment_cards SET is_active = ?, updated_at = ? WHERE id = ?", (0 if int(row["is_active"]) else 1, now_iso(), card_id))
+        conn.commit()
+        return True
+
+
+def delete_payment_card_admin(card_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        cur = conn.execute("DELETE FROM payment_cards WHERE id = ?", (card_id,))
+        conn.commit()
+        return bool(cur.rowcount)
+
+
+def payment_card_label(card: sqlite3.Row) -> str:
+    status = "فعال" if int(card["is_active"] or 0) else "غیرفعال"
+    bank = f" | {card['bank_name']}" if card["bank_name"] else ""
+    return f"#{card['id']} | {format_card_number(card['card_number'])} | {card['owner_name']}{bank} | {status}"
+
+
+def payment_cards_text() -> str:
+    cards = list_payment_cards(False)
+    text = header("💳 روش کارت‌به‌کارت")
+    text += "از این بخش می‌توانید چند شماره کارت ثبت کنید. هنگام پرداخت، ربات یکی از کارت‌های فعال را به‌صورت تصادفی به کاربر نمایش می‌دهد.\n\n"
+    text += "ادمین رسیدها به نقش <b>sales</b> ارسال می‌شود. اگر می‌خواهی مستقیم چت‌آیدی خاصی بگیرد، در env مقدار <code>SALES_ADMIN_CHAT_IDS</code> را بگذار.\n\n"
+    if not cards:
+        text += "هنوز کارتی ثبت نشده است."
+    else:
+        for card in cards:
+            text += f"• <code>{h(payment_card_label(card))}</code>\n"
+    return text
+
+
+def payment_cards_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("➕ افزودن کارت", "adm_card_add")]]
+    for card in list_payment_cards(False)[:20]:
+        action = "⛔ غیرفعال" if int(card["is_active"] or 0) else "✅ فعال"
+        rows.append([(f"{action} #{card['id']}", f"adm_card_toggle:{card['id']}"), (f"🗑 حذف #{card['id']}", f"adm_card_delete:{card['id']}")])
+    rows.append([("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def create_or_reset_payment_receipt(order: sqlite3.Row, card: sqlite3.Row, amount: int) -> int:
+    with closing(db.connect()) as conn:
+        existing = conn.execute("SELECT * FROM payment_receipts WHERE order_id = ? ORDER BY id DESC LIMIT 1", (int(order["id"]),)).fetchone()
+        if existing and existing["status"] in {"waiting_receipt", "receipt_pending"}:
+            conn.execute(
+                """
+                UPDATE payment_receipts
+                SET card_id = ?, amount = ?, status = 'waiting_receipt', updated_at = ?
+                WHERE id = ?
+                """,
+                (int(card["id"]), amount, now_iso(), int(existing["id"])),
+            )
+            rid = int(existing["id"])
+        else:
+            cur = conn.execute(
+                """
+                INSERT INTO payment_receipts (order_id, user_telegram_id, card_id, amount, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'waiting_receipt', ?, ?)
+                """,
+                (int(order["id"]), int(order["user_telegram_id"]), int(card["id"]), amount, now_iso(), now_iso()),
+            )
+            rid = int(cur.lastrowid)
+        conn.execute("UPDATE orders SET receipt_id = ?, payment_method = ? WHERE id = ?", (rid, "کارت به کارت", int(order["id"])))
+        conn.commit()
+        return rid
+
+
+def get_receipt(receipt_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)).fetchone()
+
+
+def get_receipt_by_order(order_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM payment_receipts WHERE order_id = ? ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
+
+
+def attach_receipt_file(receipt_id: int, message: Message, file_type: str, file_id: str, file_unique_id: str | None, caption: str | None) -> None:
+    with closing(db.connect()) as conn:
+        receipt = conn.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)).fetchone()
+        if not receipt:
+            return
+        conn.execute(
+            """
+            UPDATE payment_receipts
+            SET status = 'receipt_pending', receipt_file_id = ?, receipt_file_unique_id = ?, receipt_file_type = ?,
+                receipt_message_id = ?, receipt_chat_id = ?, user_caption = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (file_id, file_unique_id, file_type, message.message_id, message.chat.id, caption or "", now_iso(), receipt_id),
+        )
+        conn.execute("UPDATE orders SET status = 'receipt_pending', payment_method = 'کارت به کارت', receipt_id = ? WHERE id = ?", (receipt_id, int(receipt["order_id"])))
+        conn.commit()
+
+
+def update_receipt_review(receipt_id: int, status: str, admin_id: int, note: str = "") -> None:
+    with closing(db.connect()) as conn:
+        receipt = conn.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)).fetchone()
+        if not receipt:
+            return
+        conn.execute(
+            """
+            UPDATE payment_receipts
+            SET status = ?, admin_note = ?, reviewed_by = ?, reviewed_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, note or "", admin_id, now_iso(), now_iso(), receipt_id),
+        )
+        if status == "rejected":
+            conn.execute("UPDATE orders SET status = 'payment_rejected', admin_note = COALESCE(?, admin_note) WHERE id = ?", (note or None, int(receipt["order_id"])))
+        conn.commit()
+
+
+def payment_receipt_summary_for_order(order_id: int) -> str:
+    receipt = get_receipt_by_order(order_id)
+    if not receipt:
+        return ""
+    card = get_payment_card(int(receipt["card_id"])) if receipt["card_id"] else None
+    status_map = {
+        "waiting_receipt": "در انتظار ارسال رسید",
+        "receipt_pending": "رسید در انتظار بررسی",
+        "approved": "رسید تأیید شده",
+        "rejected": "رسید رد شده",
+        "approved_provisioning_failed": "رسید تأیید شد، فعال‌سازی نیازمند بررسی",
+    }
+    text = "\n\n🧾 <b>رسید کارت‌به‌کارت</b>\n"
+    text += f"وضعیت رسید: <b>{h(status_map.get(str(receipt['status']), receipt['status']))}</b>\n"
+    text += f"مبلغ رسید: <b>{fmt_money(int(receipt['amount']))}</b>\n"
+    if card:
+        text += f"کارت مقصد: <code>{h(format_card_number(card['card_number']))}</code> — {h(card['owner_name'])}\n"
+    if receipt["admin_note"]:
+        text += f"یادداشت بررسی: <code>{h(receipt['admin_note'])}</code>\n"
+    return text
+
+
+def sales_admin_ids() -> set[int]:
+    ids: set[int] = set(SALES_ADMIN_CHAT_IDS)
+    with closing(db.connect()) as conn:
+        rows = conn.execute("SELECT telegram_id FROM admins WHERE is_active = 1 AND role IN ('sales', 'super')").fetchall()
+    ids.update(int(r["telegram_id"]) for r in rows)
+    if not ids:
+        ids.update(BOOTSTRAP_SUPER_ADMIN_IDS)
+    return ids
+
+
+def receipt_admin_kb(receipt_id: int, order_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("🖼 مشاهده رسید", f"adm_receipt_view:{receipt_id}")],
+        [("✅ تأیید رسید", f"adm_receipt_approve:{receipt_id}"), ("❌ رد رسید", f"adm_receipt_reject:{receipt_id}")],
+        [("🧾 جزئیات سفارش", f"adm_order:{order_id}"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def card_payment_instructions(order: sqlite3.Row, card: sqlite3.Row, payable: int) -> str:
+    return (
+        header("💳 پرداخت کارت‌به‌کارت", f"سفارش #{order['id']}")
+        + f"لطفاً مبلغ را <b>دقیقاً و بدون هیچ تغییری</b> واریز کنید:\n"
+        + f"💰 مبلغ دقیق: <b>{fmt_money(payable)}</b>\n\n"
+        + f"💳 شماره کارت:\n<code>{h(format_card_number(card['card_number']))}</code>\n"
+        + f"👤 به نام: <b>{h(card['owner_name'])}</b>\n"
+        + (f"🏦 بانک: <b>{h(card['bank_name'])}</b>\n" if card["bank_name"] else "")
+        + (f"📝 توضیح کارت: {h(card['note'])}\n" if row_has(card, "note") and card["note"] else "")
+        + "\n📌 توجه: در برخی اپلیکیشن‌های پرداخت مانند آپ ممکن است هنگام انتقال، خطای محدودیت کارت نمایش داده شود. در این شرایط از همراه‌بانک یا اینترنت‌بانک خود استفاده کنید.\n"
+        + "🚫 لطفاً از انتقال وجه از طریق پایا یا پل خودداری کنید.\n"
+        + "⚠️ مبلغ را گرد نکنید، کمتر یا بیشتر نزنید و توضیح اضافه لازم نیست.\n\n"
+        + "بعد از پرداخت، <b>عکس یا فایل رسید</b> را همین‌جا ارسال کنید. تا زمانی که رسید ارسال نشود، سفارش برای بررسی ثبت نمی‌شود."
+    )
+
+
+def receipt_pending_user_text(order: sqlite3.Row) -> str:
+    return (
+        header("🧾 رسید شما ثبت شد", f"سفارش #{order['id']}")
+        + "رسید پرداخت شما برای ادمین فروش ارسال شد و سفارش در صف بررسی قرار گرفت.\n\n"
+        + "پس از تأیید، سرویس به‌صورت خودکار فعال می‌شود و لینک اشتراک برای شما ارسال خواهد شد.\n"
+        + "اگر رسید نیاز به اصلاح داشته باشد، نتیجه همراه با توضیح برایتان ارسال می‌شود."
+    )
+
+
+def receipt_notify_admin_text(order: sqlite3.Row, receipt: sqlite3.Row) -> str:
+    user = db.get_user(int(order["user_telegram_id"]))
+    username = f"@{user['username']}" if user and user["username"] else "ندارد"
+    return (
+        header("🧾 رسید جدید کارت‌به‌کارت", f"Receipt #{receipt['id']}")
+        + f"سفارش: <code>#{order['id']}</code>\n"
+        + f"کاربر: <code>{order['user_telegram_id']}</code> | {h(username)}\n"
+        + f"مبلغ قابل پرداخت: <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b>\n"
+        + f"نوع سفارش: <code>{h(order['plan_key'])}</code>\n\n"
+        + "رسید را بررسی کنید و سپس تأیید یا رد را بزنید. برای هر دو حالت می‌توانید یادداشت بگذارید."
+    )
+
 db = DB(DATABASE_PATH)
 ensure_admin_schema()
 router = Router()
@@ -1044,6 +1335,8 @@ class AdminStates(StatesGroup):
     waiting_add_admin_line = State()
     waiting_user_note = State()
     waiting_manual_service_amount = State()
+    waiting_card_line = State()
+    waiting_payment_review_note = State()
 
 
 # -----------------------------
@@ -1132,7 +1425,7 @@ def order_payment_kb(order_id: int, payable: int, wallet_balance: int, back_call
     rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
     if wallet_balance >= payable and payable > 0:
         rows.append([("💰 پرداخت با کیف پول", f"pay_wallet:{order_id}")])
-    rows.append([("🤖 ثبت پرداخت موفق دمو", f"pay_demo:{order_id}")])
+    rows.append([("💳 کارت به کارت", f"pay_card:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
@@ -1243,7 +1536,8 @@ def referral_back_kb(invite_link: str, invite_text: str) -> InlineKeyboardMarkup
 def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [
         [("👥 مدیریت کاربران", "adm_users"), ("📦 مدیریت سرویس‌ها", "adm_services")],
-        [("🧾 سفارش‌ها", "adm_orders"), ("💰 کیف پول کاربران", "adm_wallet_start")],
+        [("🧾 سفارش‌ها", "adm_orders"), ("💳 روش‌های پرداخت", "adm_payments")],
+        [("💰 کیف پول کاربران", "adm_wallet_start")],
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
         [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
@@ -1320,8 +1614,8 @@ def admin_service_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
 
 def admin_orders_kb() -> InlineKeyboardMarkup:
     return inline([
-        [("⏳ در انتظار پرداخت", "adm_orders_pending"), ("✅ پرداخت‌شده", "adm_orders_paid")],
-        [("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
+        [("⏳ در انتظار پرداخت", "adm_orders_pending"), ("🧾 رسیدهای در انتظار", "adm_orders_receipts")],
+        [("✅ پرداخت‌شده", "adm_orders_paid"), ("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -1338,7 +1632,11 @@ def admin_order_kb(order: sqlite3.Row) -> InlineKeyboardMarkup:
     oid = int(order["id"])
     uid = int(order["user_telegram_id"])
     rows: list[list[tuple[str, str]]] = []
-    if order["status"] != "paid":
+    receipt = get_receipt_by_order(oid)
+    if receipt and receipt["status"] == "receipt_pending":
+        rows.append([("🖼 مشاهده رسید", f"adm_receipt_view:{receipt['id']}"), ("✅ تأیید رسید", f"adm_receipt_approve:{receipt['id']}")])
+        rows.append([("❌ رد رسید", f"adm_receipt_reject:{receipt['id']}")])
+    elif order["status"] not in {"paid", "rejected", "payment_rejected"}:
         rows.append([("✅ تأیید دستی پرداخت", f"adm_order_pay:{oid}")])
     rows.append([("👤 پروفایل کاربر", f"adm_user:{uid}"), ("🧾 سفارش‌های کاربر", f"adm_user_orders:{uid}")])
     rows.append([("⬅️ سفارش‌ها", "adm_orders"), ("👑 منوی ادمین", "adm_home")])
@@ -1458,6 +1756,7 @@ def admin_order_text(order: sqlite3.Row) -> str:
         + f"💳 روش: <b>{h(order['payment_method'])}</b>\n"
         + f"🎟 کد: <b>{h(coupon)}</b>\n"
         + f"📅 تاریخ: <code>{h(order['created_at'])}</code>"
+        + payment_receipt_summary_for_order(int(order["id"]))
     )
 
 
@@ -1573,7 +1872,7 @@ def payment_text(plan: Plan, service_name: str, order_id: int, amount: int, disc
     text += discount_lines(details)
     text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
     text += f"💼 موجودی کیف پول: <b>{fmt_money(wallet_balance)}</b>\n\n"
-    text += "فعلاً درگاه واقعی وصل نشده؛ برای تست جریان ربات از گزینه پرداخت دمو استفاده کنید."
+    text += "در حال حاضر روش فعال پرداخت، کارت‌به‌کارت است. بعد از ارسال رسید، سفارش شما برای ادمین فروش ارسال می‌شود و پس از تأیید، سرویس فعال خواهد شد."
     return text
 
 
@@ -1591,7 +1890,7 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
         text = header("💳 پرداخت افزایش حجم", service["name"] if service else "سرویس")
         text += f"📈 بسته انتخابی: <b>{h(pkg.title)}</b>\n📊 حجم اضافه: <b>{fmt_number(pkg.data_gb)} گیگابایت</b>\n⏳ افزایش زمان: <b>ندارد</b>\n💰 مبلغ اصلی: <b>{fmt_money(amount)}</b>\n"
         text += discount_lines(details)
-        text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\nفعلاً درگاه واقعی وصل نشده؛ برای تست جریان ربات از گزینه پرداخت دمو استفاده کنید."
+        text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\nدر حال حاضر روش فعال پرداخت، کارت‌به‌کارت است. بعد از ارسال رسید، سفارش شما برای ادمین فروش ارسال می‌شود و پس از تأیید، سرویس فعال خواهد شد."
         return text, f"addon_menu:{service_id_s}", payable
 
     if plan_key.startswith("renew:"):
@@ -1641,7 +1940,7 @@ def service_text(service: sqlite3.Row) -> str:
         f"🔗 لینک کامل اشتراک:\n<code>{h(link)}</code>\n\n"
         f'📊 برای بررسی وضعیت سرویس، حجم مصرفی و زمان باقی‌مانده، از این بخش استفاده کنید:\n<a href="{h(link)}">پنل اشتراکی</a> ❗️\n\n'
         if link else
-        "🔗 لینک اشتراک:\n<code>در انتظار دریافت لینک واقعی Pasarguard</code>\n\n"
+        "🔗 لینک اشتراک:\n<code>در انتظار آماده‌سازی لینک اشتراک</code>\n\n"
     )
     error_line = (
         f"⚠️ خطای فعال‌سازی: <code>{h(service['pasarguard_sync_error'])}</code>\n\n"
@@ -1663,7 +1962,7 @@ def service_text(service: sqlite3.Row) -> str:
 def sub_link_text(service: sqlite3.Row) -> str:
     link = subscription_link(service)
     if not link:
-        return header("🔗 لینک اشتراک", service["name"]) + "هنوز لینک واقعی Pasarguard برای این سرویس ثبت نشده است. لطفاً از جزئیات سرویس گزینه sync را بزنید یا با پشتیبانی تماس بگیرید."
+        return header("🔗 لینک اشتراک", service["name"]) + "هنوز لینک اشتراک برای این سرویس هنوز ثبت نشده است. لطفاً از جزئیات سرویس گزینه sync را بزنید یا با پشتیبانی تماس بگیرید."
     return (
         header("🔗 لینک کامل اشتراک", service["name"])
         + f"<code>{h(link)}</code>\n\n"
@@ -1813,7 +2112,7 @@ async def order_activation_preflight(order: sqlite3.Row, telegram_id: int) -> tu
     if not settings.pasarguard_enabled:
         return True, ""
     if settings.pasarguard_dry_run:
-        return False, "Pasarguard در حالت Dry-run است؛ پرداخت می‌تواند دمو باشد، اما فعال‌سازی production واقعی انجام نمی‌شود. Dry-run را خاموش کن یا از ادمین بخواه سرویس را بعداً دستی فعال کند."
+        return False, "فعال‌سازی خودکار سرویس موقتاً آماده نیست. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید."
     plan_key = str(order["plan_key"])
     if plan_key.startswith("addon:") or plan_key.startswith("renew:"):
         try:
@@ -1824,17 +2123,17 @@ async def order_activation_preflight(order: sqlite3.Row, telegram_id: int) -> tu
         if not service or service["status"] == "deleted":
             return False, "سرویس مقصد برای این سفارش پیدا نشد."
         if 'pasarguard_username' not in service.keys() or not service['pasarguard_username']:
-            return False, "این سرویس هنوز به user واقعی Pasarguard وصل نیست؛ تمدید/افزایش حجم production ممکن نیست."
+            return False, "این سرویس هنوز برای عملیات خودکار آماده نیست. لطفاً با پشتیبانی تماس بگیرید."
         if plan_key.startswith("addon:"):
             return True, ""
         renew_plan_key = plan_key.split(":")[1]
         template_id, _plan, error = await ensure_template_for_plan(renew_plan_key)
         if error or not template_id:
-            return False, error or "template پلن تمدید در Pasarguard پیدا نشد."
+            return False, error or "تنظیمات پلن تمدید هنوز کامل نشده است. لطفاً با پشتیبانی تماس بگیرید."
         return True, ""
     template_id, _plan, error = await ensure_template_for_plan(plan_key)
     if error or not template_id:
-        return False, error or "template پلن در Pasarguard پیدا نشد."
+        return False, error or "تنظیمات این پلن هنوز کامل نشده است. لطفاً با پشتیبانی تماس بگیرید."
     return True, ""
 
 
@@ -2019,6 +2318,7 @@ async def create_pending_order_and_show_payment(target: Message | CallbackQuery,
     referral_discount = int(data.get("referral_discount", 0))
     order_id = db.create_order(tg_id, plan.key, amount, referral_discount, 0, "pending", "none")
     pending_names[order_id] = service_name
+    db.update_order_service_name(order_id, tg_id, service_name)
     order_discounts[order_id] = {"referral": referral_discount, "coupon": 0, "coupon_code": None}
     await state.clear()
     await show_order_payment(target, int(user["telegram_id"]), order_id)
@@ -2090,6 +2390,88 @@ async def pay_wallet(callback: CallbackQuery) -> None:
     await complete_order(callback, int(user["telegram_id"]), int(callback.data.split(":", 1)[1]), "کیف پول", use_wallet=True)
 
 
+@router.callback_query(F.data.startswith("pay_card:"))
+async def pay_card_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, telegram_id)
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
+        return
+    ok, reason = await order_activation_preflight(order, telegram_id)
+    if not ok:
+        await callback.answer("این سفارش فعلاً قابل پرداخت نیست.", show_alert=True)
+        await edit_or_answer(callback, header("⚠️ پرداخت موقتاً غیرفعال است") + h(reason), inline([[('🎫 پشتیبانی', 'ticket_new')], [('⬅️ بازگشت', f'pay_page:{order_id}'), ('🏠 منوی اصلی', 'home')]]))
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    card = choose_payment_card()
+    if not card:
+        await edit_or_answer(
+            callback,
+            header("💳 کارت‌به‌کارت موقتاً غیرفعال است")
+            + "در حال حاضر شماره کارت فعالی برای پرداخت ثبت نشده است. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+            inline([[('🎫 پشتیبانی', 'ticket_new')], [('⬅️ بازگشت', f'pay_page:{order_id}'), ('🏠 منوی اصلی', 'home')]]),
+        )
+        return
+    receipt_id = create_or_reset_payment_receipt(order, card, payable)
+    await state.set_state(CardPaymentStates.waiting_receipt)
+    await state.update_data(order_id=order_id, receipt_id=receipt_id)
+    await edit_or_answer(callback, card_payment_instructions(order, card, payable), inline([[('❌ لغو ارسال رسید', f'pay_page:{order_id}')], [('🏠 منوی اصلی', 'home')]]))
+
+
+@router.message(CardPaymentStates.waiting_receipt)
+async def card_receipt_received(message: Message, state: FSMContext) -> None:
+    user = ensure_from_message(message)
+    data = await state.get_data()
+    order_id = int(data.get("order_id", 0))
+    receipt_id = int(data.get("receipt_id", 0))
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    receipt = get_receipt(receipt_id)
+    if not order or not receipt or order["status"] not in {"pending", "payment_rejected"}:
+        await state.clear()
+        await message.answer("این سفارش دیگر قابل ثبت رسید نیست.", reply_markup=back_home_kb())
+        return
+    text = normalize_digits((message.text or "").strip())
+    if text in {"لغو", "انصراف", "cancel", "/cancel"}:
+        await state.clear()
+        await message.answer("ارسال رسید لغو شد. سفارش هنوز پرداخت نشده است.", reply_markup=back_home_kb())
+        return
+    file_type = ""
+    file_id = ""
+    unique_id = ""
+    if message.photo:
+        photo = message.photo[-1]
+        file_type = "photo"
+        file_id = photo.file_id
+        unique_id = photo.file_unique_id
+    elif message.document:
+        file_type = "document"
+        file_id = message.document.file_id
+        unique_id = message.document.file_unique_id
+    else:
+        await message.answer("برای ثبت پرداخت باید عکس یا فایل رسید را همین‌جا ارسال کنید. اگر قصد ادامه ندارید، کلمه «لغو» را بفرستید.")
+        return
+    attach_receipt_file(receipt_id, message, file_type, file_id, unique_id, message.caption)
+    await state.clear()
+    order = get_order_any(order_id) or order
+    receipt = get_receipt(receipt_id) or receipt
+    await message.answer(receipt_pending_user_text(order), reply_markup=inline([[('💳 تراکنش‌ها', 'home')], [('🏠 منوی اصلی', 'home')]]))
+    targets = sales_admin_ids()
+    if not targets:
+        logger.warning("No sales admins found for receipt %s", receipt_id)
+        return
+    for admin_id in targets:
+        try:
+            await message.bot.send_message(admin_id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, order_id))
+            try:
+                await message.bot.copy_message(admin_id, message.chat.id, message.message_id)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Failed to notify sales admin %s about receipt %s: %s", admin_id, receipt_id, exc)
+
+
 async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: int, method: str, use_wallet: bool) -> None:
     order = db.get_order(order_id, telegram_id)
     if not order or order["status"] != "pending":
@@ -2129,9 +2511,9 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         await edit_or_answer(
             callback,
             header("⚠️ پرداخت ثبت شد ولی فعال‌سازی ناموفق بود", service_name)
-            + "سرویس به‌صورت fake فعال نشد، چون لینک واقعی Pasarguard دریافت نشد.\n"
+            + "فعال‌سازی سرویس تکمیل نشد، چون لینک اشتراک آماده نشد.\n"
             + "اگر با کیف پول پرداخت کرده باشید، مبلغ به کیف پول برگشته است.\n\n"
-            + f"خطا: <code>{h(error)}</code>",
+            + "تیم پشتیبانی می‌تواند جزئیات خطا را در پنل ادمین بررسی کند.",
             inline([[('🎫 ارتباط با پشتیبانی', 'ticket_new')], [('📦 سرویس‌های من', 'my_services'), ('🏠 منوی اصلی', 'home')]]),
         )
         return
@@ -2141,7 +2523,7 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
     reward = db.reward_referrer_if_needed(telegram_id, order_id, payable)
     service = db.get_service(service_id, telegram_id)
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ سفارش با موفقیت فعال شد", service_name) + f"سرویس واقعی Pasarguard شما آماده استفاده است.\n\n{service_text(service)}{extra}" + (remote_result.notice() if remote_result else ""), service_details_kb(service))
+    await edit_or_answer(callback, header("✅ سفارش با موفقیت فعال شد", service_name) + f"سرویس شما آماده استفاده است.\n\n{service_text(service)}{extra}", service_details_kb(service))
 
 
 async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
@@ -2175,7 +2557,7 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
         db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
         refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
         mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
-        await edit_or_answer(callback, header("⚠️ افزایش حجم ناموفق بود", service["name"]) + "تغییر remote در Pasarguard انجام نشد؛ سرویس fake فعال نمی‌شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(db.get_service(service_id, telegram_id)))
+        await edit_or_answer(callback, header("⚠️ افزایش حجم ناموفق بود", service["name"]) + "افزایش حجم روی سرویس تکمیل نشد و تغییری برای کاربر فعال نشد.\n\n" + "تیم پشتیبانی می‌تواند جزئیات خطا را در پنل ادمین بررسی کند.", service_details_kb(db.get_service(service_id, telegram_id)))
         return
 
     if payable > 0:
@@ -2189,7 +2571,7 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
         await sync_remote_user_from_panel(db, service)
         service = db.get_service(service_id, telegram_id) or service
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ حجم سرویس افزایش یافت", service["name"]) + f"بسته <b>{h(pkg.title)}</b> به سرویس واقعی شما اضافه شد.\n⏳ زمان پایان سرویس تغییری نکرد.\n\n" + service_text(service) + extra + remote_result.notice(), service_details_kb(service))
+    await edit_or_answer(callback, header("✅ حجم سرویس افزایش یافت", service["name"]) + f"بسته <b>{h(pkg.title)}</b> به سرویس واقعی شما اضافه شد.\n⏳ زمان پایان سرویس تغییری نکرد.\n\n" + service_text(service) + extra, service_details_kb(service))
 
 
 async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
@@ -2223,7 +2605,7 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
         db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
         refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
         mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
-        await edit_or_answer(callback, header("⚠️ تمدید ناموفق بود", service["name"]) + "template روی remote user اعمال نشد؛ سرویس fake تمدید نمی‌شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(db.get_service(service_id, telegram_id)))
+        await edit_or_answer(callback, header("⚠️ تمدید ناموفق بود", service["name"]) + "تمدید سرویس تکمیل نشد و تغییری برای کاربر فعال نشد.\n\n" + "تیم پشتیبانی می‌تواند جزئیات خطا را در پنل ادمین بررسی کند.", service_details_kb(db.get_service(service_id, telegram_id)))
         return
 
     db.update_order_service(int(order["id"]), service_id)
@@ -2236,7 +2618,7 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
         await sync_remote_user_from_panel(db, service)
         service = db.get_service(service_id, telegram_id) or service
     extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد." if reward else ""
-    await edit_or_answer(callback, header("✅ سرویس با موفقیت تمدید شد", service["name"]) + "حجم مصرف‌شده صفر شد و زمان سرویس طبق template واقعی Pasarguard تنظیم شد.\n\n" + service_text(service) + extra + remote_result.notice(), service_details_kb(service))
+    await edit_or_answer(callback, header("✅ سرویس با موفقیت تمدید شد", service["name"]) + "حجم مصرف‌شده صفر شد و زمان سرویس طبق پلن جدید تنظیم شد.\n\n" + service_text(service) + extra, service_details_kb(service))
 
 
 @router.message(F.text == "📦 سرویس‌های من")
@@ -2271,7 +2653,7 @@ async def service_details(callback: CallbackQuery) -> None:
     # Phase 4.7: pull latest usage/status/expire/subscription_url from Pasarguard when available.
     remote_result = await sync_remote_user_from_panel(db, service) if 'pasarguard_username' in service.keys() and service['pasarguard_username'] else None
     service = db.get_service(int(service['id']), int(user["telegram_id"])) or service
-    notice = remote_result.notice() if remote_result and not remote_result.skipped and not remote_result.ok else ""
+    notice = "\n\n⚠️ بروزرسانی لحظه‌ای وضعیت سرویس فعلاً ممکن نیست؛ اطلاعات نمایش‌داده‌شده ممکن است کمی قدیمی باشد." if remote_result and not remote_result.skipped and not remote_result.ok else ""
     await edit_or_answer(callback, service_text(service) + notice, service_details_kb(service))
 
 
@@ -2393,13 +2775,13 @@ async def revoke(callback: CallbackQuery) -> None:
     remote_result = await revoke_remote_subscription(db, service)
     if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
         error = _remote_failure_text(remote_result)
-        await edit_or_answer(callback, header("⚠️ تغییر لینک ناموفق بود", service["name"]) + "لینک fake/local ساخته نشد؛ تغییر لینک باید از Pasarguard انجام شود.\n\n" + f"خطا: <code>{h(error)}</code>", service_details_kb(service))
+        await edit_or_answer(callback, header("⚠️ تغییر لینک ناموفق بود", service["name"]) + "تغییر لینک تکمیل نشد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.\n\n" + "تیم پشتیبانی می‌تواند جزئیات خطا را در پنل ادمین بررسی کند.", service_details_kb(service))
         return
     if not settings.pasarguard_enabled:
         token = db.revoke_service_link(service_id, int(user["telegram_id"]))
     service = db.get_service(service_id, int(user["telegram_id"]))
     link = subscription_link(service)
-    await edit_or_answer(callback, header("🔄 لینک اشتراک تغییر کرد", service["name"]) + f"لینک قبلی دیگر قابل استفاده نیست.\n\nلینک جدید:\n<code>{h(link or 'لینک واقعی Pasarguard ثبت نشده است')}</code>" + remote_result.notice(), service_details_kb(service))
+    await edit_or_answer(callback, header("🔄 لینک اشتراک تغییر کرد", service["name"]) + f"لینک قبلی دیگر قابل استفاده نیست.\n\nلینک جدید:\n<code>{h(link or 'لینک اشتراک ثبت نشده است')}</code>", service_details_kb(service))
 
 
 @router.callback_query(F.data.startswith("svc_settings:"))
@@ -2508,7 +2890,7 @@ async def delete_yes(callback: CallbackQuery) -> None:
     service = db.get_service(service_id, int(user["telegram_id"]))
     remote_result = await set_remote_user_status(db, service, "deleted") if service else None
     db.delete_service(service_id, int(user["telegram_id"]))
-    await edit_or_answer(callback, header("✅ سرویس حذف شد") + "سرویس از لیست شما حذف شد." + (remote_result.notice() if remote_result else ""), back_home_kb())
+    await edit_or_answer(callback, header("✅ سرویس حذف شد") + "سرویس از لیست شما حذف شد.", back_home_kb())
 
 
 @router.message(F.text == "🎁 سرویس رایگان")
@@ -2575,13 +2957,13 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
         await edit_or_answer(
             callback,
             header("⚠️ فعال‌سازی سرویس رایگان ناموفق بود", service_name)
-            + "سرویس رایگان به‌صورت fake فعال نشد؛ چون user واقعی Pasarguard ساخته نشد.\n\n"
-            + f"خطا: <code>{h(error)}</code>\n\n"
-            + "بعد از اصلاح template/permission در Pasarguard دوباره امتحان کنید یا با پشتیبانی تماس بگیرید.",
+            + "فعال‌سازی سرویس رایگان تکمیل نشد و لینک اشتراک آماده نشد.\n\n"
+            + "تیم پشتیبانی می‌تواند جزئیات خطا را در پنل ادمین بررسی کند.\n\n"
+            + "لطفاً کمی بعد دوباره امتحان کنید یا با پشتیبانی تماس بگیرید.",
             inline([[('🎫 پشتیبانی', 'ticket_new')], [('🏠 منوی اصلی', 'home')]]),
         )
         return
-    await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس واقعی در Pasarguard ساخته شده و برای بررسی کیفیت اتصال آماده است.\n\n" + service_text(service) + (remote_result.notice() if remote_result else ""), service_details_kb(service))
+    await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس برای بررسی کیفیت اتصال آماده است.\n\n" + service_text(service), service_details_kb(service))
 
 
 @router.message(F.text == "💳 تراکنش‌ها")
@@ -2598,6 +2980,9 @@ async def transactions(message: Message) -> None:
                 "pending": "در انتظار ⏳",
                 "provisioning": "در حال فعال‌سازی 🔄",
                 "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
+                "receipt_pending": "رسید در انتظار تأیید 🧾",
+                "payment_rejected": "رسید رد شد ❌",
+                "rejected": "رد شده ❌",
             }
             status = status_map.get(str(order["status"]), h(order["status"]))
             payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
@@ -3179,7 +3564,7 @@ async def admin_manual_service_amount_finish(message: Message, state: FSMContext
     ok, remote_result, service = await provision_service_or_mark_failed(service_id, uid, order_id=None, is_test=False, paid_amount=amount)
     try:
         if ok:
-            await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service) + (remote_result.notice() if remote_result else ""), reply_markup=service_details_kb(service))
+            await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service), reply_markup=service_details_kb(service))
         else:
             await message.bot.send_message(uid, header("⚠️ سرویس دستی ساخته شد اما فعال‌سازی ناموفق بود") + service_text(service), reply_markup=service_details_kb(service))
     except Exception:
@@ -3205,7 +3590,7 @@ async def admin_orders(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("🧾 مدیریت سفارش‌ها") + "یک دسته را انتخاب کنید.", admin_orders_kb())
 
 
-@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_paid", "adm_orders_latest"}))
+@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_latest"}))
 async def admin_orders_list(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "orders"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
@@ -3218,6 +3603,9 @@ async def admin_orders_list(callback: CallbackQuery) -> None:
     elif callback.data == "adm_orders_paid":
         status = "paid"
         title = "سفارش‌های پرداخت‌شده"
+    elif callback.data == "adm_orders_receipts":
+        status = "receipt_pending"
+        title = "رسیدهای در انتظار تأیید"
     orders = list_orders_admin(20, status)
     await edit_or_answer(callback, header("🧾 " + title) + ("سفارشی پیدا نشد." if not orders else "برای جزئیات انتخاب کنید."), admin_order_list_kb(orders, "adm_orders"))
 
@@ -3257,6 +3645,213 @@ async def admin_order_pay(callback: CallbackQuery) -> None:
         except Exception:
             pass
     await edit_or_answer(callback, header("✅ سفارش بررسی شد") + admin_order_text(order) + remote_notice, admin_order_kb(order))
+
+
+@router.callback_query(F.data == "adm_payments")
+async def admin_payments(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, payment_cards_text(), payment_cards_kb())
+
+
+@router.callback_query(F.data == "adm_card_add")
+async def admin_card_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_card_line)
+    await edit_or_answer(
+        callback,
+        header("➕ افزودن کارت پرداخت")
+        + "اطلاعات کارت را با این فرمت بفرستید:\n\n"
+        + "<code>شماره کارت | نام صاحب کارت | نام بانک | توضیح اختیاری | active</code>\n\n"
+        + "مثال:\n<code>6037991234567890 | علی رضایی | ملی | پرداخت سرویس HowTooSee | 1</code>",
+        admin_back_kb("adm_payments"),
+    )
+
+
+@router.message(AdminStates.waiting_card_line)
+async def admin_card_add_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+        await message.answer("دسترسی ندارید.")
+        return
+    parts = [p.strip() for p in (message.text or "").split("|")]
+    if len(parts) < 2:
+        await message.answer("❌ فرمت درست نیست. حداقل شماره کارت و نام صاحب کارت را وارد کنید.")
+        return
+    card_number = normalize_card_number(parts[0])
+    owner_name = parts[1]
+    bank_name = parts[2] if len(parts) > 2 else ""
+    note = parts[3] if len(parts) > 3 else ""
+    active = 1
+    if len(parts) > 4:
+        active = 1 if normalize_digits(parts[4]).lower() in {"1", "true", "yes", "active", "فعال"} else 0
+    if len(card_number) != 16:
+        await message.answer("❌ شماره کارت باید دقیقاً ۱۶ رقم باشد.")
+        return
+    if not owner_name:
+        await message.answer("❌ نام صاحب کارت خالی است.")
+        return
+    card_id = add_payment_card_admin(card_number, owner_name, bank_name, note, active)
+    admin_log(message.from_user.id if message.from_user else 0, "PAYMENT_CARD_ADD", "payment_card", card_id, owner_name)
+    await state.clear()
+    await message.answer(header("✅ کارت ثبت شد") + payment_cards_text(), reply_markup=payment_cards_kb())
+
+
+@router.callback_query(F.data.startswith("adm_card_toggle:"))
+async def admin_card_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    card_id = int(callback.data.split(":", 1)[1])
+    if toggle_payment_card_admin(card_id):
+        admin_log(callback.from_user.id, "PAYMENT_CARD_TOGGLE", "payment_card", card_id, "")
+        await edit_or_answer(callback, payment_cards_text(), payment_cards_kb())
+    else:
+        await callback.answer("کارت پیدا نشد.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm_card_delete:"))
+async def admin_card_delete(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    card_id = int(callback.data.split(":", 1)[1])
+    if delete_payment_card_admin(card_id):
+        admin_log(callback.from_user.id, "PAYMENT_CARD_DELETE", "payment_card", card_id, "")
+        await edit_or_answer(callback, payment_cards_text(), payment_cards_kb())
+    else:
+        await callback.answer("کارت پیدا نشد.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm_receipt_view:"))
+async def admin_receipt_view(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    receipt_id = int(callback.data.split(":", 1)[1])
+    receipt = get_receipt(receipt_id)
+    if not receipt:
+        await callback.answer("رسید پیدا نشد.", show_alert=True)
+        return
+    order = get_order_any(int(receipt["order_id"]))
+    await callback.answer("در حال ارسال رسید…")
+    try:
+        if receipt["receipt_chat_id"] and receipt["receipt_message_id"]:
+            await callback.bot.copy_message(callback.from_user.id, int(receipt["receipt_chat_id"]), int(receipt["receipt_message_id"]))
+        else:
+            await callback.bot.send_message(callback.from_user.id, "فایل رسید در دیتابیس پیام تلگرام ندارد.")
+    except Exception as exc:
+        await callback.bot.send_message(callback.from_user.id, f"ارسال رسید ناموفق بود: <code>{h(exc)}</code>")
+    if order:
+        await callback.bot.send_message(callback.from_user.id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, int(order["id"])))
+
+
+@router.callback_query(F.data.startswith("adm_receipt_approve:"))
+async def admin_receipt_approve_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    receipt_id = int(callback.data.split(":", 1)[1])
+    receipt = get_receipt(receipt_id)
+    if not receipt or receipt["status"] != "receipt_pending":
+        await callback.answer("این رسید قابل تأیید نیست.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_payment_review_note)
+    await state.update_data(receipt_id=receipt_id, action="approve")
+    await edit_or_answer(callback, header("✅ تأیید رسید") + "اگر توضیحی برای کاربر دارید بفرستید. اگر توضیح لازم نیست، بنویسید: <code>-</code>", admin_back_kb(f"adm_order:{receipt['order_id']}"))
+
+
+@router.callback_query(F.data.startswith("adm_receipt_reject:"))
+async def admin_receipt_reject_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    receipt_id = int(callback.data.split(":", 1)[1])
+    receipt = get_receipt(receipt_id)
+    if not receipt or receipt["status"] != "receipt_pending":
+        await callback.answer("این رسید قابل رد نیست.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_payment_review_note)
+    await state.update_data(receipt_id=receipt_id, action="reject")
+    await edit_or_answer(callback, header("❌ رد رسید") + "دلیل رد رسید را برای کاربر بنویسید. مثال: مبلغ واریزی با مبلغ سفارش یکسان نیست، رسید خوانا نیست، یا کارت مقصد اشتباه است.", admin_back_kb(f"adm_order:{receipt['order_id']}"))
+
+
+@router.message(AdminStates.waiting_payment_review_note)
+async def admin_receipt_review_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    receipt_id = int(data.get("receipt_id", 0))
+    action = str(data.get("action") or "")
+    note = (message.text or "").strip()
+    if note == "-":
+        note = ""
+    receipt = get_receipt(receipt_id)
+    if not receipt or receipt["status"] != "receipt_pending":
+        await state.clear()
+        await message.answer("این رسید دیگر قابل بررسی نیست.", reply_markup=admin_back_kb("adm_orders_receipts"))
+        return
+    order = get_order_any(int(receipt["order_id"]))
+    if not order:
+        await state.clear()
+        await message.answer("سفارش مربوط به رسید پیدا نشد.", reply_markup=admin_back_kb("adm_orders_receipts"))
+        return
+    admin_id = int(message.from_user.id if message.from_user else 0)
+    if action == "reject":
+        update_receipt_review(receipt_id, "rejected", admin_id, note)
+        try:
+            user_text = header("❌ رسید پرداخت تأیید نشد", f"سفارش #{order['id']}")
+            user_text += "رسید ارسالی شما توسط ادمین فروش بررسی شد و تأیید نشد.\n\n"
+            if note:
+                user_text += f"📝 توضیح ادمین:\n{h(note)}\n\n"
+            user_text += "می‌توانید دوباره از بخش خرید، سفارش جدید ثبت کنید یا برای پیگیری با پشتیبانی در ارتباط باشید."
+            await message.bot.send_message(int(order["user_telegram_id"]), user_text, reply_markup=inline([[('🎫 پشتیبانی', 'ticket_new')], [('🏠 منوی اصلی', 'home')]]))
+        except Exception:
+            pass
+        admin_log(admin_id, "PAYMENT_RECEIPT_REJECT", "receipt", receipt_id, note)
+        await state.clear()
+        refreshed = get_order_any(int(order["id"])) or order
+        await message.answer(header("❌ رسید رد شد") + admin_order_text(refreshed), reply_markup=admin_order_kb(refreshed))
+        return
+
+    service_id = set_order_paid_admin(int(order["id"]), admin_id, method="کارت به کارت")
+    refreshed = get_order_any(int(order["id"])) or order
+    service = db.get_service(service_id) if service_id else None
+    provisioning_ok = True
+    if service_id and service and (('pasarguard_username' not in service.keys()) or (not service['pasarguard_username'])):
+        ok, remote_result, service = await provision_service_or_mark_failed(service_id, int(order["user_telegram_id"]), order_id=int(order["id"]), is_test=False, paid_amount=max(int(order["amount"]) - int(order["discount_amount"]), 0))
+        provisioning_ok = ok
+        if not ok:
+            mark_order_terminal(int(order["id"]), status="provisioning_failed", method="کارت به کارت", service_id=service_id, admin_note=_remote_failure_text(remote_result))
+            update_receipt_review(receipt_id, "approved_provisioning_failed", admin_id, note)
+        else:
+            update_receipt_review(receipt_id, "approved", admin_id, note)
+    else:
+        update_receipt_review(receipt_id, "approved", admin_id, note)
+    refreshed = get_order_any(int(order["id"])) or refreshed
+    try:
+        if provisioning_ok and service:
+            user_text = header("✅ پرداخت شما تأیید شد", f"سفارش #{order['id']}")
+            user_text += "رسید پرداخت شما تأیید شد و سرویس شما فعال است.\n"
+            if note:
+                user_text += f"\n📝 توضیح ادمین:\n{h(note)}\n"
+            user_text += "\n" + service_text(service)
+            await message.bot.send_message(int(order["user_telegram_id"]), user_text, reply_markup=service_details_kb(service))
+        else:
+            user_text = header("✅ رسید تأیید شد، فعال‌سازی در حال پیگیری است", f"سفارش #{order['id']}")
+            user_text += "رسید پرداخت شما تأیید شد، اما فعال‌سازی سرویس نیاز به بررسی پشتیبانی دارد. تیم فروش موضوع را پیگیری می‌کند."
+            if note:
+                user_text += f"\n\n📝 توضیح ادمین:\n{h(note)}"
+            await message.bot.send_message(int(order["user_telegram_id"]), user_text, reply_markup=inline([[('🎫 پشتیبانی', 'ticket_new')], [('🏠 منوی اصلی', 'home')]]))
+    except Exception:
+        pass
+    admin_log(admin_id, "PAYMENT_RECEIPT_APPROVE", "receipt", receipt_id, f"provisioning_ok={provisioning_ok}; note={note}")
+    await state.clear()
+    await message.answer(header("✅ رسید بررسی شد") + admin_order_text(refreshed), reply_markup=admin_order_kb(refreshed))
 
 
 @router.callback_query(F.data == "adm_broadcast")

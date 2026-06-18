@@ -55,3 +55,23 @@ After changing template username prefix/suffix rules, run:
 `👑 پنل مدیریت → 🔌 Pasarguard → 🧪 Dry-run سینک Templateها`
 
 Then apply template sync after reviewing the diff.
+
+### Phase 4.10.2 — Card-to-card payments
+
+New admin menu:
+
+`👑 پنل مدیریت → 💳 روش‌های پرداخت`
+
+Add cards with:
+
+`card_number | owner_name | bank_name | note | active`
+
+Example:
+
+`6037991234567890 | علی رضایی | ملی | کارت فروش اصلی | 1`
+
+Receipt notifications go to admins with role `sales` and `super`. You can also set specific sales recipients in `.env`:
+
+`SALES_ADMIN_CHAT_IDS=123456789,987654321`
+
+The old demo payment button is no longer displayed in the user payment page. The payment itself is manual/card-to-card, while activation after approval uses the real provisioning flow.

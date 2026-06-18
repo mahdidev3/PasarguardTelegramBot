@@ -43,3 +43,13 @@
 - Remove plan-key username suffix from Pasarguard templates.
 - Make generated service-name tail numeric-only and env-controlled.
 - Add dynamic plan category management to admin panel and user buy/renew menus.
+
+## Phase 4.10.2 — Card-to-card Payment Review
+
+- Customer-facing Pasarguard/internal technical messages are removed from user flows.
+- Payment method page now exposes card-to-card payment instead of demo-paid button.
+- Multiple payment cards can be configured in the admin panel; an active card is selected randomly for each payment attempt.
+- Users must upload a receipt photo/document; non-receipt messages are rejected until they send a receipt or cancel.
+- Receipts are stored, copied to sales admins, and orders move to `receipt_pending`.
+- Sales admins can view, approve, or reject receipts and add a note for either outcome.
+- Approval triggers the real provisioning path; rejection notifies the user with the admin note.
