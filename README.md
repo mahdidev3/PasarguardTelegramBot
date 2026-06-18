@@ -25,3 +25,9 @@ PASARGUARD_TEMPLATE_GROUP_IDS=<real group ids>
 If `PASARGUARD_ENABLED=true` and provisioning fails, the service will stay in `provisioning_failed` and no fake link will be shown.
 
 Payment gateways/card-to-card receipt flows are intentionally still demo/manual and will be handled later.
+
+## Phase 4.10.1 Hotfix
+
+- Fixed legacy catalog bridge globals (`PLANS`, `FREE_TEST_PLANS`, `DATA_ADDON_PACKAGES`, `FREE_SERVICE_TYPES`) that were accidentally removed during Phase 4.10 user-flow refactor.
+- The buy plan/category flow can now read the DB-synced plan dictionaries again after bootstrap.
+

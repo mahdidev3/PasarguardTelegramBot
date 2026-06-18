@@ -29,3 +29,9 @@
 - Better rollback for failed renew/addon local state.
 - Orphan import tools.
 - Scheduled reconcile if needed.
+
+## Phase 4.10.1 Hotfix
+
+- Fixed legacy catalog bridge globals (`PLANS`, `FREE_TEST_PLANS`, `DATA_ADDON_PACKAGES`, `FREE_SERVICE_TYPES`) that were accidentally removed during Phase 4.10 user-flow refactor.
+- The buy plan/category flow can now read the DB-synced plan dictionaries again after bootstrap.
+

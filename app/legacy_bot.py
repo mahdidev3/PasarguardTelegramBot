@@ -125,6 +125,18 @@ class DataAddon:
     badge: str
 
 
+# Legacy catalog bridge. These dictionaries are populated from PostgreSQL during bootstrap
+# by app.services.plan_service.sync_legacy_catalog_from_db(). They must exist before
+# bootstrap runs because the staged legacy buy flow still reads them directly.
+PLANS: dict[str, Plan] = {}
+DATA_ADDON_PACKAGES: dict[str, DataAddon] = {}
+FREE_TEST_PLANS: dict[str, Plan] = {}
+
+FREE_SERVICE_TYPES: dict[str, dict[str, str]] = {
+    "standard": {"title": "🌍 سرویس رایگان استاندارد", "subtitle": "برای تست اتصال روزمره"},
+    "speed": {"title": "⚡ سرویس رایگان پرسرعت", "subtitle": "برای تست سرعت و پایداری"},
+}
+
 
 # Small transient state for user-entered service names; durable order data lives in SQLite/PostgreSQL.
 pending_names: dict[int, str] = {}
