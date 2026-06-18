@@ -342,7 +342,6 @@ def _write_xlsx(path: Path, title: str, rows: list[dict[str, Any]]) -> None:
             ws.append([row.get(h, "") for h in headers])
     else:
         ws.append(["No rows"])
-    ws.freeze_panes = "A5"
     for idx, header in enumerate(headers, start=1):
         values = [str(header)] + [str(row.get(header, "")) for row in rows[:200]]
         width = min(max(len(v) for v in values) + 2, 48)

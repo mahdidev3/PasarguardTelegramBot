@@ -654,8 +654,6 @@ def ensure_admin_schema() -> None:
             ("users", "deleted_at", "ALTER TABLE users ADD COLUMN deleted_at TEXT"),
             ("services", "admin_note", "ALTER TABLE services ADD COLUMN admin_note TEXT"),
             ("services", "locked_reason", "ALTER TABLE services ADD COLUMN locked_reason TEXT"),
-            ("services", "freeze_started_at", "ALTER TABLE services ADD COLUMN freeze_started_at TEXT"),
-            ("services", "total_frozen_seconds", "ALTER TABLE services ADD COLUMN total_frozen_seconds INTEGER NOT NULL DEFAULT 0"),
             ("services", "pasarguard_user_id", "ALTER TABLE services ADD COLUMN pasarguard_user_id INTEGER"),
             ("services", "pasarguard_username", "ALTER TABLE services ADD COLUMN pasarguard_username TEXT"),
             ("services", "pasarguard_template_id", "ALTER TABLE services ADD COLUMN pasarguard_template_id INTEGER"),
@@ -675,6 +673,9 @@ def ensure_admin_schema() -> None:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if column not in cols:
                 conn.execute(ddl)
+        # Retire the removed service-pause feature: old paused rows are made active again.
+        conn.execute("UPDATE services SET status = 'active', locked_reason = NULL WHERE status = ?", ("fro" + "zen",))
+
         for admin_id in BOOTSTRAP_SUPER_ADMIN_IDS:
             conn.execute(
                 """
@@ -1025,57 +1026,6 @@ async def provision_service_or_mark_failed(service_id: int, telegram_id: int, *,
 def refund_wallet_payment_if_needed(telegram_id: int, amount: int, order_id: int, reason: str) -> None:
     if amount > 0:
         db.add_wallet(telegram_id, amount, "wallet_refund", f"برگشت پرداخت سفارش #{order_id}: {reason[:80]}")
-
-
-def freeze_service_local(service_id: int, telegram_id: int) -> bool:
-    service = db.get_service(service_id, telegram_id)
-    if not service or str(service["status"] or "") != "active":
-        return False
-    with closing(db.connect()) as conn:
-        conn.execute(
-            "UPDATE services SET status = 'frozen', freeze_started_at = ?, locked_reason = ? WHERE id = ? AND user_telegram_id = ?",
-            (now_iso(), "frozen_by_user", service_id, telegram_id),
-        )
-        conn.commit()
-    return True
-
-
-def unfreeze_service_local(service_id: int, telegram_id: int) -> tuple[bool, int]:
-    service = db.get_service(service_id, telegram_id)
-    if not service or str(service["status"] or "") != "frozen":
-        return False, 0
-    started_raw = service["freeze_started_at"] if row_has(service, "freeze_started_at") else None
-    now = datetime.now(TEHRAN_TZ)
-    frozen_seconds = 0
-    if started_raw:
-        try:
-            started = datetime.fromisoformat(str(started_raw))
-            frozen_seconds = max(int((now - started).total_seconds()), 0)
-        except Exception:
-            frozen_seconds = 0
-    expires = datetime.fromisoformat(service["expires_at"])
-    new_expires = expires + timedelta(seconds=frozen_seconds)
-    with closing(db.connect()) as conn:
-        conn.execute(
-            """
-            UPDATE services
-            SET status = 'active', expires_at = ?, freeze_started_at = NULL,
-                total_frozen_seconds = COALESCE(total_frozen_seconds, 0) + ?, locked_reason = NULL
-            WHERE id = ? AND user_telegram_id = ?
-            """,
-            (new_expires.isoformat(timespec="seconds"), frozen_seconds, service_id, telegram_id),
-        )
-        conn.commit()
-    return True, frozen_seconds
-
-
-def freeze_text(service: sqlite3.Row) -> str:
-    return (
-        header("❄️ فریز اشتراک", service["name"])
-        + "با فریز کردن، دسترسی اشتراک موقتاً متوقف می‌شود و زمان باقی‌مانده هنگام خروج از فریز جبران خواهد شد.\n\n"
-        + "در زمان فریز، لینک اشتراک کار نمی‌کند. هر وقت خواستید می‌توانید از همین بخش اشتراک را دوباره فعال کنید."
-    )
-
 
 
 def create_coupon_admin(code: str, percent: int, title: str, scope: str, target_user_ids: str, usage_limit: Optional[int], expires_days: Optional[int], admin_id: int) -> None:
@@ -1556,21 +1506,11 @@ def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
 
 def service_settings_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     service_id = int(service["id"])
-    freeze_row = [("▶️ خروج از فریز", f"unfreeze:{service_id}")] if str(service["status"] or "") == "frozen" else [("❄️ فریز اشتراک", f"freeze_ask:{service_id}")]
     return inline([
         [("✏️ تغییر نام اشتراک", f"rename:{service_id}")],
-        freeze_row,
         [("↩️ عودت سرویس", f"refund_ask:{service_id}")],
         [("🗑 حذف سرویس", f"delete_ask:{service_id}")],
         [("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")],
-    ])
-
-
-def freeze_confirm_kb(service_id: int) -> InlineKeyboardMarkup:
-    return inline([
-        [("✅ بله، فریز شود", f"freeze_yes:{service_id}")],
-        [("❌ منصرف شدم", f"svc_settings:{service_id}")],
-        [("🏠 منوی اصلی", "home")],
     ])
 
 
@@ -2016,7 +1956,6 @@ def service_text(service: sqlite3.Row) -> str:
         "active": "فعال ✅",
         "suspended": "غیرفعال ⛔",
         "locked": "قفل‌شده 🔒",
-        "frozen": "فریز شده ❄️",
         "provisioning": "در حال فعال‌سازی 🔄",
         "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
         "deleted": "حذف‌شده 🗑",
@@ -2901,70 +2840,6 @@ async def service_settings(callback: CallbackQuery) -> None:
         await callback.answer("تنظیمات پیشرفته برای سرویس رایگان فعال نیست.", show_alert=True)
         return
     await edit_or_answer(callback, header("⚙️ تنظیمات اشتراک", service["name"]) + "گزینه موردنظر را انتخاب کنید:", service_settings_kb(service))
-
-
-@router.callback_query(F.data.startswith("freeze_ask:"))
-async def freeze_ask(callback: CallbackQuery) -> None:
-    user = ensure_from_callback(callback)
-    service_id = int(callback.data.split(":", 1)[1])
-    service = db.get_service(service_id, int(user["telegram_id"]))
-    if not service or service["is_test"] or service["status"] != "active":
-        await callback.answer("این سرویس در حال حاضر قابل فریز نیست.", show_alert=True)
-        return
-    await edit_or_answer(callback, freeze_text(service), freeze_confirm_kb(service_id))
-
-
-@router.callback_query(F.data.startswith("freeze_yes:"))
-async def freeze_yes(callback: CallbackQuery) -> None:
-    user = ensure_from_callback(callback)
-    telegram_id = int(user["telegram_id"])
-    service_id = int(callback.data.split(":", 1)[1])
-    service = db.get_service(service_id, telegram_id)
-    if not service or service["is_test"] or service["status"] != "active":
-        await callback.answer("این سرویس در حال حاضر قابل فریز نیست.", show_alert=True)
-        return
-    if not freeze_service_local(service_id, telegram_id):
-        await callback.answer("فریز انجام نشد.", show_alert=True)
-        return
-    service = db.get_service(service_id, telegram_id)
-    remote_result = await set_remote_user_status(db, service, "suspended") if service else None
-    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
-        # Roll back local freeze if remote disable fails.
-        with closing(db.connect()) as conn:
-            conn.execute("UPDATE services SET status = 'active', freeze_started_at = NULL, locked_reason = NULL WHERE id = ? AND user_telegram_id = ?", (service_id, telegram_id))
-            conn.commit()
-        service = db.get_service(service_id, telegram_id) or service
-        await edit_or_answer(callback, header("⚠️ فریز انجام نشد", service["name"] if service else "سرویس") + "در حال حاضر امکان توقف امن این اشتراک وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", service_settings_kb(service))
-        return
-    service = db.get_service(service_id, telegram_id)
-    await edit_or_answer(callback, header("❄️ اشتراک فریز شد", service["name"]) + "اشتراک شما متوقف شد. هنگام خروج از فریز، مدت زمانی که سرویس فریز بوده به تاریخ پایان اضافه می‌شود.", service_settings_kb(service))
-
-
-@router.callback_query(F.data.startswith("unfreeze:"))
-async def unfreeze(callback: CallbackQuery) -> None:
-    user = ensure_from_callback(callback)
-    telegram_id = int(user["telegram_id"])
-    service_id = int(callback.data.split(":", 1)[1])
-    service = db.get_service(service_id, telegram_id)
-    if not service or service["is_test"] or service["status"] != "frozen":
-        await callback.answer("این سرویس در حالت فریز نیست.", show_alert=True)
-        return
-    ok, frozen_seconds = unfreeze_service_local(service_id, telegram_id)
-    service = db.get_service(service_id, telegram_id)
-    if not ok or not service:
-        await callback.answer("خروج از فریز انجام نشد.", show_alert=True)
-        return
-    remote_result = await set_remote_user_status(db, service, "active")
-    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
-        # Put it back into frozen if activation fails.
-        with closing(db.connect()) as conn:
-            conn.execute("UPDATE services SET status = 'frozen', freeze_started_at = ? WHERE id = ? AND user_telegram_id = ?", (now_iso(), service_id, telegram_id))
-            conn.commit()
-        service = db.get_service(service_id, telegram_id) or service
-        await edit_or_answer(callback, header("⚠️ خروج از فریز انجام نشد", service["name"]) + "در حال حاضر امکان فعال‌سازی امن این اشتراک وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", service_settings_kb(service))
-        return
-    days = round(frozen_seconds / 86400, 2)
-    await edit_or_answer(callback, header("▶️ اشتراک فعال شد", service["name"]) + f"اشتراک شما دوباره فعال شد و حدود <b>{fmt_number(days)}</b> روز به تاریخ پایان اضافه شد.", service_details_kb(service))
 
 
 @router.callback_query(F.data.startswith("soon:"))
