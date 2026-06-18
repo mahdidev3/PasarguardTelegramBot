@@ -37,6 +37,7 @@ from dotenv import load_dotenv
 
 from app.bootstrap import bootstrap_phase1
 from app.config import settings
+from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
@@ -1321,6 +1322,10 @@ class CouponStates(StatesGroup):
 
 class WalletStates(StatesGroup):
     waiting_amount = State()
+
+
+class CardPaymentStates(StatesGroup):
+    waiting_receipt = State()
 
 
 class AdminStates(StatesGroup):
@@ -2800,7 +2805,7 @@ async def service_settings(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("soon:"))
 async def soon(callback: CallbackQuery) -> None:
-    await callback.answer("این بخش فعلاً در نسخه نمایشی فعال نیست.", show_alert=True)
+    await callback.answer("این بخش فعلاً فعال نیست.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("rename:"))
@@ -2873,14 +2878,14 @@ async def refund_yes(callback: CallbackQuery) -> None:
     remote_result = await set_remote_user_status(db, service, "deleted")
     db.add_wallet(int(user["telegram_id"]), amount, "refund", f"عودت سرویس {service['name']}")
     db.delete_service(service_id, int(user["telegram_id"]))
-    await edit_or_answer(callback, header("✅ عودت انجام شد") + f"مبلغ <b>{fmt_money(amount)}</b> به کیف پول شما برگشت و سرویس از حساب شما حذف شد." + remote_result.notice(), inline([[("💰 کیف پول", "wallet")], [("🏠 منوی اصلی", "home")]]))
+    await edit_or_answer(callback, header("✅ عودت انجام شد") + f"مبلغ <b>{fmt_money(amount)}</b> به کیف پول شما برگشت و سرویس از حساب شما حذف شد.", inline([[("💰 کیف پول", "wallet")], [("🏠 منوی اصلی", "home")]]))
 
 
 @router.callback_query(F.data.startswith("delete_ask:"))
 async def delete_ask(callback: CallbackQuery) -> None:
     service_id = int(callback.data.split(":", 1)[1])
     ensure_from_callback(callback)
-    await edit_or_answer(callback, header("🗑 حذف سرویس") + "آیا مطمئن هستید؟ این کار فقط سرویس را از لیست شما حذف می‌کند و در نسخه نمایشی برگشت‌پذیر نیست.", delete_confirm_kb(service_id))
+    await edit_or_answer(callback, header("🗑 حذف سرویس") + "آیا مطمئن هستید؟ این کار سرویس را از لیست شما حذف می‌کند و دسترسی آن غیرفعال می‌شود.", delete_confirm_kb(service_id))
 
 
 @router.callback_query(F.data.startswith("delete_yes:"))
@@ -3641,7 +3646,7 @@ async def admin_order_pay(callback: CallbackQuery) -> None:
                 mark_order_terminal(oid, status="provisioning_failed", method="تأیید دستی ادمین", service_id=service_id, admin_note=_remote_failure_text(remote_result))
                 order = get_order_any(oid)
         try:
-            await callback.bot.send_message(int(order["user_telegram_id"]), header("✅ پرداخت شما تأیید شد") + service_text(service) + remote_notice, reply_markup=service_details_kb(service))
+            await callback.bot.send_message(int(order["user_telegram_id"]), header("✅ پرداخت شما تأیید شد") + service_text(service), reply_markup=service_details_kb(service))
         except Exception:
             pass
     await edit_or_answer(callback, header("✅ سفارش بررسی شد") + admin_order_text(order) + remote_notice, admin_order_kb(order))
@@ -3667,7 +3672,8 @@ async def admin_card_add_start(callback: CallbackQuery, state: FSMContext) -> No
         header("➕ افزودن کارت پرداخت")
         + "اطلاعات کارت را با این فرمت بفرستید:\n\n"
         + "<code>شماره کارت | نام صاحب کارت | نام بانک | توضیح اختیاری | active</code>\n\n"
-        + "مثال:\n<code>6037991234567890 | علی رضایی | ملی | پرداخت سرویس HowTooSee | 1</code>",
+        + "مثال:\n<code>6037991234567890 | علی رضایی | ملی | پرداخت سرویس HowTooSee | 1</code>\n\n"
+        + pipe_escape_hint(),
         admin_back_kb("adm_payments"),
     )
 
@@ -3677,7 +3683,7 @@ async def admin_card_add_finish(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = [p.strip() for p in (message.text or "").split("|")]
+    parts = split_escaped_pipe(message.text or "")
     if len(parts) < 2:
         await message.answer("❌ فرمت درست نیست. حداقل شماره کارت و نام صاحب کارت را وارد کنید.")
         return
@@ -3984,7 +3990,7 @@ async def admin_coupon_add(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.set_state(AdminStates.waiting_coupon_line)
     sample = "VIP30 | 30 | all | 100 | 30\nUSER20 | 20 | users:123456,987654 | 10 | 7\nFIRST15 | 15 | first_purchase | 200 | 14"
-    await edit_or_answer(callback, header("➕ ساخت/ویرایش کد") + "فرمت را دقیق وارد کنید:\n<code>CODE | percent | scope | usage_limit | expires_days</code>\n\nScope می‌تواند <code>all</code>، <code>first_purchase</code> یا <code>users:ID1,ID2</code> باشد.\n\nنمونه:\n<code>" + h(sample) + "</code>", admin_back_kb("adm_coupons"))
+    await edit_or_answer(callback, header("➕ ساخت/ویرایش کد") + "فرمت را دقیق وارد کنید:\n<code>CODE | percent | scope | usage_limit | expires_days</code>\n\nScope می‌تواند <code>all</code>، <code>first_purchase</code> یا <code>users:ID1,ID2</code> باشد.\n\n" + pipe_escape_hint() + "\n\nنمونه:\n<code>" + h(sample) + "</code>", admin_back_kb("adm_coupons"))
 
 
 @router.message(AdminStates.waiting_coupon_line)
@@ -3992,7 +3998,7 @@ async def admin_coupon_add_finish(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = [p.strip() for p in (message.text or "").split("|")]
+    parts = split_escaped_pipe(message.text or "")
     if len(parts) < 5:
         await message.answer("❌ فرمت اشتباه است. نمونه: <code>VIP30 | 30 | all | 100 | 30</code>")
         return
@@ -4107,7 +4113,7 @@ async def admin_admin_add_finish(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = [p.strip() for p in (message.text or "").split("|")]
+    parts = split_escaped_pipe(message.text or "")
     if len(parts) < 2:
         await message.answer("❌ فرمت اشتباه است. نمونه: <code>123456789 | support</code>")
         return

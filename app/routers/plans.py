@@ -23,6 +23,7 @@ from app.services.plan_service import (
     upsert_plan_from_line,
 )
 from app.services.ticket_service import is_admin
+from app.utils.line_parser import pipe_escape_hint
 
 plans_router = Router(name="phase2_plans")
 

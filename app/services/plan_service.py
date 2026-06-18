@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 import re
 from typing import Any
 
+from app.utils.line_parser import split_escaped_pipe
+
 from sqlalchemy import desc, select
 
 from app.database import session_scope
@@ -117,7 +119,7 @@ async def list_categories(active_only: bool = True) -> list[PlanCategory]:
 
 async def upsert_category_from_line(line: str, admin_id: int) -> tuple[bool, str]:
     """Parse and save a category line: key | title | description | sort_order | active."""
-    parts = [p.strip() for p in (line or "").split("|")]
+    parts = split_escaped_pipe(line or "")
     if len(parts) < 4:
         return False, "فرمت اشتباه است. نمونه: key | title | description | sort_order | active"
     key, title, description, sort_s = parts[:4]
@@ -167,7 +169,7 @@ async def get_plan(plan_key: str) -> CatalogPlan | None:
 
 async def upsert_plan_from_line(line: str, admin_id: int) -> tuple[bool, str]:
     """Parse and save a plan line: key | title | data_gb | days | price | category | badge."""
-    parts = [p.strip() for p in (line or "").split("|")]
+    parts = split_escaped_pipe(line or "")
     if len(parts) < 7:
         return False, "فرمت اشتباه است. نمونه: key | title | data_gb | days | price | category | badge"
     key, title, data_s, days_s, price_s, category, badge = parts[:7]
@@ -242,7 +244,7 @@ async def list_addons(active_only: bool = False) -> list[DataAddonPackageDB]:
 
 
 async def upsert_addon_from_line(line: str, admin_id: int) -> tuple[bool, str]:
-    parts = [p.strip() for p in (line or "").split("|")]
+    parts = split_escaped_pipe(line or "")
     if len(parts) < 5:
         return False, "فرمت اشتباه است. نمونه: key | title | data_gb | price | badge"
     key, title, data_s, price_s, badge = parts[:5]

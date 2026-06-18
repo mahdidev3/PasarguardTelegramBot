@@ -45,7 +45,9 @@ def reports_home_kb() -> InlineKeyboardMarkup:
     return inline([
         [("📊 گزارش استفاده", "adm_report:usage"), ("👥 کاربران", "adm_report:users")],
         [("📦 سرویس‌ها", "adm_report:services"), ("🧾 سفارش‌ها", "adm_report:orders")],
-        [("💰 کیف پول", "adm_report:wallet"), ("💎 رفرال", "adm_report:referrals")],
+        [("💰 کیف پول", "adm_report:wallet"), ("💳 رسیدها", "adm_report:payment_receipts")],
+        [("📈 خلاصه مالی", "adm_report:finance_summary"), ("📒 گردش مالی", "adm_report:financial_ledger")],
+        [("💳 کارت‌ها", "adm_report:payment_cards"), ("💎 رفرال", "adm_report:referrals")],
         [("🎫 تیکت‌ها", "adm_report:tickets"), ("💬 پیام‌های تیکت", "adm_report:ticket_messages")],
         [("🎟 کدهای تخفیف", "adm_report:coupons"), ("📦 پلن‌ها", "adm_report:plans")],
         [("📢 پیام همگانی", "adm_report:broadcasts"), ("📜 لاگ ادمین", "adm_report:admin_logs")],

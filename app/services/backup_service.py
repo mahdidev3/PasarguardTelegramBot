@@ -223,6 +223,27 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     (base / "data" / "sqlite_dump.sql").write_text(_sqlite_dump(), encoding="utf-8")
 
     usage = {row["key"]: row["value"] for row in usage_rows}
+    orders_rows = sqlite_data.get("orders", [])
+    receipts_rows = sqlite_data.get("payment_receipts", [])
+    wallet_rows = sqlite_data.get("wallet_transactions", [])
+    paid_orders = [row for row in orders_rows if row.get("status") == "paid"]
+    finance_summary = {
+        "orders_total": len(orders_rows),
+        "orders_paid": len(paid_orders),
+        "orders_receipt_pending": sum(1 for row in orders_rows if row.get("status") == "receipt_pending"),
+        "orders_payment_rejected": sum(1 for row in orders_rows if row.get("status") == "payment_rejected"),
+        "gross_paid": sum(int(row.get("amount") or 0) for row in paid_orders),
+        "discount_paid": sum(int(row.get("discount_amount") or 0) for row in paid_orders),
+        "net_paid": sum(int(row.get("amount") or 0) - int(row.get("discount_amount") or 0) for row in paid_orders),
+        "receipts_total": len(receipts_rows),
+        "receipts_pending": sum(1 for row in receipts_rows if row.get("status") == "receipt_pending"),
+        "receipts_approved": sum(1 for row in receipts_rows if row.get("status") == "approved"),
+        "receipts_rejected": sum(1 for row in receipts_rows if row.get("status") == "rejected"),
+        "wallet_transactions_total": len(wallet_rows),
+        "wallet_positive_total": sum(int(row.get("amount") or 0) for row in wallet_rows if int(row.get("amount") or 0) > 0),
+        "wallet_negative_total_abs": sum(abs(int(row.get("amount") or 0)) for row in wallet_rows if int(row.get("amount") or 0) < 0),
+    }
+    _write_jsonl(base / "data" / "finance_summary.jsonl", [{"key": key, "value": value} for key, value in finance_summary.items()])
     file_success = sum(1 for row in ticket_file_manifest if row.get("backed_up"))
     file_failed = sum(1 for row in ticket_file_manifest if not row.get("backed_up"))
     manifest = {
@@ -238,6 +259,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
             "ticket_files": {"total": len(ticket_file_manifest), "backed_up": file_success, "failed": file_failed},
         },
         "usage": usage,
+        "finance": finance_summary,
         "ticket_files": {
             "included": bot is not None,
             "active_files_backed_up": file_success,

@@ -55,6 +55,10 @@ REPORT_SPECS: dict[str, ReportSpec] = {
     "services": ReportSpec("services", "سرویس‌ها", "sqlite", "services", Service),
     "orders": ReportSpec("orders", "سفارش‌ها", "sqlite", "orders", Order),
     "wallet": ReportSpec("wallet", "تراکنش‌های کیف پول", "sqlite", "wallet_transactions", WalletTransaction),
+    "payment_cards": ReportSpec("payment_cards", "کارت‌های پرداخت", "sqlite", "payment_cards"),
+    "payment_receipts": ReportSpec("payment_receipts", "رسیدهای کارت‌به‌کارت", "sqlite", "payment_receipts"),
+    "financial_ledger": ReportSpec("financial_ledger", "گردش مالی کامل", "virtual"),
+    "finance_summary": ReportSpec("finance_summary", "خلاصه مالی", "virtual"),
     "referrals": ReportSpec("referrals", "رفرال‌ها", "sqlite", "referrals", Referral),
     "tickets": ReportSpec("tickets", "تیکت‌ها", "pg", "tickets", Ticket),
     "ticket_messages": ReportSpec("ticket_messages", "پیام‌های تیکت", "pg", "ticket_messages", TicketMessage),
@@ -150,6 +154,99 @@ def _sqlite_scalar(query: str, params: tuple[Any, ...] = ()) -> int | float:
         conn.close()
 
 
+def _sqlite_group_rows(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    conn = _sqlite_connect()
+    if conn is None:
+        return []
+    try:
+        return [dict(row) for row in conn.execute(query, params).fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+def _financial_summary_rows() -> list[dict[str, Any]]:
+    created_at = datetime.now(timezone.utc).isoformat()
+    rows: list[dict[str, Any]] = [
+        {"section": "orders", "metric": "orders_total", "title": "تعداد کل سفارش‌ها", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_paid", "title": "سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'paid'"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_pending", "title": "سفارش‌های در انتظار پرداخت", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'pending'"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_receipt_pending", "title": "رسیدهای در انتظار بررسی", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'receipt_pending'"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_rejected", "title": "پرداخت‌های ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'payment_rejected'"), "created_at": created_at},
+        {"section": "orders", "metric": "gross_paid", "title": "مبلغ خام سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
+        {"section": "orders", "metric": "discount_paid", "title": "جمع تخفیف سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
+        {"section": "orders", "metric": "net_paid", "title": "خالص فروش پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
+        {"section": "wallet", "metric": "wallet_debits", "title": "برداشت از کیف پول", "value": _sqlite_scalar("SELECT COALESCE(SUM(ABS(amount)), 0) FROM wallet_transactions WHERE amount < 0"), "created_at": created_at},
+        {"section": "wallet", "metric": "wallet_credits", "title": "واریز/بازگشت به کیف پول", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount), 0) FROM wallet_transactions WHERE amount > 0"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_total", "title": "تعداد رسیدهای کارت‌به‌کارت", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_pending", "title": "رسیدهای در انتظار", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_approved", "title": "رسیدهای تأییدشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_rejected", "title": "رسیدهای ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'rejected'"), "created_at": created_at},
+    ]
+    for row in _sqlite_group_rows("SELECT COALESCE(payment_method, 'unknown') AS method, COUNT(*) AS count, COALESCE(SUM(amount - discount_amount), 0) AS net_amount FROM orders WHERE status = 'paid' GROUP BY COALESCE(payment_method, 'unknown') ORDER BY net_amount DESC"):
+        rows.append({"section": "paid_by_method", "metric": row.get("method"), "title": f"فروش پرداخت‌شده با {row.get('method')}", "value": row.get("net_amount"), "count": row.get("count"), "created_at": created_at})
+    for row in _sqlite_group_rows("SELECT COALESCE(type, 'unknown') AS tx_type, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount FROM wallet_transactions GROUP BY COALESCE(type, 'unknown') ORDER BY amount DESC"):
+        rows.append({"section": "wallet_by_type", "metric": row.get("tx_type"), "title": f"کیف پول / {row.get('tx_type')}", "value": row.get("amount"), "count": row.get("count"), "created_at": created_at})
+    return rows
+
+
+def _financial_ledger_rows() -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _sqlite_rows("orders"):
+        rows.append({
+            "source": "orders",
+            "event_id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "user_telegram_id": row.get("user_telegram_id"),
+            "status": row.get("status"),
+            "method": row.get("payment_method"),
+            "gross_amount": row.get("amount"),
+            "discount_amount": row.get("discount_amount"),
+            "net_amount": (int(row.get("amount") or 0) - int(row.get("discount_amount") or 0)),
+            "wallet_used": row.get("wallet_used"),
+            "coupon_code": row.get("coupon_code"),
+            "receipt_id": row.get("receipt_id"),
+            "service_id": row.get("service_id"),
+            "description": row.get("admin_note") or row.get("plan_key"),
+        })
+    for row in _sqlite_rows("wallet_transactions"):
+        rows.append({
+            "source": "wallet_transactions",
+            "event_id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "user_telegram_id": row.get("user_telegram_id"),
+            "status": "posted",
+            "method": "wallet",
+            "gross_amount": row.get("amount"),
+            "discount_amount": 0,
+            "net_amount": row.get("amount"),
+            "wallet_used": None,
+            "coupon_code": None,
+            "receipt_id": None,
+            "service_id": None,
+            "description": row.get("description") or row.get("type"),
+        })
+    for row in _sqlite_rows("payment_receipts"):
+        rows.append({
+            "source": "payment_receipts",
+            "event_id": row.get("id"),
+            "created_at": row.get("created_at"),
+            "user_telegram_id": row.get("user_telegram_id"),
+            "status": row.get("status"),
+            "method": "card_to_card",
+            "gross_amount": row.get("amount"),
+            "discount_amount": 0,
+            "net_amount": row.get("amount"),
+            "wallet_used": None,
+            "coupon_code": None,
+            "receipt_id": row.get("id"),
+            "service_id": None,
+            "description": row.get("admin_note") or row.get("receipt_caption") or f"order_id={row.get('order_id')}",
+        })
+    return sorted(rows, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+
 async def usage_summary_rows() -> list[dict[str, Any]]:
     """Return a compact bot usage report spanning SQLite and PostgreSQL."""
     sqlite_metrics = [
@@ -163,6 +260,8 @@ async def usage_summary_rows() -> list[dict[str, Any]]:
         ("orders_total", "تعداد سفارش‌ها", _sqlite_scalar("SELECT COUNT(*) FROM orders")),
         ("orders_paid", "سفارش‌های پرداخت‌شده", _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'paid'")),
         ("sales_total", "فروش کل پرداخت‌شده", _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'")),
+        ("receipts_pending", "رسیدهای کارت‌به‌کارت در انتظار", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'")),
+        ("receipts_approved", "رسیدهای تأییدشده", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'")),
         ("wallet_balance_total", "جمع موجودی کیف پول کاربران", _sqlite_scalar("SELECT COALESCE(SUM(wallet_balance), 0) FROM users")),
     ]
     pg_metrics: list[tuple[str, str, Any]] = []
@@ -192,7 +291,13 @@ async def usage_summary_rows() -> list[dict[str, Any]]:
 async def collect_report_rows(report_key: str, limit: int | None = None) -> tuple[ReportSpec, list[dict[str, Any]]]:
     spec = REPORT_SPECS[report_key]
     if spec.source == "virtual":
-        return spec, await usage_summary_rows()
+        if report_key == "usage":
+            return spec, await usage_summary_rows()
+        if report_key == "finance_summary":
+            return spec, _financial_summary_rows()
+        if report_key == "financial_ledger":
+            return spec, _financial_ledger_rows()
+        return spec, []
     if spec.source == "sqlite":
         rows = _sqlite_rows(spec.table or "", limit=limit)
         # During/after migration, PostgreSQL may be the source of truth. Fall back to PG if SQLite is empty.
