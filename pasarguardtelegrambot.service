@@ -1,0 +1,23 @@
+[Unit]
+Description=Pasarguard Telegram Bot
+Documentation=https://docs.pasarguard.org
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/PasarguardTelegramBot
+EnvironmentFile=-/home/PasarguardTelegramBot/.env
+ExecStart=/home/PasarguardTelegramBot/.venv/bin/python /home/PasarguardTelegramBot/main.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pasarguardtelegrambot
+
+[Install]
+WantedBy=multi-user.target
