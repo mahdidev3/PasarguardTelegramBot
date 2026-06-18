@@ -73,6 +73,18 @@ class Plan:
     badge: str
 
 
+@dataclass(frozen=True)
+class DataAddon:
+    key: str
+    title: str
+    data_gb: float
+    price: int
+    badge: str
+
+
+SERVICE_NAME_PREFIX = "howtosee_"
+
+
 PLANS: dict[str, Plan] = {
     "m_10": Plan("m_10", "۱۰ گیگابایت | یک‌ماهه", 10, 31, 100_000, "monthly", "اقتصادی"),
     "m_20": Plan("m_20", "۲۰ گیگابایت | یک‌ماهه", 20, 31, 190_000, "monthly", "محبوب"),
@@ -82,6 +94,32 @@ PLANS: dict[str, Plan] = {
     "q_60": Plan("q_60", "۶۰ گیگابایت | سه‌ماهه", 60, 93, 540_000, "quarterly", "سه‌ماهه"),
     "q_100": Plan("q_100", "۱۰۰ گیگابایت | سه‌ماهه", 100, 93, 850_000, "quarterly", "پیشنهادی"),
     "q_150": Plan("q_150", "۱۵۰ گیگابایت | سه‌ماهه", 150, 93, 1_180_000, "quarterly", "حجیم"),
+}
+
+
+DATA_ADDON_PACKAGES: dict[str, DataAddon] = {
+    "add_5": DataAddon("add_5", "۵ گیگابایت حجم اضافه", 5, 39_000, "شروع اقتصادی"),
+    "add_10": DataAddon("add_10", "۱۰ گیگابایت حجم اضافه", 10, 69_000, "انتخاب هوشمند"),
+    "add_20": DataAddon("add_20", "۲۰ گیگابایت حجم اضافه", 20, 129_000, "پیشنهادی"),
+    "add_50": DataAddon("add_50", "۵۰ گیگابایت حجم اضافه", 50, 299_000, "به‌صرفه‌ترین"),
+}
+
+
+FREE_SERVICE_TYPES: dict[str, dict[str, str]] = {
+    "standard": {
+        "title": "🌍 سرویس رایگان استاندارد",
+        "subtitle": "برای تست اتصال روزمره",
+    },
+    "speed": {
+        "title": "⚡ سرویس رایگان پرسرعت",
+        "subtitle": "برای تست سرعت و پایداری",
+    },
+}
+
+
+FREE_TEST_PLANS: dict[str, Plan] = {
+    "free_standard_150": Plan("free_standard_150", f"{FREE_TEST_MB} مگابایت | رایگان استاندارد", FREE_TEST_MB / 1024, 3, 0, "free:standard", "رایگان"),
+    "free_speed_150": Plan("free_speed_150", f"{FREE_TEST_MB} مگابایت | رایگان پرسرعت", FREE_TEST_MB / 1024, 3, 0, "free:speed", "رایگان"),
 }
 
 
@@ -108,13 +146,22 @@ def clean_username(value: str) -> str:
     return cleaned[:32]
 
 
+def service_name_with_prefix(raw: str) -> str:
+    cleaned = clean_username(raw)
+    if not cleaned:
+        return ""
+    if cleaned.lower().startswith(SERVICE_NAME_PREFIX):
+        return cleaned[:32]
+    return f"{SERVICE_NAME_PREFIX}{cleaned}"[:32]
+
+
 def make_token() -> str:
     return secrets.token_urlsafe(14).replace("-", "").replace("_", "")[:20]
 
 
 def make_service_name(telegram_id: int) -> str:
     suffix = str(telegram_id)[-5:]
-    return f"HowTooSee_{suffix}_{random.randint(10, 99)}"
+    return f"{SERVICE_NAME_PREFIX}{suffix}_{random.randint(10, 99)}"
 
 
 def h(value: Any) -> str:
@@ -234,6 +281,10 @@ class DB:
         first_name: Optional[str],
         referred_by_telegram_id: Optional[int] = None,
     ) -> sqlite3.Row:
+        # Anti self-referral: a user must never be saved as their own referrer.
+        if referred_by_telegram_id == telegram_id:
+            referred_by_telegram_id = None
+
         user = self.get_user(telegram_id)
         if user:
             with closing(self.connect()) as conn:
@@ -333,6 +384,49 @@ class DB:
             conn.commit()
             return int(cur.lastrowid)
 
+    def mark_first_purchase_done(self, telegram_id: int) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("UPDATE users SET first_purchase_done = 1 WHERE telegram_id = ?", (telegram_id,))
+            conn.commit()
+
+    def add_data_to_service(self, service_id: int, telegram_id: int, data_gb: float) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE services
+                SET data_gb = data_gb + ?, status = 'active'
+                WHERE id = ? AND user_telegram_id = ?
+                """,
+                (data_gb, service_id, telegram_id),
+            )
+            conn.commit()
+
+    def renew_service(self, service_id: int, telegram_id: int, plan: Plan, paid_amount: int) -> None:
+        expires = datetime.now(TEHRAN_TZ) + timedelta(days=plan.days)
+        with closing(self.connect()) as conn:
+            conn.execute(
+                """
+                UPDATE services
+                SET plan_key = ?, plan_title = ?, data_gb = ?, days = ?, price = ?, paid_amount = ?,
+                    expires_at = ?, data_used_mb = 0, is_test = 0, status = 'active'
+                WHERE id = ? AND user_telegram_id = ?
+                """,
+                (
+                    plan.key,
+                    plan.title,
+                    plan.data_gb,
+                    plan.days,
+                    plan.price,
+                    paid_amount,
+                    expires.isoformat(timespec="seconds"),
+                    service_id,
+                    telegram_id,
+                ),
+            )
+            if paid_amount > 0:
+                conn.execute("UPDATE users SET first_purchase_done = 1 WHERE telegram_id = ?", (telegram_id,))
+            conn.commit()
+
     def get_service(self, service_id: int, telegram_id: Optional[int] = None) -> Optional[sqlite3.Row]:
         with closing(self.connect()) as conn:
             if telegram_id is None:
@@ -394,6 +488,15 @@ class DB:
             if not ref:
                 return None
             referrer_id = int(ref["referrer_telegram_id"])
+
+            # Defense-in-depth: even if a bad/self-referral row is inserted manually,
+            # never pay commission to the buyer themselves.
+            if referrer_id == buyer_telegram_id:
+                conn.execute("DELETE FROM referrals WHERE referred_telegram_id = ?", (buyer_telegram_id,))
+                conn.execute("UPDATE users SET referred_by_telegram_id = NULL WHERE telegram_id = ?", (buyer_telegram_id,))
+                conn.commit()
+                return None
+
             commission = int(paid_amount * REFERRAL_COMMISSION_PERCENT / 100)
             if commission <= 0:
                 return None
@@ -472,7 +575,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🛒 خرید سرویس")],
-            [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 تست رایگان")],
+            [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 سرویس رایگان")],
             [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
             [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
         ],
@@ -498,7 +601,7 @@ def buy_type_kb() -> InlineKeyboardMarkup:
     return inline([
         [("🛍 پلن‌های آماده یک‌ماهه", "buy_cat:monthly")],
         [("💎 پلن‌های حرفه‌ای سه‌ماهه", "buy_cat:quarterly")],
-        [("🎁 سرویس تست رایگان", "free_test")],
+        [("🎁 سرویس رایگان", "free_test_menu")],
         [("🏠 منوی اصلی", "home")],
     ])
 
@@ -512,12 +615,60 @@ def plans_kb(category: str) -> InlineKeyboardMarkup:
     return inline(rows)
 
 
-def order_payment_kb(order_id: int, payable: int, wallet_balance: int) -> InlineKeyboardMarkup:
+def free_service_type_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for key, item in FREE_SERVICE_TYPES.items():
+        rows.append([(item["title"], f"free_type:{key}")])
+    rows.append([("⬅️ بازگشت", "buy"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def free_packages_kb(service_type: str) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for plan in FREE_TEST_PLANS.values():
+        if plan.category == f"free:{service_type}":
+            rows.append([(f"🎁 {plan.title} — رایگان", f"free_plan:{plan.key}")])
+    rows.append([("⬅️ بازگشت", "free_test_menu"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def addon_packages_kb(service_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for pkg in DATA_ADDON_PACKAGES.values():
+        rows.append([(f"📈 {pkg.title} — {fmt_money(pkg.price)}", f"addon_pkg:{service_id}:{pkg.key}")])
+    rows.append([("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def renew_type_kb(service_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("🛍 پلن‌های آماده یک‌ماهه", f"renew_cat:{service_id}:monthly")],
+        [("💎 پلن‌های حرفه‌ای سه‌ماهه", f"renew_cat:{service_id}:quarterly")],
+        [("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")],
+    ])
+
+
+def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for plan in PLANS.values():
+        if plan.category == category:
+            rows.append([(f"♻️ {plan.title} — {fmt_money(plan.price)}", f"renew_plan:{service_id}:{plan.key}")])
+    rows.append([("⬅️ بازگشت", f"renew_menu:{service_id}"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def order_payment_kb(
+    order_id: int,
+    payable: int,
+    wallet_balance: int,
+    back_callback: str = "buy",
+    back_text: str = "⬅️ انتخاب پلن دیگر",
+) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     if wallet_balance >= payable and payable > 0:
         rows.append([("💰 پرداخت با کیف پول", f"pay_wallet:{order_id}")])
     rows.append([("🤖 ثبت پرداخت موفق دمو", f"pay_demo:{order_id}")])
-    rows.append([("⬅️ انتخاب پلن دیگر", "buy"), ("🏠 منوی اصلی", "home")])
+    rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
 
@@ -534,7 +685,7 @@ def services_kb(services: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 def service_details_kb(service_id: int) -> InlineKeyboardMarkup:
     return inline([
         [("🔗 لینک اشتراک", f"sub_link:{service_id}"), ("🔄 تغییر لینک", f"revoke:{service_id}")],
-        [("♻️ تمدید سرویس", "buy"), ("📈 افزایش حجم", "buy")],
+        [("♻️ تمدید سرویس", f"renew_warn:{service_id}"), ("📈 افزایش حجم", f"addon_menu:{service_id}")],
         [("⚙️ تنظیمات اشتراک", f"svc_settings:{service_id}")],
         [("⬅️ سرویس‌های من", "my_services"), ("🏠 منوی اصلی", "home")],
     ])
@@ -594,7 +745,7 @@ def welcome_text(first_name: str | None = None) -> str:
         f"<code>See beyond limits</code>\n\n"
         f"سلام{name_part} 👋\n"
         f"به ربات رسمی <b>{h(BRAND_NAME)}</b> خوش آمدید.\n\n"
-        "اینجا می‌تونید سرویس VPN بخرید، تست رایگان بگیرید، سرویس‌هاتون رو مدیریت کنید و با معرفی دوستان اعتبار کیف پول بگیرید.\n\n"
+        "اینجا می‌تونید سرویس VPN بخرید، سرویس رایگان بگیرید، سرویس‌هاتون رو مدیریت کنید و با معرفی دوستان اعتبار کیف پول بگیرید.\n\n"
         "🔹 سرورهای پرسرعت و پایدار\n"
         "🔹 ترافیک امن و اختصاصی\n"
         "🔹 مناسب ایرانسل، همراه اول و مخابرات\n\n"
@@ -608,6 +759,47 @@ def buy_text() -> str:
         "پلن‌های آماده برای شروع سریع مناسب‌اند.\n"
         "پلن‌های سه‌ماهه برای مصرف پایدار و اقتصادی‌تر پیشنهاد می‌شوند."
     )
+
+
+def free_service_text() -> str:
+    return (
+        header("🎁 سرویس رایگان", "اول نوع سرویس را انتخاب کنید") +
+        "برای تست کیفیت، یک سرویس رایگان محدود می‌توانید فعال کنید.\n"
+        "این سرویس فقط یک‌بار برای هر حساب قابل دریافت است."
+    )
+
+
+def free_package_text(service_type: str) -> str:
+    item = FREE_SERVICE_TYPES.get(service_type, FREE_SERVICE_TYPES["standard"])
+    return (
+        header("🎁 انتخاب پکیج رایگان", item["title"]) +
+        f"{h(item['subtitle'])}\n\n"
+        "پکیج موردنظر را انتخاب کنید:"
+    )
+
+
+def addon_text(service: sqlite3.Row) -> str:
+    return (
+        header("📈 افزایش حجم سرویس", service["name"]) +
+        "یکی از بسته‌های حجم اضافه را انتخاب کنید.\n\n"
+        "✅ فقط حجم سرویس بیشتر می‌شود.\n"
+        "⏳ زمان پایان سرویس هیچ تغییری نمی‌کند.\n"
+        "💡 بسته‌های زیر نسبت به خرید سرویس جدید، به‌صرفه‌تر طراحی شده‌اند."
+    )
+
+
+def renew_text(service: sqlite3.Row) -> str:
+    return (
+        header("♻️ تمدید سرویس", service["name"]) +
+        "نوع پلن تمدید را انتخاب کنید.\n\n"
+        "⚠️ با تمدید، حجم و زمان سرویس شما مطابق پلن جدید ریست می‌شود.\n"
+        "اگر فقط حجم بیشتری می‌خواهید، از گزینه «افزایش حجم» استفاده کنید."
+    )
+
+
+def renew_category_text(service: sqlite3.Row, category: str) -> str:
+    base = plan_category_text(category)
+    return base + "\n\n" + f"♻️ تمدید برای سرویس: <b>{h(service['name'])}</b>"
 
 
 def plan_category_text(category: str) -> str:
@@ -631,7 +823,8 @@ def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int
     if discount:
         text += f"🎁 تخفیف دعوت دوستان: <b>{fmt_money(discount)}</b>\n"
     text += f"✅ مبلغ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
-    text += "یک نام برای اشتراک وارد کنید یا دکمه زیر را بزنید تا خودکار ساخته شود."
+    text += "یک نام دلخواه برای اشتراک وارد کنید یا دکمه زیر را بزنید تا خودکار ساخته شود.\n\n"
+    text += "ربات به‌صورت خودکار ابتدای نام را <code>howtosee_</code> می‌گذارد."
     return text, plan.price, discount, payable
 
 
@@ -651,6 +844,36 @@ def payment_text(plan: Plan, service_name: str, amount: int, discount: int, paya
     return text
 
 
+def addon_payment_text(service: sqlite3.Row, pkg: DataAddon, wallet_balance: int) -> str:
+    return (
+        header("💳 پرداخت افزایش حجم", service["name"]) +
+        f"📈 بسته انتخابی: <b>{h(pkg.title)}</b>\n"
+        f"📊 حجم اضافه: <b>{fmt_number(pkg.data_gb)} گیگابایت</b>\n"
+        f"⏳ افزایش زمان: <b>ندارد</b>\n"
+        f"💰 مبلغ: <b>{fmt_money(pkg.price)}</b>\n"
+        f"💼 موجودی کیف پول: <b>{fmt_money(wallet_balance)}</b>\n\n"
+        "فعلاً درگاه واقعی وصل نشده؛ برای تست جریان ربات از گزینه پرداخت دمو استفاده کنید."
+    )
+
+
+def renew_payment_text(service: sqlite3.Row, plan: Plan, amount: int, discount: int, payable: int, wallet_balance: int) -> str:
+    text = (
+        header("💳 پرداخت تمدید سرویس", service["name"]) +
+        f"♻️ پلن تمدید: <b>{h(plan.title)}</b>\n"
+        f"📊 حجم جدید: <b>{fmt_number(plan.data_gb)} گیگابایت</b>\n"
+        f"⏳ اعتبار جدید: <b>{fmt_number(plan.days)} روز</b>\n"
+        f"💰 مبلغ اصلی: <b>{fmt_money(amount)}</b>\n"
+    )
+    if discount:
+        text += f"🎁 تخفیف دعوت: <b>{fmt_money(discount)}</b>\n"
+    text += (
+        f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
+        f"💼 موجودی کیف پول: <b>{fmt_money(wallet_balance)}</b>\n\n"
+        "⚠️ با پرداخت، حجم مصرف‌شده صفر می‌شود و زمان سرویس مطابق پلن جدید ریست می‌شود."
+    )
+    return text
+
+
 def service_text(service: sqlite3.Row) -> str:
     expires = datetime.fromisoformat(service["expires_at"])
     days_left = max((expires - datetime.now(TEHRAN_TZ)).days, 0)
@@ -658,7 +881,7 @@ def service_text(service: sqlite3.Row) -> str:
     left_gb = max(float(service["data_gb"]) - used_gb, 0)
     sub_link = f"{SUBSCRIPTION_BASE_URL}/{service['token']}"
     status_label = "فعال ✅" if service["status"] == "active" else "غیرفعال ⛔"
-    test_label = "\n🎁 نوع: <b>تست رایگان</b>" if service["is_test"] else ""
+    test_label = "\n🎁 نوع: <b>سرویس رایگان</b>" if service["is_test"] else ""
     return (
         header("📦 جزئیات سرویس", service["name"]) +
         f"🟢 وضعیت: <b>{status_label}</b>{test_label}\n"
@@ -759,6 +982,8 @@ def ensure_from_message(message: Message) -> sqlite3.Row:
     if not user:
         raise RuntimeError("No Telegram user in message")
     referrer = parse_referrer_from_text(message.text)
+    if referrer == user.id:
+        referrer = None
     return db.ensure_user(user.id, user.username, user.first_name, referrer)
 
 
@@ -866,12 +1091,14 @@ async def auto_name(callback: CallbackQuery, state: FSMContext) -> None:
 async def custom_name(message: Message, state: FSMContext) -> None:
     user = ensure_from_message(message)
     raw = (message.text or "").strip()
-    service_name = clean_username(raw)
-    if not service_name:
+    cleaned = clean_username(raw)
+    if not cleaned:
         service_name = make_service_name(int(user["telegram_id"]))
-    if len(service_name) < 3:
-        await message.answer("نام اشتراک حداقل باید ۳ کاراکتر باشد. فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.")
-        return
+    else:
+        if len(cleaned) < 3:
+            await message.answer("نام اشتراک حداقل باید ۳ کاراکتر معتبر داشته باشد. فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.")
+            return
+        service_name = service_name_with_prefix(cleaned)
     await create_pending_order_and_show_payment(message, state, service_name)
 
 
@@ -920,7 +1147,16 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
     if not order or order["status"] != "pending":
         await callback.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
-    plan = PLANS[order["plan_key"]]
+
+    plan_key = str(order["plan_key"])
+    if plan_key.startswith("addon:"):
+        await complete_addon_order(callback, telegram_id, order, method, use_wallet)
+        return
+    if plan_key.startswith("renew:"):
+        await complete_renew_order(callback, telegram_id, order, method, use_wallet)
+        return
+
+    plan = PLANS[plan_key]
     payable = int(order["amount"]) - int(order["discount_amount"])
     user = db.get_user(telegram_id)
     if not user:
@@ -956,6 +1192,109 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         callback,
         header("✅ سفارش با موفقیت فعال شد", service_name)
         + f"سرویس شما آماده استفاده است.\n\n{service_text(service)}{extra}",
+        service_details_kb(service_id),
+    )
+
+
+async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
+    parts = str(order["plan_key"]).split(":")
+    if len(parts) != 3:
+        await callback.answer("سفارش افزایش حجم نامعتبر است.", show_alert=True)
+        return
+    package_key = parts[1]
+    service_id = int(parts[2])
+    pkg = DATA_ADDON_PACKAGES.get(package_key)
+    service = db.get_service(service_id, telegram_id)
+    if not pkg or not service or service["status"] == "deleted":
+        await callback.answer("سرویس یا بسته حجم پیدا نشد.", show_alert=True)
+        return
+
+    payable = int(order["amount"]) - int(order["discount_amount"])
+    user = db.get_user(telegram_id)
+    if not user:
+        await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
+        return
+
+    if use_wallet:
+        if int(user["wallet_balance"]) < payable:
+            await callback.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+            return
+        db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت افزایش حجم سفارش #{order['id']}")
+        wallet_used = payable
+    else:
+        wallet_used = 0
+
+    db.add_data_to_service(service_id, telegram_id, pkg.data_gb)
+    if payable > 0:
+        db.mark_first_purchase_done(telegram_id)
+    db.update_order_service(int(order["id"]), service_id)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?",
+            (method, wallet_used, int(order["id"])),
+        )
+        conn.commit()
+
+    reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
+    service = db.get_service(service_id, telegram_id)
+    extra = ""
+    if reward:
+        extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد."
+    await edit_or_answer(
+        callback,
+        header("✅ حجم سرویس افزایش یافت", service["name"]) +
+        f"بسته <b>{h(pkg.title)}</b> به سرویس شما اضافه شد.\n"
+        "⏳ زمان پایان سرویس تغییری نکرد.\n\n" + service_text(service) + extra,
+        service_details_kb(service_id),
+    )
+
+
+async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
+    parts = str(order["plan_key"]).split(":")
+    if len(parts) != 3:
+        await callback.answer("سفارش تمدید نامعتبر است.", show_alert=True)
+        return
+    plan_key = parts[1]
+    service_id = int(parts[2])
+    plan = PLANS.get(plan_key)
+    service = db.get_service(service_id, telegram_id)
+    if not plan or not service or service["status"] == "deleted":
+        await callback.answer("سرویس یا پلن تمدید پیدا نشد.", show_alert=True)
+        return
+
+    payable = int(order["amount"]) - int(order["discount_amount"])
+    user = db.get_user(telegram_id)
+    if not user:
+        await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
+        return
+
+    if use_wallet:
+        if int(user["wallet_balance"]) < payable:
+            await callback.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+            return
+        db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت تمدید سفارش #{order['id']}")
+        wallet_used = payable
+    else:
+        wallet_used = 0
+
+    db.renew_service(service_id, telegram_id, plan, payable)
+    db.update_order_service(int(order["id"]), service_id)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "UPDATE orders SET status = 'paid', payment_method = ?, wallet_used = ? WHERE id = ?",
+            (method, wallet_used, int(order["id"])),
+        )
+        conn.commit()
+
+    reward = db.reward_referrer_if_needed(telegram_id, int(order["id"]), payable)
+    service = db.get_service(service_id, telegram_id)
+    extra = ""
+    if reward:
+        extra = "\n\n💎 پورسانت معرفی با موفقیت برای معرف شما ثبت شد."
+    await edit_or_answer(
+        callback,
+        header("✅ سرویس با موفقیت تمدید شد", service["name"]) +
+        "حجم مصرف‌شده صفر شد و زمان سرویس طبق پلن جدید تنظیم شد.\n\n" + service_text(service) + extra,
         service_details_kb(service_id),
     )
 
@@ -999,6 +1338,120 @@ async def service_details(callback: CallbackQuery) -> None:
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
     await edit_or_answer(callback, service_text(service), service_details_kb(service_id))
+
+
+@router.callback_query(F.data.startswith("addon_menu:"))
+async def addon_menu(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, addon_text(service), addon_packages_kb(service_id))
+
+
+@router.callback_query(F.data.startswith("addon_pkg:"))
+async def addon_package_selected(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    service_id = int(parts[1])
+    package_key = parts[2]
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    pkg = DATA_ADDON_PACKAGES.get(package_key)
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    if not pkg:
+        await callback.answer("بسته حجم پیدا نشد.", show_alert=True)
+        return
+
+    order_id = db.create_order(int(user["telegram_id"]), f"addon:{package_key}:{service_id}", pkg.price, 0, 0, "pending", "none")
+    await edit_or_answer(
+        callback,
+        addon_payment_text(service, pkg, int(user["wallet_balance"])),
+        order_payment_kb(order_id, pkg.price, int(user["wallet_balance"]), f"addon_menu:{service_id}", "⬅️ انتخاب بسته دیگر"),
+    )
+
+
+@router.callback_query(F.data.startswith("renew_warn:"))
+async def renew_warn(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+
+    await callback.answer(
+        "⚠️ توجه!\nبا تمدید، حجم و زمان سرویس شما ریست می‌شود.\nاگر فقط حجم بیشتری می‌خواهید، از افزایش حجم استفاده کنید ✅",
+        show_alert=True,
+    )
+    if callback.message:
+        try:
+            await callback.message.edit_text(renew_text(service), reply_markup=renew_type_kb(service_id), disable_web_page_preview=True)
+        except Exception:
+            await callback.message.answer(renew_text(service), reply_markup=renew_type_kb(service_id), disable_web_page_preview=True)
+
+
+@router.callback_query(F.data.startswith("renew_menu:"))
+async def renew_menu(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, renew_text(service), renew_type_kb(service_id))
+
+
+@router.callback_query(F.data.startswith("renew_cat:"))
+async def renew_category(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    service_id = int(parts[1])
+    category = parts[2]
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, renew_category_text(service, category), renew_plans_kb(service_id, category))
+
+
+@router.callback_query(F.data.startswith("renew_plan:"))
+async def renew_plan_selected(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    service_id = int(parts[1])
+    plan_key = parts[2]
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    plan = PLANS.get(plan_key)
+    if not service or service["status"] == "deleted":
+        await callback.answer("سرویس پیدا نشد.", show_alert=True)
+        return
+    if not plan:
+        await callback.answer("پلن تمدید پیدا نشد.", show_alert=True)
+        return
+
+    discount = 0
+    if user["referred_by_telegram_id"] and not user["first_purchase_done"]:
+        discount = int(plan.price * REFERRED_DISCOUNT_PERCENT / 100)
+    payable = max(plan.price - discount, 0)
+    order_id = db.create_order(int(user["telegram_id"]), f"renew:{plan_key}:{service_id}", plan.price, discount, 0, "pending", "none")
+    await edit_or_answer(
+        callback,
+        renew_payment_text(service, plan, plan.price, discount, payable, int(user["wallet_balance"])),
+        order_payment_kb(order_id, payable, int(user["wallet_balance"]), f"renew_menu:{service_id}", "⬅️ انتخاب پلن دیگر"),
+    )
 
 
 @router.callback_query(F.data.startswith("sub_link:"))
@@ -1071,7 +1524,8 @@ async def rename_start(callback: CallbackQuery, state: FSMContext) -> None:
     await edit_or_answer(
         callback,
         header("✏️ تغییر نام اشتراک", service["name"]) +
-        "نام جدید را وارد کنید.\n\nفقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.",
+        "نام جدید را وارد کنید.\n\nربات به‌صورت خودکار ابتدای نام را <code>howtosee_</code> می‌گذارد.\n"
+        "فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.",
         inline([[('❌ لغو', f'svc_settings:{service_id}')]]),
     )
 
@@ -1081,10 +1535,11 @@ async def rename_finish(message: Message, state: FSMContext) -> None:
     user = ensure_from_message(message)
     data = await state.get_data()
     service_id = int(data["service_id"])
-    name = clean_username(message.text or "")
-    if len(name) < 3:
+    cleaned = clean_username(message.text or "")
+    if len(cleaned) < 3:
         await message.answer("نام جدید حداقل باید ۳ کاراکتر معتبر داشته باشد.")
         return
+    name = service_name_with_prefix(cleaned)
     db.rename_service(service_id, int(user["telegram_id"]), name)
     await state.clear()
     await message.answer(
@@ -1113,38 +1568,81 @@ async def delete_yes(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("✅ سرویس حذف شد") + "سرویس از لیست شما حذف شد.", back_home_kb())
 
 
-@router.message(F.text == "🎁 تست رایگان")
+@router.message(F.text == "🎁 سرویس رایگان")
 async def free_test_msg(message: Message) -> None:
     user = ensure_from_message(message)
-    await show_free_test(message, int(user["telegram_id"]))
+    await show_free_service_menu(message, int(user["telegram_id"]))
 
 
-@router.callback_query(F.data == "free_test")
-async def free_test_cb(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "free_test_menu")
+async def free_test_menu_cb(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
     await callback.answer()
     if callback.message:
-        await show_free_test(callback.message, int(user["telegram_id"]))
+        await show_free_service_menu(callback.message, int(user["telegram_id"]), edit_callback=callback)
 
 
-async def show_free_test(message: Message, telegram_id: int) -> None:
+async def show_free_service_menu(
+    message: Message,
+    telegram_id: int,
+    edit_callback: Optional[CallbackQuery] = None,
+) -> None:
     user = db.get_user(telegram_id)
     if user and user["free_test_used"]:
-        await message.answer(
-            header("🎁 تست رایگان") +
-            "شما قبلاً سرویس تست رایگان خود را دریافت کرده‌اید.\n\nبرای ادامه استفاده، یکی از پلن‌های اصلی را انتخاب کنید.",
-            reply_markup=inline([[('🛒 خرید سرویس', 'buy')], [('🏠 منوی اصلی', 'home')]]),
+        text = (
+            header("🎁 سرویس رایگان") +
+            "شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.\n\n"
+            "برای ادامه استفاده، یکی از پلن‌های اصلی را انتخاب کنید."
         )
+        markup = inline([[('🛒 خرید سرویس', 'buy')], [('🏠 منوی اصلی', 'home')]])
+        if edit_callback:
+            await edit_or_answer(edit_callback, text, markup)
+        else:
+            await message.answer(text, reply_markup=markup)
         return
-    test_plan = Plan("test", f"{FREE_TEST_MB} مگابایت | تست رایگان", FREE_TEST_MB / 1024, 3, 0, "test", "رایگان")
-    service_name = f"Test_{str(telegram_id)[-5:]}"
+
+    if edit_callback:
+        await edit_or_answer(edit_callback, free_service_text(), free_service_type_kb())
+    else:
+        await message.answer(free_service_text(), reply_markup=free_service_type_kb())
+
+
+@router.callback_query(F.data.startswith("free_type:"))
+async def free_type_selected(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    if user and user["free_test_used"]:
+        await callback.answer("شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.", show_alert=True)
+        return
+    service_type = callback.data.split(":", 1)[1]
+    if service_type not in FREE_SERVICE_TYPES:
+        await callback.answer("نوع سرویس پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, free_package_text(service_type), free_packages_kb(service_type))
+
+
+@router.callback_query(F.data.startswith("free_plan:"))
+async def free_plan_selected(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    if user and user["free_test_used"]:
+        await callback.answer("شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.", show_alert=True)
+        return
+
+    plan_key = callback.data.split(":", 1)[1]
+    test_plan = FREE_TEST_PLANS.get(plan_key)
+    if not test_plan:
+        await callback.answer("پکیج رایگان پیدا نشد.", show_alert=True)
+        return
+
+    suffix = str(telegram_id)[-5:]
+    service_name = f"{SERVICE_NAME_PREFIX}free_{suffix}"[:32]
     service_id = db.create_service(telegram_id, service_name, test_plan, 0, is_test=True)
     service = db.get_service(service_id, telegram_id)
-    await message.answer(
-        header("🎁 تست رایگان فعال شد", service_name) +
+    await edit_or_answer(
+        callback,
+        header("🎁 سرویس رایگان فعال شد", service_name) +
         "این سرویس برای بررسی کیفیت اتصال ساخته شده است.\n\n" + service_text(service),
-        reply_markup=service_details_kb(service_id),
-        disable_web_page_preview=True,
+        service_details_kb(service_id),
     )
 
 
