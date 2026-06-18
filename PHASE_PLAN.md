@@ -44,3 +44,15 @@ Future Phase 4:
 - Connect service status/delete/refund to safe Pasarguard disable/enable updates.
 - Connect link revoke and usage reset to Pasarguard operations.
 - Keep `PASARGUARD_DRY_RUN=true` as a safe no-op mode.
+
+## Phase 4.8 — Pasarguard backup/restore checkpoint
+
+Status: implemented in this package.
+
+- Backups now include Pasarguard actual templates/users when `PASARGUARD_ENABLED=true`.
+- Backups include desired Pasarguard templates/users derived from bot plans/services.
+- Restore upload shows a Pasarguard dry-run reconcile report before confirmation.
+- Confirmed restore runs database restore first, then Pasarguard reconcile.
+- With `PASARGUARD_DRY_RUN=true`, reconcile only reports actions.
+- With `PASARGUARD_DRY_RUN=false`, reconcile creates/updates templates/users and never remote-deletes users.
+- Exact non-zero usage restore is reported when the API cannot safely set usage exactly; zero usage is restored with reset.

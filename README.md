@@ -50,3 +50,15 @@ GRANT ALL PRIVILEGES ON DATABASE pasarguard_telegram_bot TO pasarguard_telegram_
 ### Phase 4.5/4.6 notes
 
 This checkpoint starts real service-user integration. Keep `PASARGUARD_DRY_RUN=true` for the first run. With dry-run on, Telegram purchase flows keep working but no remote Pasarguard user is created. After template sync works, set `PASARGUARD_DRY_RUN=false` to create/modify remote users.
+
+### Phase 4.8 Pasarguard checkpoint backup/restore
+
+When `PASARGUARD_ENABLED=true`, complete backups contain:
+
+- `external/pasarguard_desired_templates.jsonl`
+- `external/pasarguard_desired_state.jsonl`
+- `external/pasarguard_actual_templates.jsonl`
+- `external/pasarguard_actual_users.jsonl`
+- `external/pasarguard_summary.json`
+
+During restore, the bot first shows a dry-run reconcile report. After numeric confirmation, it restores the bot databases and then reconciles Pasarguard. Keep `PASARGUARD_DRY_RUN=true` for report-only restore testing. Set it to `false` only when you want the bot to actually create/update remote templates/users.

@@ -24,9 +24,10 @@ from app.config import settings
 from app.database import session_scope
 from app.models import Base, TicketAttachment
 from app.services.export_service import usage_summary_rows
+from app.services.pasarguard_checkpoint_service import write_pasarguard_checkpoint_files
 
 
-BACKUP_VERSION = 2
+BACKUP_VERSION = 3
 
 
 def _stamp() -> str:
@@ -218,7 +219,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     for table, rows in pg_data.items():
         _write_jsonl(base / "data" / "postgres" / f"{table}.jsonl", rows)
     _write_jsonl(base / "data" / "ticket_files_manifest.jsonl", ticket_file_manifest)
-    _write_jsonl(base / "external" / "pasarguard_desired_state.jsonl", _desired_pasarguard_state(sqlite_data, pg_data))
+    pasarguard_summary = await write_pasarguard_checkpoint_files(base, sqlite_data, pg_data, admin_id)
     (base / "data" / "sqlite_dump.sql").write_text(_sqlite_dump(), encoding="utf-8")
 
     usage = {row["key"]: row["value"] for row in usage_rows}
@@ -230,7 +231,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": admin_id,
         "database_engine": "postgresql+legacy_sqlite_bridge",
-        "schema_version": "phase3.1-create_all-runtime_patches",
+        "schema_version": "phase4.8-pasarguard-checkpoint",
         "counts": {
             "sqlite": {table: len(rows) for table, rows in sqlite_data.items()},
             "postgres": {table: len(rows) for table, rows in pg_data.items()},
@@ -244,11 +245,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
             "manifest": "data/ticket_files_manifest.jsonl",
             "note": "Closed ticket files are deleted from bot-side access storage and are not included after closure.",
         },
-        "pasarguard": {
-            "included": False,
-            "desired_state_included": True,
-            "note": "Pasarguard API backup/restore adapter is planned for the future phase.",
-        },
+        "pasarguard": pasarguard_summary,
     }
     (base / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 

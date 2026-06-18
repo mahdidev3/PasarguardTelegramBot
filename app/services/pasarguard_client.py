@@ -161,18 +161,34 @@ class PasarguardClient:
         await self.ensure_login()
         return await self._request("GET", "/api/admin", retries=1)
 
+    @staticmethod
+    def _extract_list_response(data: Any, *keys: str) -> list[dict[str, Any]]:
+        """Extract Pasarguard list responses with varied wrappers.
+
+        The OpenAPI schemas use response objects for some list endpoints, while
+        older deployments may return a bare list. Keep this defensive so sync and
+        backup do not silently miss records after panel upgrades.
+        """
+        if isinstance(data, dict):
+            for key in (*keys, "items", "data", "results", "users", "user_templates", "templates"):
+                if isinstance(data.get(key), list):
+                    return [dict(item) for item in data[key] if isinstance(item, dict)]
+        if isinstance(data, list):
+            return [dict(item) for item in data if isinstance(item, dict)]
+        return []
+
     async def list_user_templates(self, *, limit: int = 1000, offset: int = 0) -> list[dict[str, Any]]:
         await self.ensure_login()
         data = await self._request("GET", "/api/user_templates", params={"limit": limit, "offset": offset}, retries=1)
-        if isinstance(data, dict):
-            for key in ("items", "user_templates", "templates", "results"):
-                if isinstance(data.get(key), list):
-                    return list(data[key])
-            if isinstance(data.get("data"), list):
-                return list(data["data"])
-        if isinstance(data, list):
-            return list(data)
-        return []
+        return self._extract_list_response(data, "user_templates", "templates")
+
+    async def list_users(self, *, limit: int = 1000, offset: int = 0, search: str | None = None) -> list[dict[str, Any]]:
+        await self.ensure_login()
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if search:
+            params["search"] = search
+        data = await self._request("GET", "/api/users", params=params, retries=1)
+        return self._extract_list_response(data, "users")
 
     async def get_user_template(self, template_id: int) -> dict[str, Any]:
         await self.ensure_login()

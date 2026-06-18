@@ -16,6 +16,7 @@ from app.services.admin_audit_service import audit_log
 from app.services.backup_service import create_complete_backup, inspect_backup_file
 from app.services.confirmation_service import create_confirmation, verify_confirmation
 from app.services.restore_service import restore_complete_backup
+from app.services.pasarguard_checkpoint_service import reconcile_backup_with_pasarguard, render_reconcile_report
 from app.services.scheduled_backup_service import disable_auto_backup, enable_auto_backup, get_auto_backup_config, run_auto_backup_once
 from app.services.ticket_service import is_admin
 
@@ -82,7 +83,7 @@ async def backup_home(callback: CallbackQuery) -> None:
     text += (
         "بک‌آپ شامل کاربران، سرویس‌ها، سفارش‌ها، کیف پول، رفرال، تیکت‌ها، ادمین‌ها، تنظیمات، پلن‌ها، "
         "متن‌ها، کدهای تخفیف و گزارش استفاده است.\n\n"
-        "اتصال واقعی Pasarguard هنوز فعال نیست؛ اما فایل desired_state برای checkpoint آینده داخل بک‌آپ قرار می‌گیرد."
+        "اگر Pasarguard فعال باشد، actual_state و desired_state پنل هم داخل بک‌آپ ذخیره می‌شود و هنگام ریستور dry-run/reconcile قابل اجراست."
     )
     await edit_or_answer(callback, text, backup_home_kb())
 
@@ -103,7 +104,9 @@ async def create_backup(callback: CallbackQuery) -> None:
             f"سرویس‌های فعال: {usage.get('services_active', 0)}\n"
             f"مصرف کل GB: {usage.get('data_used_gb', 0)} / {usage.get('data_total_gb', 0)}\n"
             f"فایل‌های تیکت: {manifest.get('ticket_files', {}).get('active_files_backed_up', 0)} موفق / "
-            f"{manifest.get('ticket_files', {}).get('active_files_failed', 0)} ناموفق"
+            f"{manifest.get('ticket_files', {}).get('active_files_failed', 0)} ناموفق\n"
+            f"Pasarguard: desired {manifest.get('pasarguard', {}).get('desired_users', 0)} user / "
+            f"actual {manifest.get('pasarguard', {}).get('actual_users', 0)} user"
         )
         await callback.message.answer_document(FSInputFile(path), caption=caption)
 
@@ -233,6 +236,12 @@ async def restore_file_received(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("❌ checksum فایل بک‌آپ معتبر نیست. ریستور متوقف شد.")
         return
+    pg_report_text = ""
+    try:
+        pg_report = await reconcile_backup_with_pasarguard(dest, admin_id=message.from_user.id, dry_run=True)
+        pg_report_text = "\n\n🔌 Dry-run ریستور Pasarguard:\n<pre>" + h(render_reconcile_report(pg_report)) + "</pre>"
+    except Exception as exc:
+        pg_report_text = "\n\n⚠️ Dry-run Pasarguard انجام نشد:\n<code>" + h(exc) + "</code>"
     confirmation = await create_confirmation(
         message.from_user.id,
         "RESTORE_FULL",
@@ -252,9 +261,13 @@ async def restore_file_received(message: Message, state: FSMContext) -> None:
         f"سرویس‌های فعال: <b>{h(usage.get('services_active', 0))}</b>\n"
         f"مصرف: <b>{h(usage.get('data_used_gb', 0))} / {h(usage.get('data_total_gb', 0))} GB</b>\n\n"
         "قبل از ریستور، یک بک‌آپ اضطراری از وضعیت فعلی ساخته می‌شود.\n"
+        "اگر PASARGUARD_ENABLED=true باشد، reconcile پنل هم بعد از ریستور اجرا می‌شود؛ "
+        "با PASARGUARD_DRY_RUN=true فقط گزارش می‌دهد و با false اعمال واقعی انجام می‌دهد.\n"
         f"برای تأیید نهایی این کد را وارد کنید:\n<code>{confirmation.code}</code>"
     )
+    text += pg_report_text
     await message.answer(text)
+
 
 
 @backup_router.message(BackupStates.waiting_restore_confirm)
@@ -275,11 +288,19 @@ async def restore_confirm(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(f"❌ ریستور انجام نشد:\n<code>{h(exc)}</code>")
         return
+    pg_restore_text = ""
+    try:
+        from app.config import settings as _settings
+        pg_report = await reconcile_backup_with_pasarguard(restore_path, admin_id=message.from_user.id, dry_run=_settings.pasarguard_dry_run)
+        pg_restore_text = "\n\n🔌 نتیجه Reconcile Pasarguard:\n<pre>" + h(render_reconcile_report(pg_report)) + "</pre>"
+    except Exception as exc:
+        pg_restore_text = "\n\n⚠️ Reconcile Pasarguard انجام نشد:\n<code>" + h(exc) + "</code>"
     await audit_log(message.from_user.id, "RESTORE_FULL", "backup", payload.get("file_name"), "restore completed")
     await state.clear()
     text = header("✅ ریستور کامل انجام شد")
     text += f"بک‌آپ اضطراری قبل از ریستور:\n<code>{h(result.get('emergency_backup'))}</code>\n\n"
     text += f"SQLite tables: <b>{len(result.get('sqlite', {}))}</b>\nPostgreSQL tables: <b>{len(result.get('postgres', {}))}</b>"
+    text += pg_restore_text
     await message.answer(text, reply_markup=backup_home_kb())
     emergency = result.get("emergency_backup")
     if emergency and Path(str(emergency)).exists():
