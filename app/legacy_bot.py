@@ -654,6 +654,8 @@ def ensure_admin_schema() -> None:
             ("users", "deleted_at", "ALTER TABLE users ADD COLUMN deleted_at TEXT"),
             ("services", "admin_note", "ALTER TABLE services ADD COLUMN admin_note TEXT"),
             ("services", "locked_reason", "ALTER TABLE services ADD COLUMN locked_reason TEXT"),
+            ("services", "freeze_started_at", "ALTER TABLE services ADD COLUMN freeze_started_at TEXT"),
+            ("services", "total_frozen_seconds", "ALTER TABLE services ADD COLUMN total_frozen_seconds INTEGER NOT NULL DEFAULT 0"),
             ("services", "pasarguard_user_id", "ALTER TABLE services ADD COLUMN pasarguard_user_id INTEGER"),
             ("services", "pasarguard_username", "ALTER TABLE services ADD COLUMN pasarguard_username TEXT"),
             ("services", "pasarguard_template_id", "ALTER TABLE services ADD COLUMN pasarguard_template_id INTEGER"),
@@ -848,7 +850,9 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     plan_key = str(order["plan_key"])
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     service_id: Optional[int] = None
-    if plan_key in PLANS:
+    if plan_key.startswith("wallet_topup:"):
+        db.add_wallet(telegram_id, payable, "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
+    elif plan_key in PLANS:
         service_name = (order["service_name"] if row_has(order, "service_name") and order["service_name"] else make_service_name(telegram_id))
         service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     elif plan_key.startswith("addon:"):
@@ -1021,6 +1025,56 @@ async def provision_service_or_mark_failed(service_id: int, telegram_id: int, *,
 def refund_wallet_payment_if_needed(telegram_id: int, amount: int, order_id: int, reason: str) -> None:
     if amount > 0:
         db.add_wallet(telegram_id, amount, "wallet_refund", f"برگشت پرداخت سفارش #{order_id}: {reason[:80]}")
+
+
+def freeze_service_local(service_id: int, telegram_id: int) -> bool:
+    service = db.get_service(service_id, telegram_id)
+    if not service or str(service["status"] or "") != "active":
+        return False
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "UPDATE services SET status = 'frozen', freeze_started_at = ?, locked_reason = ? WHERE id = ? AND user_telegram_id = ?",
+            (now_iso(), "frozen_by_user", service_id, telegram_id),
+        )
+        conn.commit()
+    return True
+
+
+def unfreeze_service_local(service_id: int, telegram_id: int) -> tuple[bool, int]:
+    service = db.get_service(service_id, telegram_id)
+    if not service or str(service["status"] or "") != "frozen":
+        return False, 0
+    started_raw = service["freeze_started_at"] if row_has(service, "freeze_started_at") else None
+    now = datetime.now(TEHRAN_TZ)
+    frozen_seconds = 0
+    if started_raw:
+        try:
+            started = datetime.fromisoformat(str(started_raw))
+            frozen_seconds = max(int((now - started).total_seconds()), 0)
+        except Exception:
+            frozen_seconds = 0
+    expires = datetime.fromisoformat(service["expires_at"])
+    new_expires = expires + timedelta(seconds=frozen_seconds)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE services
+            SET status = 'active', expires_at = ?, freeze_started_at = NULL,
+                total_frozen_seconds = COALESCE(total_frozen_seconds, 0) + ?, locked_reason = NULL
+            WHERE id = ? AND user_telegram_id = ?
+            """,
+            (new_expires.isoformat(timespec="seconds"), frozen_seconds, service_id, telegram_id),
+        )
+        conn.commit()
+    return True, frozen_seconds
+
+
+def freeze_text(service: sqlite3.Row) -> str:
+    return (
+        header("❄️ فریز اشتراک", service["name"])
+        + "با فریز کردن، دسترسی اشتراک موقتاً متوقف می‌شود و زمان باقی‌مانده هنگام خروج از فریز جبران خواهد شد.\n\n"
+        + "در زمان فریز، لینک اشتراک کار نمی‌کند. هر وقت خواستید می‌توانید از همین بخش اشتراک را دوباره فعال کنید."
+    )
 
 
 
@@ -1425,10 +1479,20 @@ def name_prompt_kb(back_callback: str) -> InlineKeyboardMarkup:
     ])
 
 
-def order_payment_kb(order_id: int, payable: int, wallet_balance: int, back_callback: str = "buy", back_text: str = "⬅️ انتخاب پلن دیگر") -> InlineKeyboardMarkup:
+def order_payment_kb(
+    order_id: int,
+    payable: int,
+    wallet_balance: int,
+    back_callback: str = "buy",
+    back_text: str = "⬅️ انتخاب پلن دیگر",
+    *,
+    allow_wallet: bool = True,
+    allow_coupon: bool = True,
+) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
-    rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
-    if wallet_balance >= payable and payable > 0:
+    if allow_coupon:
+        rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
+    if allow_wallet and wallet_balance >= payable and payable > 0:
         rows.append([("💰 پرداخت با کیف پول", f"pay_wallet:{order_id}")])
     rows.append([("💳 کارت به کارت", f"pay_card:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
@@ -1490,10 +1554,12 @@ def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
     return inline(rows)
 
 
-def service_settings_kb(service_id: int) -> InlineKeyboardMarkup:
+def service_settings_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
+    service_id = int(service["id"])
+    freeze_row = [("▶️ خروج از فریز", f"unfreeze:{service_id}")] if str(service["status"] or "") == "frozen" else [("❄️ فریز اشتراک", f"freeze_ask:{service_id}")]
     return inline([
         [("✏️ تغییر نام اشتراک", f"rename:{service_id}")],
-        [("❄️ فریز اشتراک", f"soon:freeze")],
+        freeze_row,
         [("↩️ عودت سرویس", f"refund_ask:{service_id}")],
         [("🗑 حذف سرویس", f"delete_ask:{service_id}")],
         [("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")],
@@ -1888,6 +1954,13 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
     payable = max(amount - discount, 0)
     details = order_discount_details(int(order["id"]), order)
 
+    if plan_key.startswith("wallet_topup:"):
+        text = header("💳 پرداخت شارژ کیف پول", f"سفارش #{order['id']}")
+        text += f"💰 مبلغ شارژ کیف پول: <b>{fmt_money(amount)}</b>\n"
+        text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
+        text += "بعد از ارسال رسید و تأیید ادمین فروش، موجودی کیف پول شما به همین مقدار افزایش پیدا می‌کند."
+        return text, "wallet", payable
+
     if plan_key.startswith("addon:"):
         _, pkg_key, service_id_s = plan_key.split(":")
         service = db.get_service(int(service_id_s), int(user["telegram_id"]))
@@ -1935,6 +2008,7 @@ def service_text(service: sqlite3.Row) -> str:
         "active": "فعال ✅",
         "suspended": "غیرفعال ⛔",
         "locked": "قفل‌شده 🔒",
+        "frozen": "فریز شده ❄️",
         "provisioning": "در حال فعال‌سازی 🔄",
         "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
         "deleted": "حذف‌شده 🗑",
@@ -2119,6 +2193,8 @@ async def order_activation_preflight(order: sqlite3.Row, telegram_id: int) -> tu
     if settings.pasarguard_dry_run:
         return False, "فعال‌سازی خودکار سرویس موقتاً آماده نیست. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید."
     plan_key = str(order["plan_key"])
+    if plan_key.startswith("wallet_topup:"):
+        return True, ""
     if plan_key.startswith("addon:") or plan_key.startswith("renew:"):
         try:
             service_id = int(plan_key.split(":")[-1])
@@ -2151,11 +2227,21 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
         return
     text, back_callback, payable = render_order_payment_text(order, user)
     ok, reason = await order_activation_preflight(order, telegram_id)
+    plan_key = str(order["plan_key"])
+    is_wallet_topup = plan_key.startswith("wallet_topup:")
     if not ok:
         text += "\n\n⚠️ <b>این سفارش فعلاً قابل پرداخت نیست.</b>\n" + h(reason)
         markup = inline([[('🎫 پشتیبانی', 'ticket_new')], [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")]])
     else:
-        markup = order_payment_kb(order_id, payable, int(user["wallet_balance"]), back_callback, "⬅️ بازگشت")
+        markup = order_payment_kb(
+            order_id,
+            payable,
+            int(user["wallet_balance"]),
+            back_callback,
+            "⬅️ بازگشت",
+            allow_wallet=not is_wallet_topup,
+            allow_coupon=not is_wallet_topup,
+        )
     if isinstance(target, CallbackQuery):
         await edit_or_answer(target, text, markup)
     else:
@@ -2345,9 +2431,12 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not order or order["status"] != "pending":
         await callback.answer("سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
+    if str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("کد تخفیف برای شارژ کیف پول قابل استفاده نیست.", show_alert=True)
+        return
     await state.set_state(CouponStates.waiting_code)
     await state.update_data(order_id=order_id)
-    text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید.\n\nکدها از پنل ادمین و دیتابیس واقعی خوانده می‌شوند؛ کد hardcoded در مسیر کاربر استفاده نمی‌شود."
+    text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید."
     await edit_or_answer(callback, text, coupon_cancel_kb(order_id))
 
 
@@ -2483,6 +2572,9 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         await callback.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
     plan_key = str(order["plan_key"])
+    if plan_key.startswith("wallet_topup:"):
+        await callback.answer("شارژ کیف پول فقط از طریق کارت‌به‌کارت و تأیید رسید انجام می‌شود.", show_alert=True)
+        return
     if plan_key.startswith("addon:"):
         await complete_addon_order(callback, telegram_id, order, method, use_wallet)
         return
@@ -2800,7 +2892,71 @@ async def service_settings(callback: CallbackQuery) -> None:
     if service["is_test"]:
         await callback.answer("تنظیمات پیشرفته برای سرویس رایگان فعال نیست.", show_alert=True)
         return
-    await edit_or_answer(callback, header("⚙️ تنظیمات اشتراک", service["name"]) + "گزینه موردنظر را انتخاب کنید:", service_settings_kb(service_id))
+    await edit_or_answer(callback, header("⚙️ تنظیمات اشتراک", service["name"]) + "گزینه موردنظر را انتخاب کنید:", service_settings_kb(service))
+
+
+@router.callback_query(F.data.startswith("freeze_ask:"))
+async def freeze_ask(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    if not service or service["is_test"] or service["status"] != "active":
+        await callback.answer("این سرویس در حال حاضر قابل فریز نیست.", show_alert=True)
+        return
+    await edit_or_answer(callback, freeze_text(service), freeze_confirm_kb(service_id))
+
+
+@router.callback_query(F.data.startswith("freeze_yes:"))
+async def freeze_yes(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, telegram_id)
+    if not service or service["is_test"] or service["status"] != "active":
+        await callback.answer("این سرویس در حال حاضر قابل فریز نیست.", show_alert=True)
+        return
+    if not freeze_service_local(service_id, telegram_id):
+        await callback.answer("فریز انجام نشد.", show_alert=True)
+        return
+    service = db.get_service(service_id, telegram_id)
+    remote_result = await set_remote_user_status(db, service, "suspended") if service else None
+    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
+        # Roll back local freeze if remote disable fails.
+        with closing(db.connect()) as conn:
+            conn.execute("UPDATE services SET status = 'active', freeze_started_at = NULL, locked_reason = NULL WHERE id = ? AND user_telegram_id = ?", (service_id, telegram_id))
+            conn.commit()
+        service = db.get_service(service_id, telegram_id) or service
+        await edit_or_answer(callback, header("⚠️ فریز انجام نشد", service["name"] if service else "سرویس") + "در حال حاضر امکان توقف امن این اشتراک وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", service_settings_kb(service))
+        return
+    service = db.get_service(service_id, telegram_id)
+    await edit_or_answer(callback, header("❄️ اشتراک فریز شد", service["name"]) + "اشتراک شما متوقف شد. هنگام خروج از فریز، مدت زمانی که سرویس فریز بوده به تاریخ پایان اضافه می‌شود.", service_settings_kb(service))
+
+
+@router.callback_query(F.data.startswith("unfreeze:"))
+async def unfreeze(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, telegram_id)
+    if not service or service["is_test"] or service["status"] != "frozen":
+        await callback.answer("این سرویس در حالت فریز نیست.", show_alert=True)
+        return
+    ok, frozen_seconds = unfreeze_service_local(service_id, telegram_id)
+    service = db.get_service(service_id, telegram_id)
+    if not ok or not service:
+        await callback.answer("خروج از فریز انجام نشد.", show_alert=True)
+        return
+    remote_result = await set_remote_user_status(db, service, "active")
+    if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
+        # Put it back into frozen if activation fails.
+        with closing(db.connect()) as conn:
+            conn.execute("UPDATE services SET status = 'frozen', freeze_started_at = ? WHERE id = ? AND user_telegram_id = ?", (now_iso(), service_id, telegram_id))
+            conn.commit()
+        service = db.get_service(service_id, telegram_id) or service
+        await edit_or_answer(callback, header("⚠️ خروج از فریز انجام نشد", service["name"]) + "در حال حاضر امکان فعال‌سازی امن این اشتراک وجود ندارد. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.", service_settings_kb(service))
+        return
+    days = round(frozen_seconds / 86400, 2)
+    await edit_or_answer(callback, header("▶️ اشتراک فعال شد", service["name"]) + f"اشتراک شما دوباره فعال شد و حدود <b>{fmt_number(days)}</b> روز به تاریخ پایان اضافه شد.", service_details_kb(service))
 
 
 @router.callback_query(F.data.startswith("soon:"))
@@ -3025,10 +3181,11 @@ async def wallet_topup_amount(message: Message, state: FSMContext) -> None:
     if amount < WALLET_MIN_TOPUP:
         await message.answer(f"❌ مبلغ واردشده کمتر از حداقل واریز است.\nحداقل واریز: <b>{fmt_money(WALLET_MIN_TOPUP)}</b>", reply_markup=wallet_amount_kb())
         return
-    db.add_wallet(int(user["telegram_id"]), amount, "demo_topup", "افزایش موجودی دمو")
+    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "کارت به کارت")
     await state.clear()
-    user = db.get_user(int(user["telegram_id"]))
-    await message.answer(header("✅ کیف پول شارژ شد") + f"مبلغ <b>{fmt_money(amount)}</b> به کیف پول نمایشی شما اضافه شد.\n\nموجودی جدید: <b>{fmt_money(int(user['wallet_balance']))}</b>", reply_markup=wallet_kb())
+    await message.answer(header("💳 ادامه شارژ کیف پول") + "برای تکمیل شارژ، رسید کارت‌به‌کارت را ثبت کنید. موجودی بعد از تأیید ادمین فروش اضافه می‌شود.")
+    await show_order_payment(message, int(user["telegram_id"]), order_id)
+
 
 
 @router.message(F.text == "📊 اطلاعات حساب")
@@ -3826,9 +3983,12 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
 
     service_id = set_order_paid_admin(int(order["id"]), admin_id, method="کارت به کارت")
     refreshed = get_order_any(int(order["id"])) or order
+    is_wallet_topup = str(order["plan_key"]).startswith("wallet_topup:")
     service = db.get_service(service_id) if service_id else None
     provisioning_ok = True
-    if service_id and service and (('pasarguard_username' not in service.keys()) or (not service['pasarguard_username'])):
+    if is_wallet_topup:
+        update_receipt_review(receipt_id, "approved", admin_id, note)
+    elif service_id and service and (('pasarguard_username' not in service.keys()) or (not service['pasarguard_username'])):
         ok, remote_result, service = await provision_service_or_mark_failed(service_id, int(order["user_telegram_id"]), order_id=int(order["id"]), is_test=False, paid_amount=max(int(order["amount"]) - int(order["discount_amount"]), 0))
         provisioning_ok = ok
         if not ok:
@@ -3840,7 +4000,16 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
         update_receipt_review(receipt_id, "approved", admin_id, note)
     refreshed = get_order_any(int(order["id"])) or refreshed
     try:
-        if provisioning_ok and service:
+        if is_wallet_topup:
+            user_row = db.get_user(int(order["user_telegram_id"]))
+            user_text = header("✅ شارژ کیف پول تأیید شد", f"سفارش #{order['id']}")
+            user_text += f"رسید پرداخت شما تأیید شد و مبلغ <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b> به کیف پول شما اضافه شد.\n"
+            if user_row:
+                user_text += f"موجودی فعلی کیف پول: <b>{fmt_money(int(user_row['wallet_balance']))}</b>\n"
+            if note:
+                user_text += f"\n📝 توضیح ادمین:\n{h(note)}\n"
+            await message.bot.send_message(int(order["user_telegram_id"]), user_text, reply_markup=inline([[('💰 کیف پول', 'wallet')], [('🛒 خرید سرویس', 'buy'), ('🏠 منوی اصلی', 'home')]]))
+        elif provisioning_ok and service:
             user_text = header("✅ پرداخت شما تأیید شد", f"سفارش #{order['id']}")
             user_text += "رسید پرداخت شما تأیید شد و سرویس شما فعال است.\n"
             if note:
