@@ -35,6 +35,9 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+from app.bootstrap import bootstrap_phase1
+from app.routers.tickets import ticket_router
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -956,6 +959,7 @@ def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 سرویس رایگان")],
         [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
+        [KeyboardButton(text="🎫 پشتیبانی / تیکت‌ها")],
     ]
     if is_admin_id(telegram_id):
         rows.append([KeyboardButton(text="👑 پنل مدیریت")])
@@ -1129,8 +1133,9 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [
         [("👥 مدیریت کاربران", "adm_users"), ("📦 مدیریت سرویس‌ها", "adm_services")],
         [("🧾 سفارش‌ها", "adm_orders"), ("💰 کیف پول کاربران", "adm_wallet_start")],
-        [("🎟 کدهای تخفیف", "adm_coupons"), ("📢 پیام همگانی", "adm_broadcast")],
-        [("🔒 قفل بات", "adm_bot_lock"), ("📊 گزارش‌ها", "adm_reports")],
+        [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
+        [("📢 پیام همگانی", "adm_broadcast"), ("🔒 قفل بات", "adm_bot_lock")],
+        [("📊 گزارش‌ها", "adm_reports")],
     ]
     if admin_has(admin_id, "*"):
         rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
@@ -3250,10 +3255,13 @@ async def unknown(message: Message, state: FSMContext) -> None:
 
 
 async def main() -> None:
+    await bootstrap_phase1()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(AccessGuardMiddleware())
     dp.callback_query.middleware(AccessGuardMiddleware())
+    # Phase 1 routers must be included before the legacy catch-all router.
+    dp.include_router(ticket_router)
     dp.include_router(router)
     logger.info("Bot started: @%s", BOT_USERNAME)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())

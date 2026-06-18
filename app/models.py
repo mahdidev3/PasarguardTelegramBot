@@ -1,5 +1,264 @@
-"""Domain models placeholder for Phase 1.
+"""SQLAlchemy models for Phase 1 PostgreSQL storage.
 
-PostgreSQL/SQLAlchemy models will be introduced here in the database migration
-phase. Phase 0 intentionally keeps the existing SQLite models in app.legacy_bot.
+The schema mirrors the current bot entities and adds the complete ticket and
+numeric-confirmation foundations requested for Phase 1.
 """
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+
+class User(Base, TimestampMixin):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(255))
+    first_name: Mapped[str | None] = mapped_column(String(255))
+    referral_code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    referred_by_telegram_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    wallet_balance: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_referral_earned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    free_test_used: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    first_purchase_done: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    locked_reason: Mapped[str | None] = mapped_column(Text)
+    locked_notice: Mapped[str | None] = mapped_column(Text)
+    admin_note: Mapped[str | None] = mapped_column(Text)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Service(Base, TimestampMixin):
+    __tablename__ = "services"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    plan_key: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    plan_title: Mapped[str] = mapped_column(String(255), nullable=False)
+    data_gb: Mapped[float] = mapped_column(Float, nullable=False)
+    days: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[int] = mapped_column(Integer, nullable=False)
+    paid_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    token: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    data_used_mb: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    admin_note: Mapped[str | None] = mapped_column(Text)
+    locked_reason: Mapped[str | None] = mapped_column(Text)
+
+
+class Order(Base, TimestampMixin):
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    service_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    plan_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    discount_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    wallet_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    payment_method: Mapped[str] = mapped_column(String(120), nullable=False)
+    coupon_code: Mapped[str | None] = mapped_column(String(80))
+    coupon_discount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    admin_note: Mapped[str | None] = mapped_column(Text)
+
+
+class WalletTransaction(Base, TimestampMixin):
+    __tablename__ = "wallet_transactions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    type: Mapped[str] = mapped_column(String(80), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    related_user_id: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class Referral(Base, TimestampMixin):
+    __tablename__ = "referrals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    referrer_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    referred_telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True, nullable=False)
+    rewarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    first_order_id: Mapped[int | None] = mapped_column(Integer)
+    commission_amount: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rewarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Admin(Base, TimestampMixin):
+    __tablename__ = "admins"
+
+    telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    role: Mapped[str] = mapped_column(String(32), default="support", nullable=False)
+    added_by: Mapped[int | None] = mapped_column(BigInteger)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class AdminLog(Base):
+    __tablename__ = "admin_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(120), nullable=False)
+    target_type: Mapped[str | None] = mapped_column(String(80))
+    target_id: Mapped[str | None] = mapped_column(String(120))
+    details: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class BotSetting(Base):
+    __tablename__ = "bot_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class Coupon(Base, TimestampMixin):
+    __tablename__ = "coupons"
+
+    code: Mapped[str] = mapped_column(String(80), primary_key=True)
+    percent: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    scope: Mapped[str] = mapped_column(String(50), default="all", nullable=False)
+    target_user_ids: Mapped[str | None] = mapped_column(Text)
+    usage_limit: Mapped[int | None] = mapped_column(Integer)
+    per_user_limit: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    used_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    stack_with_referral: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    max_discount_percent: Mapped[int] = mapped_column(Integer, default=40, nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_by: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class CouponUsage(Base):
+    __tablename__ = "coupon_usages"
+    __table_args__ = (UniqueConstraint("code", "order_id", name="uq_coupon_usage_order"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    order_id: Mapped[int] = mapped_column(Integer, index=True, nullable=False)
+    discount_amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class Ticket(Base, TimestampMixin):
+    __tablename__ = "tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    category: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    related_type: Mapped[str] = mapped_column(String(80), default="general", nullable=False)
+    related_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    subject: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="open", index=True, nullable=False)
+    priority: Mapped[str] = mapped_column(String(40), default="normal", index=True, nullable=False)
+    assigned_admin_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    messages: Mapped[list["TicketMessage"]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
+    notes: Mapped[list["TicketAdminNote"]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
+    events: Mapped[list["TicketEvent"]] = relationship(back_populates="ticket", cascade="all, delete-orphan")
+
+
+class TicketMessage(Base):
+    __tablename__ = "ticket_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False)
+    sender_type: Mapped[str] = mapped_column(String(30), nullable=False)  # user/admin/system
+    sender_telegram_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    body: Mapped[str | None] = mapped_column(Text)
+    message_type: Mapped[str] = mapped_column(String(40), default="text", nullable=False)
+    telegram_file_id: Mapped[str | None] = mapped_column(Text)
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(Text)
+    file_name: Mapped[str | None] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    ticket: Mapped[Ticket] = relationship(back_populates="messages")
+    attachments: Mapped[list["TicketAttachment"]] = relationship(back_populates="message", cascade="all, delete-orphan")
+
+
+class TicketAttachment(Base):
+    __tablename__ = "ticket_attachments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False)
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("ticket_messages.id", ondelete="SET NULL"), index=True)
+    telegram_file_id: Mapped[str] = mapped_column(Text, nullable=False)
+    telegram_file_unique_id: Mapped[str | None] = mapped_column(Text)
+    file_name: Mapped[str | None] = mapped_column(String(255))
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    file_size: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    message: Mapped[TicketMessage | None] = relationship(back_populates="attachments")
+
+
+class TicketAdminNote(Base):
+    __tablename__ = "ticket_admin_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False)
+    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    ticket: Mapped[Ticket] = relationship(back_populates="notes")
+
+
+class TicketEvent(Base):
+    __tablename__ = "ticket_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(ForeignKey("tickets.id", ondelete="CASCADE"), index=True, nullable=False)
+    actor_telegram_id: Mapped[int | None] = mapped_column(BigInteger)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    ticket: Mapped[Ticket] = relationship(back_populates="events")
+
+
+class AdminConfirmation(Base):
+    __tablename__ = "admin_confirmations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True, nullable=False)
+    action: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    code_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

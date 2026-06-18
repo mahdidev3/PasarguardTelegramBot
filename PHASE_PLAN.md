@@ -1,38 +1,36 @@
-# Development phases
+# Approved phase plan
 
-The project will move forward only after the user tests each phase and confirms.
+The user asked to move phase by phase, testing each phase before continuing.
 
-## Phase 0 — Architecture cleanup
+## Phase 0 — Done
 
-- Keep runtime behavior stable.
-- Move current single-file implementation to `app/legacy_bot.py`.
-- Keep `python main.py` as the entrypoint.
-- Add package folders for routers, services, repositories, keyboards, utils, schemas and migrations.
-- Prepare clear boundaries for the next phases.
+- Split the project into a cleaner multi-file structure.
+- Keep legacy runtime behavior intact.
+- Prepare folders for routers, services, repositories, models, schemas and migrations.
 
-## Phase 1
+## Phase 1 — Current checkpoint
 
-- PostgreSQL migration.
-- Database models.
+- PostgreSQL/SQLAlchemy foundation.
+- Full core data models.
 - Complete ticket system.
-- Numeric second confirmation for dangerous admin actions.
+- Numeric second-confirmation system.
 
-## Phase 2
+## Phase 2 — Next after user approval
 
-- Full plan management from database.
+- Plan management from database.
 - Editable texts/messages from admin panel.
-- Broadcast system with photo/file/custom buttons.
+- Broadcast with photo/file/custom buttons.
 
 ## Phase 3
 
 - CSV/Excel exports.
 - Full backup.
 - Full restore.
-- Usage report in backups.
+- Usage report in backup.
 
-## Phase 4 — Future Pasarguard integration
+## Phase 4 — Future only
 
 - Pasarguard backup adapter.
 - Pasarguard restore/reconcile adapter.
-- Create/update remote services.
-- Sync data usage.
+- Create/fix remote services.
+- Sync data usage and remaining time.

@@ -1,18 +1,13 @@
-"""Application bootstrap helpers.
-
-In Phase 0 this module documents the target boot flow. Runtime still delegates to
-app.legacy_bot.main. In the next phases, routers will be registered here instead
-of inside the legacy file.
-"""
+"""Application bootstrap for Phase 1."""
 
 from __future__ import annotations
 
-from aiogram import Dispatcher, Router
-from aiogram.fsm.storage.memory import MemoryStorage
+from app.config import settings
+from app.database import init_database
+from app.services.ticket_service import seed_bootstrap_admins
 
 
-def create_dispatcher(*routers: Router) -> Dispatcher:
-    dp = Dispatcher(storage=MemoryStorage())
-    for router in routers:
-        dp.include_router(router)
-    return dp
+async def bootstrap_phase1() -> None:
+    """Initialize PostgreSQL schema and seed bootstrap super admins."""
+    await init_database()
+    await seed_bootstrap_admins(settings.bootstrap_super_admin_ids)
