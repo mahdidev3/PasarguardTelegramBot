@@ -46,3 +46,7 @@ ALTER USER pasarguard_telegram_bot WITH PASSWORD 'YOUR_STRONG_PASSWORD';
 GRANT ALL PRIVILEGES ON DATABASE pasarguard_telegram_bot TO pasarguard_telegram_bot;
 \q
 ```
+
+### Phase 4.5/4.6 notes
+
+This checkpoint starts real service-user integration. Keep `PASARGUARD_DRY_RUN=true` for the first run. With dry-run on, Telegram purchase flows keep working but no remote Pasarguard user is created. After template sync works, set `PASARGUARD_DRY_RUN=false` to create/modify remote users.

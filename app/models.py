@@ -73,6 +73,16 @@ class Service(Base, TimestampMixin):
     admin_note: Mapped[str | None] = mapped_column(Text)
     locked_reason: Mapped[str | None] = mapped_column(Text)
 
+    # Pasarguard remote binding (Phase 4)
+    pasarguard_user_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    pasarguard_username: Mapped[str | None] = mapped_column(String(255), index=True)
+    pasarguard_template_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    pasarguard_subscription_url: Mapped[str | None] = mapped_column(Text)
+    pasarguard_last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pasarguard_last_state_json: Mapped[dict | None] = mapped_column(JSON)
+    pasarguard_sync_status: Mapped[str | None] = mapped_column(String(40))
+    pasarguard_sync_error: Mapped[str | None] = mapped_column(Text)
+
 
 class Order(Base, TimestampMixin):
     __tablename__ = "orders"
@@ -201,6 +211,14 @@ class CatalogPlan(Base, TimestampMixin):
     max_per_user: Mapped[int | None] = mapped_column(Integer)
     created_by: Mapped[int | None] = mapped_column(BigInteger)
     updated_by: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Pasarguard template binding (Phase 4)
+    pasarguard_template_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    pasarguard_template_name: Mapped[str | None] = mapped_column(String(255), index=True)
+    pasarguard_sync_status: Mapped[str | None] = mapped_column(String(40))
+    pasarguard_sync_error: Mapped[str | None] = mapped_column(Text)
+    pasarguard_last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pasarguard_last_state_json: Mapped[dict | None] = mapped_column(JSON)
 
 
 class CatalogPlanVersion(Base):
@@ -419,4 +437,88 @@ class AdminConfirmation(Base):
     code_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PasarguardTemplate(Base, TimestampMixin):
+    __tablename__ = "pasarguard_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    plan_key: Mapped[str | None] = mapped_column(String(80), index=True)
+    remote_template_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True)
+    remote_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    managed_marker: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    data_limit_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    expire_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    username_prefix: Mapped[str | None] = mapped_column(String(20))
+    username_suffix: Mapped[str | None] = mapped_column(String(20))
+    group_ids_json: Mapped[list | None] = mapped_column(JSON)
+    is_disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sync_status: Mapped[str] = mapped_column(String(40), default="local", index=True, nullable=False)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_remote_state_json: Mapped[dict | None] = mapped_column(JSON)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class PasarguardUser(Base, TimestampMixin):
+    __tablename__ = "pasarguard_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    service_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    user_telegram_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    plan_key: Mapped[str | None] = mapped_column(String(80), index=True)
+    remote_user_id: Mapped[int | None] = mapped_column(Integer, unique=True, index=True)
+    remote_username: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    remote_template_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    subscription_url: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str | None] = mapped_column(String(40), index=True)
+    data_limit_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    used_traffic_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    expire_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    managed_marker: Mapped[str] = mapped_column(String(120), index=True, nullable=False)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_remote_state_json: Mapped[dict | None] = mapped_column(JSON)
+    sync_status: Mapped[str] = mapped_column(String(40), default="local", index=True, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class PasarguardSyncJob(Base):
+    __tablename__ = "pasarguard_sync_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    admin_telegram_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    mode: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    dry_run: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(40), default="running", index=True, nullable=False)
+    total_items: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    success_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    report_json: Mapped[dict | None] = mapped_column(JSON)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PasarguardSyncEvent(Base):
+    __tablename__ = "pasarguard_sync_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    service_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    plan_key: Mapped[str | None] = mapped_column(String(80), index=True)
+    remote_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    action: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    old_state_json: Mapped[dict | None] = mapped_column(JSON)
+    new_state_json: Mapped[dict | None] = mapped_column(JSON)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class PasarguardRemoteSnapshot(Base):
+    __tablename__ = "pasarguard_remote_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_type: Mapped[str] = mapped_column(String(80), index=True, nullable=False)
+    source: Mapped[str] = mapped_column(String(80), default="pasarguard", nullable=False)
+    state_json: Mapped[dict | list | None] = mapped_column(JSON)
+    created_by: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

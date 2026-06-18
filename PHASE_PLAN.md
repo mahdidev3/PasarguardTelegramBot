@@ -33,3 +33,14 @@ Future Phase 4:
 - Pasarguard backup/restore adapter.
 - Pasarguard remote service create/update/reconcile.
 - Data usage/time remaining sync.
+
+## Phase 4.5/4.6 checkpoint
+
+- Connect paid service creation to Pasarguard `create_user_from_template`.
+- Store remote username, remote id, template id, subscription URL and sync status in legacy SQLite service rows and PostgreSQL mapping tables.
+- Prefer Pasarguard subscription URL in user/admin service displays.
+- Connect renewal to Pasarguard template re-apply.
+- Connect addon volume changes to Pasarguard data_limit updates.
+- Connect service status/delete/refund to safe Pasarguard disable/enable updates.
+- Connect link revoke and usage reset to Pasarguard operations.
+- Keep `PASARGUARD_DRY_RUN=true` as a safe no-op mode.

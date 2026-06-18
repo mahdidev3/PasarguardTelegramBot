@@ -41,7 +41,17 @@ from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
 from app.routers.backup import backup_router
+from app.routers.pasarguard import pasarguard_router
 from app.services.scheduled_backup_service import start_auto_backup_scheduler
+from app.services.pasarguard_user_service import (
+    apply_template_to_remote_user,
+    create_remote_user_for_service,
+    reset_remote_user_usage,
+    revoke_remote_subscription,
+    set_remote_user_status,
+    sync_remote_user_from_local,
+    update_remote_user_limit,
+)
 from app.routers.plans import plans_router
 from app.routers.settings import settings_router
 
@@ -223,6 +233,11 @@ def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
 
 
 def subscription_link(service: sqlite3.Row) -> str:
+    try:
+        if "pasarguard_subscription_url" in service.keys() and service["pasarguard_subscription_url"]:
+            return str(service["pasarguard_subscription_url"])
+    except Exception:
+        pass
     return f"{SUBSCRIPTION_BASE_URL}/{service['token']}"
 
 
@@ -574,6 +589,14 @@ def ensure_admin_schema() -> None:
             ("users", "deleted_at", "ALTER TABLE users ADD COLUMN deleted_at TEXT"),
             ("services", "admin_note", "ALTER TABLE services ADD COLUMN admin_note TEXT"),
             ("services", "locked_reason", "ALTER TABLE services ADD COLUMN locked_reason TEXT"),
+            ("services", "pasarguard_user_id", "ALTER TABLE services ADD COLUMN pasarguard_user_id INTEGER"),
+            ("services", "pasarguard_username", "ALTER TABLE services ADD COLUMN pasarguard_username TEXT"),
+            ("services", "pasarguard_template_id", "ALTER TABLE services ADD COLUMN pasarguard_template_id INTEGER"),
+            ("services", "pasarguard_subscription_url", "ALTER TABLE services ADD COLUMN pasarguard_subscription_url TEXT"),
+            ("services", "pasarguard_last_sync_at", "ALTER TABLE services ADD COLUMN pasarguard_last_sync_at TEXT"),
+            ("services", "pasarguard_last_state_json", "ALTER TABLE services ADD COLUMN pasarguard_last_state_json TEXT"),
+            ("services", "pasarguard_sync_status", "ALTER TABLE services ADD COLUMN pasarguard_sync_status TEXT"),
+            ("services", "pasarguard_sync_error", "ALTER TABLE services ADD COLUMN pasarguard_sync_error TEXT"),
             ("orders", "coupon_code", "ALTER TABLE orders ADD COLUMN coupon_code TEXT"),
             ("orders", "coupon_discount", "ALTER TABLE orders ADD COLUMN coupon_discount INTEGER NOT NULL DEFAULT 0"),
             ("orders", "admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT"),
@@ -1144,6 +1167,7 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
         [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
         [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
+        [("🔌 Pasarguard", "adm_pasarguard")],
     ]
     if admin_has(admin_id, "*"):
         rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
@@ -2269,9 +2293,10 @@ async def refund_yes(callback: CallbackQuery) -> None:
         await callback.answer("این سرویس قبلاً استفاده شده و عودت خودکار برای آن فعال نیست.", show_alert=True)
         return
     amount = int(service["paid_amount"])
+    remote_result = await set_remote_user_status(db, service, "deleted")
     db.add_wallet(int(user["telegram_id"]), amount, "refund", f"عودت سرویس {service['name']}")
     db.delete_service(service_id, int(user["telegram_id"]))
-    await edit_or_answer(callback, header("✅ عودت انجام شد") + f"مبلغ <b>{fmt_money(amount)}</b> به کیف پول شما برگشت و سرویس از حساب شما حذف شد.", inline([[("💰 کیف پول", "wallet")], [("🏠 منوی اصلی", "home")]]))
+    await edit_or_answer(callback, header("✅ عودت انجام شد") + f"مبلغ <b>{fmt_money(amount)}</b> به کیف پول شما برگشت و سرویس از حساب شما حذف شد." + remote_result.notice(), inline([[("💰 کیف پول", "wallet")], [("🏠 منوی اصلی", "home")]]))
 
 
 @router.callback_query(F.data.startswith("delete_ask:"))
@@ -2285,8 +2310,10 @@ async def delete_ask(callback: CallbackQuery) -> None:
 async def delete_yes(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
     service_id = int(callback.data.split(":", 1)[1])
+    service = db.get_service(service_id, int(user["telegram_id"]))
+    remote_result = await set_remote_user_status(db, service, "deleted") if service else None
     db.delete_service(service_id, int(user["telegram_id"]))
-    await edit_or_answer(callback, header("✅ سرویس حذف شد") + "سرویس از لیست شما حذف شد.", back_home_kb())
+    await edit_or_answer(callback, header("✅ سرویس حذف شد") + "سرویس از لیست شما حذف شد." + (remote_result.notice() if remote_result else ""), back_home_kb())
 
 
 @router.message(F.text == "🎁 سرویس رایگان")
@@ -2781,7 +2808,9 @@ async def admin_service_status(callback: CallbackQuery) -> None:
     admin_update_service_status(sid, status, f"set by admin {callback.from_user.id}")
     admin_log(callback.from_user.id, "SERVICE_STATUS", "service", sid, status)
     service = db.get_service(sid)
-    await edit_or_answer(callback, header("✅ وضعیت سرویس تغییر کرد") + admin_service_text(service), admin_service_kb(service))
+    remote_result = await set_remote_user_status(db, service, status) if service else None
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ وضعیت سرویس تغییر کرد") + admin_service_text(service) + (remote_result.notice() if remote_result else ""), admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_svc_revoke:"))
@@ -2795,9 +2824,11 @@ async def admin_service_revoke(callback: CallbackQuery) -> None:
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
     db.revoke_service_link(sid, int(service["user_telegram_id"]))
+    service = db.get_service(sid)
+    remote_result = await revoke_remote_subscription(db, service)
     admin_log(callback.from_user.id, "SERVICE_REVOKE_LINK", "service", sid, "")
     service = db.get_service(sid)
-    await edit_or_answer(callback, header("✅ لینک سرویس تغییر کرد") + admin_service_text(service), admin_service_kb(service))
+    await edit_or_answer(callback, header("✅ لینک سرویس تغییر کرد") + admin_service_text(service) + remote_result.notice(), admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_svc_data:"))
@@ -2811,7 +2842,9 @@ async def admin_service_add_data(callback: CallbackQuery) -> None:
     admin_add_data_to_service(sid, gb)
     admin_log(callback.from_user.id, "SERVICE_ADD_DATA", "service", sid, f"+{gb}GB")
     service = db.get_service(sid)
-    await edit_or_answer(callback, header("✅ حجم اضافه شد") + admin_service_text(service), admin_service_kb(service))
+    remote_result = await update_remote_user_limit(db, service) if service else None
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ حجم اضافه شد") + admin_service_text(service) + (remote_result.notice() if remote_result else ""), admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_svc_days:"))
@@ -2825,7 +2858,9 @@ async def admin_service_add_days(callback: CallbackQuery) -> None:
     admin_add_days_to_service(sid, days)
     admin_log(callback.from_user.id, "SERVICE_ADD_DAYS", "service", sid, f"+{days} days")
     service = db.get_service(sid)
-    await edit_or_answer(callback, header("✅ زمان اضافه شد") + admin_service_text(service), admin_service_kb(service))
+    remote_result = await sync_remote_user_from_local(db, service) if service else None
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ زمان اضافه شد") + admin_service_text(service) + (remote_result.notice() if remote_result else ""), admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_svc_reset:"))
@@ -2839,7 +2874,9 @@ async def admin_service_reset_usage(callback: CallbackQuery) -> None:
         conn.commit()
     admin_log(callback.from_user.id, "SERVICE_RESET_USAGE", "service", sid, "")
     service = db.get_service(sid)
-    await edit_or_answer(callback, header("✅ مصرف ریست شد") + admin_service_text(service), admin_service_kb(service))
+    remote_result = await reset_remote_user_usage(db, service) if service else None
+    service = db.get_service(sid)
+    await edit_or_answer(callback, header("✅ مصرف ریست شد") + admin_service_text(service) + (remote_result.notice() if remote_result else ""), admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_manual_service:"))
@@ -2885,11 +2922,13 @@ async def admin_manual_service_amount_finish(message: Message, state: FSMContext
         await message.answer("❌ ساخت سرویس ناموفق بود.", reply_markup=admin_back_kb(f"adm_user:{uid}"))
         return
     service = db.get_service(service_id)
+    remote_result = await create_remote_user_for_service(db, service, order_id=None)
+    service = db.get_service(service_id)
     try:
-        await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service), reply_markup=service_details_kb(service))
+        await message.bot.send_message(uid, header("✅ سرویس شما فعال شد") + service_text(service) + remote_result.notice(), reply_markup=service_details_kb(service))
     except Exception:
         pass
-    await message.answer(header("✅ سرویس دستی ساخته شد") + admin_service_text(service), reply_markup=admin_service_kb(service))
+    await message.answer(header("✅ سرویس دستی ساخته شد") + admin_service_text(service) + remote_result.notice(), reply_markup=admin_service_kb(service))
 
 
 @router.callback_query(F.data.startswith("adm_user_orders:"))
@@ -3284,6 +3323,7 @@ async def main() -> None:
     dp.include_router(broadcast_router)
     dp.include_router(reports_router)
     dp.include_router(backup_router)
+    dp.include_router(pasarguard_router)
     dp.include_router(router)
     auto_backup_task = start_auto_backup_scheduler(bot)
     logger.info("Bot started: @%s", BOT_USERNAME)
