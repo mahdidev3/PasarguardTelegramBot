@@ -1,24 +1,27 @@
-# HowTooSee Bot — Phase 1
+# HowTooSee Bot — Phase 1 ticket bugfix
 
-Phase 1 keeps the legacy bot behavior available, but adds the new PostgreSQL
-foundation, a complete ticket system, and numeric second-confirmation support.
+This package keeps the Phase 1 architecture and fixes the first ticket-system bugs reported during testing.
 
-## What changed in Phase 1
+## Phase 1 contents
 
-- New async SQLAlchemy/PostgreSQL layer in `app/database.py`
-- Full SQLAlchemy schema in `app/models.py`
-- Ticket tables: `tickets`, `ticket_messages`, `ticket_attachments`, `ticket_admin_notes`, `ticket_events`
-- Numeric confirmation table: `admin_confirmations`
-- New ticket router in `app/routers/tickets.py`
-- New ticket keyboards in `app/keyboards/tickets.py`
-- Ticket service layer in `app/services/ticket_service.py`
-- Confirmation service in `app/services/confirmation_service.py`
-- Admin audit service in `app/services/admin_audit_service.py`
-- Legacy `main.py` entrypoint still works: `python main.py`
-- User menu now contains `🎫 پشتیبانی / تیکت‌ها`
-- Admin panel now contains `🎫 تیکت‌ها`
+- PostgreSQL / SQLAlchemy foundation.
+- Core SQLAlchemy models.
+- Complete ticket system foundation.
+- Numeric second-confirmation service.
+- User ticket menu: `🎫 پشتیبانی / تیکت‌ها`.
+- Admin ticket menu inside the existing admin panel.
 
-## PostgreSQL setup on Ubuntu
+## Fixes in this package
+
+- Fixed the new-ticket category flow so choosing service/order/wallet/general continues reliably to the subject step.
+- Added clearer ticket instructions telling users to send description + media/file/voice/video in one message when possible.
+- Fixed duplicate first user message in admin ticket view.
+- Added admin file viewer: admin can open the file list and click a specific photo/video/document/voice/audio to receive it in Telegram.
+- Changed ticket assignee display:
+  - Admin view shows role + chat ID.
+  - User view shows only the role label, not the admin chat ID.
+
+## PostgreSQL setup
 
 ```bash
 sudo apt update
@@ -44,7 +47,7 @@ ADMIN_CHAT_IDS=123456789
 BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 ```
 
-## Install and run
+## Run
 
 ```bash
 python -m venv .venv
@@ -54,42 +57,3 @@ cp .env.example .env
 nano .env
 python main.py
 ```
-
-On startup, Phase 1 creates the PostgreSQL tables automatically with
-`Base.metadata.create_all()` so you can test quickly on a fresh database.
-Alembic scaffolding is present in `app/migrations/` for the next hardening pass.
-
-## Ticket flow
-
-User side:
-
-```text
-🎫 پشتیبانی / تیکت‌ها
-├── 🎫 تیکت جدید
-├── 📂 تیکت‌های باز من
-└── ✅ بسته‌شده‌ها
-```
-
-Admin side:
-
-```text
-👑 پنل مدیریت
-└── 🎫 تیکت‌ها
-    ├── 🆕 جدید
-    ├── 📂 همه باز
-    ├── 👤 تیکت‌های من
-    ├── ⏳ منتظر کاربر
-    └── ✅ بسته‌شده‌ها
-```
-
-Ticket messages support text, photo, document, video, voice and audio metadata.
-The file itself is not downloaded; Telegram `file_id` is stored for later use.
-
-## Numeric confirmation
-
-The confirmation service is now available for dangerous admin actions. In this
-phase it is wired into admin ticket close: closing a ticket from the admin panel
-requires a 6-digit code that expires after 5 minutes.
-
-Later phases will reuse the same service for restore, broadcast, delete user,
-delete service, wallet decrease, and bot lock.

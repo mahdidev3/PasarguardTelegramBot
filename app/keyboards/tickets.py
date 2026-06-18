@@ -29,6 +29,14 @@ def ticket_category_kb() -> InlineKeyboardMarkup:
     return inline(rows)
 
 
+def ticket_subject_kb() -> InlineKeyboardMarkup:
+    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+
+
+def ticket_body_kb() -> InlineKeyboardMarkup:
+    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+
+
 def user_ticket_list_kb(ticket_rows: list[object], back: str = "ticket_home") -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for ticket in ticket_rows[:20]:
@@ -66,15 +74,33 @@ def admin_ticket_list_kb(ticket_rows: list[object], back: str = "adm_tickets") -
 
 
 def admin_ticket_view_kb(ticket_id: int, assigned_to_me: bool = False) -> InlineKeyboardMarkup:
+    assign_text = "✅ مسئولیت با شماست" if assigned_to_me else "👮 گرفتن مسئولیت"
     return inline(
         [
-            [("✉️ پاسخ دادن", f"adm_ticket_reply:{ticket_id}"), ("👮 گرفتن مسئولیت", f"adm_ticket_assign:{ticket_id}")],
+            [("✉️ پاسخ دادن", f"adm_ticket_reply:{ticket_id}"), (assign_text, f"adm_ticket_assign:{ticket_id}")],
             [("📝 یادداشت داخلی", f"adm_ticket_note:{ticket_id}"), ("📎 فایل‌ها", f"adm_ticket_files:{ticket_id}")],
             [("⚡ اولویت زیاد", f"adm_ticket_prio:{ticket_id}:high"), ("🔥 فوری", f"adm_ticket_prio:{ticket_id}:urgent")],
             [("✅ بستن با کد", f"adm_ticket_close_ask:{ticket_id}"), ("🔁 باز کردن", f"adm_ticket_reopen:{ticket_id}")],
             [("⬅️ لیست تیکت‌ها", "adm_tickets_open"), ("👑 منوی ادمین", "adm_home")],
         ]
     )
+
+
+def admin_ticket_files_kb(ticket_id: int, file_messages: list[object]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    icons = {
+        "photo": "🖼",
+        "video": "🎬",
+        "voice": "🎤",
+        "audio": "🎧",
+        "document": "📄",
+    }
+    for msg in file_messages[:25]:
+        icon = icons.get(getattr(msg, "message_type", ""), "📎")
+        name = getattr(msg, "file_name", None) or getattr(msg, "message_type", "file")
+        rows.append([(f"{icon} پیام #{getattr(msg, 'id', 0)} | {str(name)[:28]}", f"adm_ticket_file:{ticket_id}:{getattr(msg, 'id', 0)}")])
+    rows.append([("⬅️ برگشت به تیکت", f"adm_ticket:{ticket_id}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
 
 
 def confirm_cancel_kb(back_callback: str) -> InlineKeyboardMarkup:

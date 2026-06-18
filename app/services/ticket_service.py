@@ -48,6 +48,13 @@ TICKET_PRIORITY_LABELS: dict[str, str] = {
     "urgent": "فوری",
 }
 
+ADMIN_ROLE_LABELS: dict[str, str] = {
+    "super": "مدیریت کل",
+    "sales": "مدیریت فروش",
+    "support": "پشتیبانی",
+    "marketing": "مدیریت مارکتینگ",
+}
+
 
 @dataclass(frozen=True)
 class TicketStats:
@@ -104,14 +111,40 @@ async def active_admin_ids() -> list[int]:
         return [int(x) for x in result.scalars().all()]
 
 
+async def admin_role_label(telegram_id: int | None) -> str:
+    if not telegram_id:
+        return "ندارد"
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Admin.role).where(Admin.telegram_id == telegram_id, Admin.is_active.is_(True))
+        )
+        role = result.scalar_one_or_none()
+    return ADMIN_ROLE_LABELS.get(str(role or ""), "ادمین")
+
+
+async def admin_assignee_label(telegram_id: int | None, admin_view: bool = False) -> str:
+    if not telegram_id:
+        return "ندارد"
+    label = await admin_role_label(telegram_id)
+    if admin_view:
+        return f"{label} | {telegram_id}"
+    return label
+
+
 async def create_ticket(
     user_telegram_id: int,
     category: str,
     related_type: str,
     related_id: str | None,
     subject: str,
-    body: str,
+    body: str | None = None,
 ) -> Ticket:
+    """Create the ticket shell.
+
+    The first user message is stored by add_ticket_message so media tickets do
+    not appear twice in the conversation history. The body argument is kept for
+    backward compatibility with earlier Phase 1 code.
+    """
     async with session_scope() as session:
         ticket = Ticket(
             user_telegram_id=user_telegram_id,
@@ -124,15 +157,6 @@ async def create_ticket(
         )
         session.add(ticket)
         await session.flush()
-        session.add(
-            TicketMessage(
-                ticket_id=ticket.id,
-                sender_type="user",
-                sender_telegram_id=user_telegram_id,
-                body=body,
-                message_type="text",
-            )
-        )
         session.add(
             TicketEvent(
                 ticket_id=ticket.id,
