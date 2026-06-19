@@ -84,7 +84,7 @@ def desired_payload_for_plan(plan: CatalogPlan) -> dict[str, Any]:
         "name": template_name_for_plan(plan),
         "data_limit": int(float(plan.data_gb) * BYTES_PER_GB),
         "expire_duration": int(plan.days) * 86400,
-        "username_prefix": (settings.pasarguard_username_prefix or "hts_")[:20],
+        "username_prefix": (settings.pasarguard_username_prefix or "")[:20],
         "username_suffix": username_suffix_for_plan(plan),
         "group_ids": list(settings.pasarguard_template_group_ids),
         "data_limit_reset_strategy": "no_reset",

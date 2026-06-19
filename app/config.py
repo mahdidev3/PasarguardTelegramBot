@@ -73,7 +73,7 @@ class Settings:
     pasarguard_dry_run: bool = True
     pasarguard_managed_prefix: str = "HTS_BOT"
     pasarguard_template_group_ids: list[int] = field(default_factory=list)
-    pasarguard_username_prefix: str = "hts_"
+    pasarguard_username_prefix: str = ""
     pasarguard_username_suffix: str = ""
 
 
@@ -101,7 +101,7 @@ settings = Settings(
     pasarguard_dry_run=_parse_bool(os.getenv("PASARGUARD_DRY_RUN", "true"), True),
     pasarguard_managed_prefix=os.getenv("PASARGUARD_MANAGED_PREFIX", "HTS_BOT").strip() or "HTS_BOT",
     pasarguard_template_group_ids=_parse_int_list(os.getenv("PASARGUARD_TEMPLATE_GROUP_IDS", "")),
-    pasarguard_username_prefix=os.getenv("PASARGUARD_USERNAME_PREFIX", "hts_").strip()[:20],
+    pasarguard_username_prefix=os.getenv("PASARGUARD_USERNAME_PREFIX", "").strip()[:20],
     pasarguard_username_suffix=os.getenv("PASARGUARD_USERNAME_SUFFIX", "").strip()[:20],
 )
 

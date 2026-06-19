@@ -156,12 +156,11 @@ def is_managed_remote_user(remote: dict[str, Any]) -> bool:
     username = _remote_username(remote).lower()
     note = _remote_note(remote)
     marker = managed_marker()
-    configured_prefix = (settings.pasarguard_username_prefix or "hts_").lower()
+    configured_prefix = (settings.pasarguard_username_prefix or "").lower()
     return (
         marker in note
         or "[HOWTOOSEE_BOT_START]" in note
         or username.startswith(configured_prefix)
-        or username.startswith("hts_")
         or username.startswith("howtosee_")
     )
 
