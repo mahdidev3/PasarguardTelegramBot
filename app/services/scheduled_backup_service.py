@@ -138,3 +138,6 @@ async def auto_backup_loop(bot: Bot) -> None:
 
 def start_auto_backup_scheduler(bot: Bot) -> asyncio.Task:
     return asyncio.create_task(auto_backup_loop(bot), name="howtoosee_auto_backup_loop")
+
+
+

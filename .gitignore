@@ -12,6 +12,7 @@ ENV/
 # Bot secrets
 .env
 *.env
+merge_folder.py
 
 # Local database
 *.sqlite
@@ -38,3 +39,6 @@ dist/
 .mypy_cache/
 .ruff_cache/
 /informations
+
+
+

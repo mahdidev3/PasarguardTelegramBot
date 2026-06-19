@@ -119,7 +119,7 @@ def _parse_remote_expire(value: Any) -> datetime | None:
 
 def sanitize_remote_username(value: str, telegram_id: int, service_id: int) -> str:
     raw = (value or "").strip().lower()
-    raw = re.sub(r"[^a-z0-9]+", "", raw)
+    raw = re.sub(r"[^a-z0-9_-]+", "", raw)
     if not raw:
         raw = f"{telegram_id % 100000}{service_id}"
     # For auto-generated numeric names, keep the tail digits-only.
@@ -656,7 +656,16 @@ async def sync_remote_user_from_panel(sqlite_db: Any, service: Mapping[str, Any]
     job_id = await _create_job(action, service_id)
     try:
         async with PasarguardClient() as client:
-            remote = await client.get_user_by_username(username)
+            try:
+                remote = await client.get_user_by_username(username)
+            except PasarguardAPIError as exc:
+                alt_username = sanitize_remote_username(str(_row_get(service, "name", "")), telegram_id, service_id)
+                if getattr(exc, "status_code", None) == 404 and alt_username and alt_username != username:
+                    remote = await client.get_user_by_username(alt_username)
+                    username = alt_username
+                    _sqlite_update_remote(sqlite_db, service_id, username=username, status="synced_from_panel", error=None)
+                else:
+                    raise
         remote = _normalize_remote_user_payload(remote)
         changes = _service_panel_diffs(service, remote)
         actual_username = str(remote.get("username") or username)
@@ -754,3 +763,6 @@ def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
         if len(report.errors) > 15:
             lines.append(f"… و {len(report.errors) - 15} خطای دیگر")
     return "\n".join(lines)
+
+
+

@@ -75,3 +75,6 @@ Receipt notifications go to admins with role `sales` and `super`. You can also s
 `SALES_ADMIN_CHAT_IDS=123456789,987654321`
 
 The old demo payment button is no longer displayed in the user payment page. The payment itself is manual/card-to-card, while activation after approval uses the real provisioning flow.
+
+
+

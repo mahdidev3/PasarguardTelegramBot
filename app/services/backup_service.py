@@ -181,6 +181,53 @@ async def _download_ticket_files(base: Path, bot: Bot | None) -> list[dict[str, 
         return manifest
 
 
+async def _download_receipt_files(base: Path, sqlite_data: dict[str, list[dict[str, Any]]], bot: Bot | None) -> list[dict[str, Any]]:
+    """Download card-to-card receipt media stored in Telegram into the backup ZIP."""
+    rows = list(sqlite_data.get("payment_receipt_files") or [])
+    legacy_receipts = sqlite_data.get("payment_receipts") or []
+    # Backward compatibility: old backups had only one receipt file on payment_receipts.
+    for receipt in legacy_receipts:
+        if receipt.get("receipt_chat_id") and receipt.get("receipt_message_id") and not any(str(r.get("receipt_id")) == str(receipt.get("id")) for r in rows):
+            rows.append({
+                "id": f"legacy-{receipt.get('id')}",
+                "receipt_id": receipt.get("id"),
+                "order_id": receipt.get("order_id"),
+                "user_telegram_id": receipt.get("user_telegram_id"),
+                "file_id": receipt.get("receipt_file_id"),
+                "file_unique_id": receipt.get("receipt_file_unique_id"),
+                "file_type": receipt.get("receipt_file_type") or "unknown",
+                "message_id": receipt.get("receipt_message_id"),
+                "chat_id": receipt.get("receipt_chat_id"),
+                "caption": receipt.get("user_caption"),
+            })
+    manifest: list[dict[str, Any]] = []
+    if bot is None:
+        for row in rows:
+            manifest.append({**row, "backed_up": False, "error": "bot_not_provided", "path": None, "sha256": None})
+        return manifest
+    for row in rows:
+        item = {**row, "backed_up": False, "error": None, "path": None, "sha256": None}
+        try:
+            file_id = row.get("file_id")
+            if not file_id:
+                item["error"] = "missing_file_id"
+                manifest.append(item)
+                continue
+            tg_file = await bot.get_file(file_id)  # type: ignore[arg-type]
+            ext = ".jpg" if str(row.get("file_type")) == "photo" else ".bin"
+            rel = Path("files") / "receipts" / str(row.get("order_id") or "unknown") / f"{row.get('receipt_id')}_{row.get('id')}{ext}"
+            dest = base / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            await bot.download_file(tg_file.file_path, destination=dest)
+            item["backed_up"] = True
+            item["path"] = rel.as_posix()
+            item["sha256"] = _sha256(dest)
+        except Exception as exc:
+            item["error"] = str(exc)
+        manifest.append(item)
+    return manifest
+
+
 def _desired_pasarguard_state(sqlite_data: dict[str, list[dict[str, Any]]], pg_data: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
     """Future adapter input: what Pasarguard should look like after restore.
 
@@ -213,12 +260,14 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     pg_data = await _pg_tables()
     usage_rows = await usage_summary_rows()
     ticket_file_manifest = await _download_ticket_files(base, bot)
+    receipt_file_manifest = await _download_receipt_files(base, sqlite_data, bot)
 
     for table, rows in sqlite_data.items():
         _write_jsonl(base / "data" / "sqlite" / f"{table}.jsonl", rows)
     for table, rows in pg_data.items():
         _write_jsonl(base / "data" / "postgres" / f"{table}.jsonl", rows)
     _write_jsonl(base / "data" / "ticket_files_manifest.jsonl", ticket_file_manifest)
+    _write_jsonl(base / "data" / "receipt_files_manifest.jsonl", receipt_file_manifest)
     pasarguard_summary = await write_pasarguard_checkpoint_files(base, sqlite_data, pg_data, admin_id)
     (base / "data" / "sqlite_dump.sql").write_text(_sqlite_dump(), encoding="utf-8")
 
@@ -246,6 +295,8 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     _write_jsonl(base / "data" / "finance_summary.jsonl", [{"key": key, "value": value} for key, value in finance_summary.items()])
     file_success = sum(1 for row in ticket_file_manifest if row.get("backed_up"))
     file_failed = sum(1 for row in ticket_file_manifest if not row.get("backed_up"))
+    receipt_file_success = sum(1 for row in receipt_file_manifest if row.get("backed_up"))
+    receipt_file_failed = sum(1 for row in receipt_file_manifest if not row.get("backed_up"))
     manifest = {
         "backup_version": BACKUP_VERSION,
         "bot_name": settings.brand_name,
@@ -257,6 +308,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
             "sqlite": {table: len(rows) for table, rows in sqlite_data.items()},
             "postgres": {table: len(rows) for table, rows in pg_data.items()},
             "ticket_files": {"total": len(ticket_file_manifest), "backed_up": file_success, "failed": file_failed},
+            "receipt_files": {"total": len(receipt_file_manifest), "backed_up": receipt_file_success, "failed": receipt_file_failed},
         },
         "usage": usage,
         "finance": finance_summary,
@@ -266,6 +318,12 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
             "active_files_failed": file_failed,
             "manifest": "data/ticket_files_manifest.jsonl",
             "note": "Closed ticket files are deleted from bot-side access storage and are not included after closure.",
+        },
+        "receipt_files": {
+            "included": bot is not None,
+            "files_backed_up": receipt_file_success,
+            "files_failed": receipt_file_failed,
+            "manifest": "data/receipt_files_manifest.jsonl",
         },
         "pasarguard": pasarguard_summary,
     }
@@ -311,3 +369,6 @@ def inspect_backup_file(zip_path: str | Path) -> dict[str, Any]:
         manifest["file_name"] = path.name
         manifest["file_size"] = path.stat().st_size
         return manifest
+
+
+

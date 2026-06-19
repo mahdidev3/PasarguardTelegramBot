@@ -159,3 +159,6 @@ async def admin_text_reset(callback: CallbackQuery) -> None:
         text += f"عنوان: <b>{h(tpl.title)}</b>\nگروه: <b>{h(tpl.group_name)}</b>\nمتغیرهای مجاز: <code>{h(tpl.allowed_placeholders or '-')}</code>\n\n<b>متن فعلی:</b>\n{body}"
         if callback.message:
             await callback.message.answer(text, reply_markup=text_view_kb(key), disable_web_page_preview=True)
+
+
+

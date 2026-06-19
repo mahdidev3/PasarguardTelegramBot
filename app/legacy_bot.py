@@ -103,6 +103,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and set your bot token.")
 
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+RECEIPT_UPLOAD_WINDOW_MINUTES = int(os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "20"))
 
 
 # -----------------------------
@@ -164,6 +165,54 @@ def fmt_number(value: int | float) -> str:
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     return f"{value:,}".replace(",", "٬")
+
+
+def gregorian_to_jalali(gy: int, gm: int, gd: int) -> tuple[int, int, int]:
+    """Convert Gregorian date to Jalali/Shamsi without external dependencies."""
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    if gy > 1600:
+        jy = 979
+        gy -= 1600
+    else:
+        jy = 0
+        gy -= 621
+    gy2 = gy + 1 if gm > 2 else gy
+    days = (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100) + ((gy2 + 399) // 400) - 80 + gd + g_d_m[gm - 1]
+    jy += 33 * (days // 12053)
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + days // 31
+        jd = 1 + days % 31
+    else:
+        jm = 7 + (days - 186) // 30
+        jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+
+def parse_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        raw = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TEHRAN_TZ)
+        return dt.astimezone(TEHRAN_TZ)
+    except Exception:
+        return None
+
+
+def fmt_jalali_datetime(value: Any) -> str:
+    dt = parse_dt(value)
+    if not dt:
+        return str(value or "-")
+    jy, jm, jd = gregorian_to_jalali(dt.year, dt.month, dt.day)
+    return f"{jy:04d}/{jm:02d}/{jd:02d} ساعت {dt.hour:02d}:{dt.minute:02d}"
 
 
 def h(value: Any) -> str:
@@ -597,7 +646,9 @@ def ensure_admin_schema() -> None:
                 per_user_limit INTEGER NOT NULL DEFAULT 1,
                 used_count INTEGER NOT NULL DEFAULT 0,
                 stack_with_referral INTEGER NOT NULL DEFAULT 1,
-                max_discount_percent INTEGER NOT NULL DEFAULT 40,
+                max_discount_percent INTEGER NOT NULL DEFAULT 100,
+                max_discount_amount INTEGER,
+                min_order_amount INTEGER NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 expires_at TEXT,
                 created_by INTEGER,
@@ -639,10 +690,26 @@ def ensure_admin_schema() -> None:
                 receipt_chat_id INTEGER,
                 user_caption TEXT,
                 admin_note TEXT,
+                expires_at TEXT,
+                submitted_at TEXT,
                 reviewed_by INTEGER,
                 reviewed_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS payment_receipt_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                receipt_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT,
+                file_type TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                caption TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -667,14 +734,19 @@ def ensure_admin_schema() -> None:
             ("orders", "admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT"),
             ("orders", "service_name", "ALTER TABLE orders ADD COLUMN service_name TEXT"),
             ("orders", "receipt_id", "ALTER TABLE orders ADD COLUMN receipt_id INTEGER"),
+            ("coupons", "max_discount_amount", "ALTER TABLE coupons ADD COLUMN max_discount_amount INTEGER"),
+            ("coupons", "min_order_amount", "ALTER TABLE coupons ADD COLUMN min_order_amount INTEGER NOT NULL DEFAULT 0"),
             ("payment_cards", "note", "ALTER TABLE payment_cards ADD COLUMN note TEXT"),
             ("payment_receipts", "admin_note", "ALTER TABLE payment_receipts ADD COLUMN admin_note TEXT"),
+            ("payment_receipts", "expires_at", "ALTER TABLE payment_receipts ADD COLUMN expires_at TEXT"),
+            ("payment_receipts", "submitted_at", "ALTER TABLE payment_receipts ADD COLUMN submitted_at TEXT"),
         ]:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if column not in cols:
                 conn.execute(ddl)
         # Retire the removed service-pause feature: old paused rows are made active again.
         conn.execute("UPDATE services SET status = 'active', locked_reason = NULL WHERE status = ?", ("fro" + "zen",))
+        conn.execute("UPDATE coupons SET max_discount_percent = 100 WHERE max_discount_percent IS NULL OR max_discount_percent < 100")
 
         for admin_id in BOOTSTRAP_SUPER_ADMIN_IDS:
             conn.execute(
@@ -730,9 +802,17 @@ def setting_set(key: str, value: str) -> None:
 
 ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
     "super": {"*"},
-    "sales": {"dashboard", "users", "services", "orders", "wallet", "manual_service", "broadcast"},
-    "support": {"dashboard", "users", "services", "orders", "direct_message"},
+    # Sales may review payments/receipts and see order context only. It must not manage users, wallets, services, or broadcasts.
+    "sales": {"dashboard", "orders", "payment_receipts"},
+    "support": {"dashboard", "users", "services", "direct_message"},
     "marketing": {"dashboard", "broadcast", "coupons", "reports"},
+}
+
+ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
+    "super": "دسترسی کامل به همه بخش‌ها؛ فقط برای مالک/مدیر اصلی.",
+    "sales": "فقط مدیریت سفارش‌ها و بررسی رسیدهای کارت‌به‌کارت؛ بدون بلاک/حذف کاربر و بدون تغییر کیف پول.",
+    "support": "پشتیبانی کاربران، مشاهده/مدیریت سرویس‌ها و ارسال پیام مستقیم؛ بدون دسترسی مالی حساس.",
+    "marketing": "کمپین، پیام همگانی، کد تخفیف و گزارش‌ها؛ بدون دسترسی عملیاتی به کاربران/پرداخت.",
 }
 
 
@@ -806,7 +886,7 @@ def update_user_status(telegram_id: int, status: str, reason: str = "", notice: 
     with closing(db.connect()) as conn:
         deleted_at = now_iso() if status == "deleted" else None
         conn.execute(
-            "UPDATE users SET status = ?, locked_reason = ?, locked_notice = ?, deleted_at = COALESCE(?, deleted_at) WHERE telegram_id = ?",
+            "UPDATE users SET status = ?, locked_reason = ?, locked_notice = ?, deleted_at = ? WHERE telegram_id = ?",
             (status, reason or None, notice or None, deleted_at, telegram_id),
         )
         conn.commit()
@@ -818,16 +898,23 @@ def set_user_note(telegram_id: int, note: str) -> None:
         conn.commit()
 
 
-def list_all_users(limit: int = 100000, only_active: bool = False, buyers_only: bool = False, no_purchase: bool = False) -> list[sqlite3.Row]:
+def list_all_users(limit: int = 100000, only_active: bool = False, buyers_only: bool = False, no_purchase: bool = False, include_deleted: bool = False, deleted_only: bool = False) -> list[sqlite3.Row]:
     with closing(db.connect()) as conn:
-        where = ["COALESCE(status, 'active') != 'deleted'"]
+        where: list[str] = []
+        if deleted_only:
+            where.append("COALESCE(status, 'active') = 'deleted'")
+        elif not include_deleted:
+            where.append("COALESCE(status, 'active') != 'deleted'")
         if only_active:
             where.append("COALESCE(status, 'active') = 'active'")
         if buyers_only:
             where.append("first_purchase_done = 1")
         if no_purchase:
             where.append("first_purchase_done = 0")
-        sql = "SELECT * FROM users WHERE " + " AND ".join(where) + " ORDER BY id DESC LIMIT ?"
+        sql = "SELECT * FROM users"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
         return list(conn.execute(sql, (limit,)).fetchall())
 
 
@@ -943,7 +1030,10 @@ def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row) -
     if usage_limit is not None and int(row["used_count"]) >= int(usage_limit):
         return None, "ظرفیت استفاده از این کد تخفیف تکمیل شده است."
     if int(row["per_user_limit"] or 1) <= coupon_usage_count(code, telegram_id):
-        return None, "شما قبلاً از این کد تخفیف استفاده کرده‌اید."
+        return None, "سقف استفاده شما از این کد تخفیف تکمیل شده است."
+    min_order_amount = int(row["min_order_amount"] if row_has(row, "min_order_amount") and row["min_order_amount"] is not None else 0)
+    if min_order_amount and int(order["amount"]) < min_order_amount:
+        return None, f"این کد فقط برای خریدهای حداقل {fmt_money(min_order_amount)} قابل استفاده است."
     scope = str(row["scope"] or "all")
     targets = [x.strip() for x in str(row["target_user_ids"] or "").split(",") if x.strip()]
     if scope in {"user", "users"} and str(telegram_id) not in targets:
@@ -1028,7 +1118,22 @@ def refund_wallet_payment_if_needed(telegram_id: int, amount: int, order_id: int
         db.add_wallet(telegram_id, amount, "wallet_refund", f"برگشت پرداخت سفارش #{order_id}: {reason[:80]}")
 
 
-def create_coupon_admin(code: str, percent: int, title: str, scope: str, target_user_ids: str, usage_limit: Optional[int], expires_days: Optional[int], admin_id: int) -> None:
+def create_coupon_admin(
+    code: str,
+    percent: int,
+    title: str,
+    scope: str,
+    target_user_ids: str,
+    usage_limit: Optional[int],
+    expires_days: Optional[int],
+    admin_id: int,
+    *,
+    per_user_limit: int = 1,
+    max_discount_percent: int = 100,
+    max_discount_amount: Optional[int] = None,
+    min_order_amount: int = 0,
+    stack_with_referral: int = 1,
+) -> None:
     expires_at = None
     if expires_days and expires_days > 0:
         expires_at = (datetime.now(TEHRAN_TZ) + timedelta(days=expires_days)).isoformat(timespec="seconds")
@@ -1037,21 +1142,31 @@ def create_coupon_admin(code: str, percent: int, title: str, scope: str, target_
             """
             INSERT INTO coupons
             (code, percent, title, scope, target_user_ids, usage_limit, per_user_limit, used_count,
-             stack_with_referral, max_discount_percent, active, expires_at, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, 0, 1, 40, 1, ?, ?, ?)
+             stack_with_referral, max_discount_percent, max_discount_amount, min_order_amount, active, expires_at, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 percent = excluded.percent,
                 title = excluded.title,
                 scope = excluded.scope,
                 target_user_ids = excluded.target_user_ids,
                 usage_limit = excluded.usage_limit,
+                per_user_limit = excluded.per_user_limit,
+                stack_with_referral = excluded.stack_with_referral,
+                max_discount_percent = excluded.max_discount_percent,
+                max_discount_amount = excluded.max_discount_amount,
+                min_order_amount = excluded.min_order_amount,
                 active = 1,
                 expires_at = excluded.expires_at
             """,
-            (code.upper(), percent, title, scope, target_user_ids or None, usage_limit, expires_at, admin_id, now_iso()),
+            (
+                code.upper(), percent, title, scope, target_user_ids or None, usage_limit,
+                max(int(per_user_limit), 1), 1 if stack_with_referral else 0,
+                min(max(int(max_discount_percent), 0), 100), max_discount_amount, max(int(min_order_amount), 0),
+                expires_at, admin_id, now_iso(),
+            ),
         )
         conn.commit()
-    admin_log(admin_id, "COUPON_UPSERT", "coupon", code.upper(), f"percent={percent}, scope={scope}, limit={usage_limit}, expires_days={expires_days}")
+    admin_log(admin_id, "COUPON_UPSERT", "coupon", code.upper(), f"percent={percent}, scope={scope}, limit={usage_limit}, per_user={per_user_limit}, min={min_order_amount}, max_amount={max_discount_amount}, expires_days={expires_days}")
 
 
 def disable_coupon_admin(code: str, admin_id: int) -> bool:
@@ -1155,25 +1270,29 @@ def payment_cards_kb() -> InlineKeyboardMarkup:
 
 
 def create_or_reset_payment_receipt(order: sqlite3.Row, card: sqlite3.Row, amount: int) -> int:
+    expires_at = (datetime.now(TEHRAN_TZ) + timedelta(minutes=RECEIPT_UPLOAD_WINDOW_MINUTES)).isoformat(timespec="seconds")
     with closing(db.connect()) as conn:
-        existing = conn.execute("SELECT * FROM payment_receipts WHERE order_id = ? ORDER BY id DESC LIMIT 1", (int(order["id"]),)).fetchone()
-        if existing and existing["status"] in {"waiting_receipt", "receipt_pending"}:
+        existing = conn.execute(
+            "SELECT * FROM payment_receipts WHERE order_id = ? AND status = 'waiting_receipt' ORDER BY id DESC LIMIT 1",
+            (int(order["id"]),),
+        ).fetchone()
+        if existing:
             conn.execute(
                 """
                 UPDATE payment_receipts
-                SET card_id = ?, amount = ?, status = 'waiting_receipt', updated_at = ?
+                SET card_id = ?, amount = ?, status = 'waiting_receipt', expires_at = ?, submitted_at = NULL, updated_at = ?
                 WHERE id = ?
                 """,
-                (int(card["id"]), amount, now_iso(), int(existing["id"])),
+                (int(card["id"]), amount, expires_at, now_iso(), int(existing["id"])),
             )
             rid = int(existing["id"])
         else:
             cur = conn.execute(
                 """
-                INSERT INTO payment_receipts (order_id, user_telegram_id, card_id, amount, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 'waiting_receipt', ?, ?)
+                INSERT INTO payment_receipts (order_id, user_telegram_id, card_id, amount, status, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'waiting_receipt', ?, ?, ?)
                 """,
-                (int(order["id"]), int(order["user_telegram_id"]), int(card["id"]), amount, now_iso(), now_iso()),
+                (int(order["id"]), int(order["user_telegram_id"]), int(card["id"]), amount, expires_at, now_iso(), now_iso()),
             )
             rid = int(cur.lastrowid)
         conn.execute("UPDATE orders SET receipt_id = ?, payment_method = ? WHERE id = ?", (rid, "کارت به کارت", int(order["id"])))
@@ -1191,22 +1310,101 @@ def get_receipt_by_order(order_id: int) -> Optional[sqlite3.Row]:
         return conn.execute("SELECT * FROM payment_receipts WHERE order_id = ? ORDER BY id DESC LIMIT 1", (order_id,)).fetchone()
 
 
-def attach_receipt_file(receipt_id: int, message: Message, file_type: str, file_id: str, file_unique_id: str | None, caption: str | None) -> None:
+def receipt_deadline_expired(receipt: sqlite3.Row) -> bool:
+    if not row_has(receipt, "expires_at") or not receipt["expires_at"]:
+        return False
+    deadline = parse_dt(str(receipt["expires_at"]))
+    if not deadline:
+        return False
+    return deadline < datetime.now(TEHRAN_TZ)
+
+
+def list_receipt_files(receipt_id: int) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return list(conn.execute("SELECT * FROM payment_receipt_files WHERE receipt_id = ? ORDER BY id ASC", (receipt_id,)).fetchall())
+
+
+def receipt_file_count(receipt_id: int) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM payment_receipt_files WHERE receipt_id = ?", (receipt_id,)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def set_receipt_user_note(receipt_id: int, note: str) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE payment_receipts SET user_caption = ?, updated_at = ? WHERE id = ?", (note.strip(), now_iso(), receipt_id))
+        conn.commit()
+
+
+def add_receipt_file(receipt_id: int, message: Message, file_type: str, file_id: str, file_unique_id: str | None, caption: str | None) -> None:
     with closing(db.connect()) as conn:
         receipt = conn.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)).fetchone()
         if not receipt:
             return
         conn.execute(
             """
+            INSERT INTO payment_receipt_files
+            (receipt_id, order_id, user_telegram_id, file_id, file_unique_id, file_type, message_id, chat_id, caption, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt_id,
+                int(receipt["order_id"]),
+                int(receipt["user_telegram_id"]),
+                file_id,
+                file_unique_id,
+                file_type,
+                int(message.message_id),
+                int(message.chat.id),
+                caption or "",
+                now_iso(),
+            ),
+        )
+        # Keep legacy single-file columns updated for compatibility with old rows/admin screens.
+        conn.execute(
+            """
             UPDATE payment_receipts
-            SET status = 'receipt_pending', receipt_file_id = ?, receipt_file_unique_id = ?, receipt_file_type = ?,
-                receipt_message_id = ?, receipt_chat_id = ?, user_caption = ?, updated_at = ?
+            SET receipt_file_id = ?, receipt_file_unique_id = ?, receipt_file_type = ?,
+                receipt_message_id = ?, receipt_chat_id = ?,
+                user_caption = COALESCE(NULLIF(?, ''), user_caption), updated_at = ?
             WHERE id = ?
             """,
-            (file_id, file_unique_id, file_type, message.message_id, message.chat.id, caption or "", now_iso(), receipt_id),
+            (file_id, file_unique_id, file_type, int(message.message_id), int(message.chat.id), caption or "", now_iso(), receipt_id),
+        )
+        conn.commit()
+
+
+def attach_receipt_file(receipt_id: int, message: Message, file_type: str, file_id: str, file_unique_id: str | None, caption: str | None) -> None:
+    add_receipt_file(receipt_id, message, file_type, file_id, file_unique_id, caption)
+
+
+def submit_payment_receipt(receipt_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        receipt = conn.execute("SELECT * FROM payment_receipts WHERE id = ?", (receipt_id,)).fetchone()
+        if not receipt:
+            return False
+        count = conn.execute("SELECT COUNT(*) AS c FROM payment_receipt_files WHERE receipt_id = ?", (receipt_id,)).fetchone()
+        has_new_files = bool(count and int(count["c"]) > 0)
+        has_legacy_file = bool(receipt["receipt_chat_id"] and receipt["receipt_message_id"])
+        if not has_new_files and not has_legacy_file:
+            return False
+        if str(receipt["status"]) != "waiting_receipt":
+            return False
+        conn.execute(
+            "UPDATE payment_receipts SET status = 'receipt_pending', submitted_at = ?, updated_at = ? WHERE id = ?",
+            (now_iso(), now_iso(), receipt_id),
         )
         conn.execute("UPDATE orders SET status = 'receipt_pending', payment_method = 'کارت به کارت', receipt_id = ? WHERE id = ?", (receipt_id, int(receipt["order_id"])))
         conn.commit()
+        return True
+
+
+def receipt_upload_kb(receipt_id: int, order_id: int, can_submit: bool) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if can_submit:
+        rows.append([("✅ ثبت تراکنش و ارسال برای فروش", f"receipt_submit:{receipt_id}")])
+    rows.append([("❌ لغو ارسال رسید", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
 
 
 def update_receipt_review(receipt_id: int, status: str, admin_id: int, note: str = "") -> None:
@@ -1242,6 +1440,9 @@ def payment_receipt_summary_for_order(order_id: int) -> str:
     text = "\n\n🧾 <b>رسید کارت‌به‌کارت</b>\n"
     text += f"وضعیت رسید: <b>{h(status_map.get(str(receipt['status']), receipt['status']))}</b>\n"
     text += f"مبلغ رسید: <b>{fmt_money(int(receipt['amount']))}</b>\n"
+    text += f"تعداد فایل‌های رسید: <b>{fmt_number(receipt_file_count(int(receipt['id'])))}</b>\n"
+    if row_has(receipt, "expires_at") and receipt["expires_at"] and str(receipt["status"]) == "waiting_receipt":
+        text += f"مهلت ارسال رسید: <code>{h(fmt_jalali_datetime(receipt['expires_at']))}</code>\n"
     if card:
         text += f"کارت مقصد: <code>{h(format_card_number(card['card_number']))}</code> — {h(card['owner_name'])}\n"
     if receipt["admin_note"]:
@@ -1252,10 +1453,8 @@ def payment_receipt_summary_for_order(order_id: int) -> str:
 def sales_admin_ids() -> set[int]:
     ids: set[int] = set(SALES_ADMIN_CHAT_IDS)
     with closing(db.connect()) as conn:
-        rows = conn.execute("SELECT telegram_id FROM admins WHERE is_active = 1 AND role IN ('sales', 'super')").fetchall()
+        rows = conn.execute("SELECT telegram_id FROM admins WHERE is_active = 1 AND role = 'sales'").fetchall()
     ids.update(int(r["telegram_id"]) for r in rows)
-    if not ids:
-        ids.update(BOOTSTRAP_SUPER_ADMIN_IDS)
     return ids
 
 
@@ -1279,7 +1478,8 @@ def card_payment_instructions(order: sqlite3.Row, card: sqlite3.Row, payable: in
         + "\n📌 توجه: در برخی اپلیکیشن‌های پرداخت مانند آپ ممکن است هنگام انتقال، خطای محدودیت کارت نمایش داده شود. در این شرایط از همراه‌بانک یا اینترنت‌بانک خود استفاده کنید.\n"
         + "🚫 لطفاً از انتقال وجه از طریق پایا یا پل خودداری کنید.\n"
         + "⚠️ مبلغ را گرد نکنید، کمتر یا بیشتر نزنید و توضیح اضافه لازم نیست.\n\n"
-        + "بعد از پرداخت، <b>عکس یا فایل رسید</b> را همین‌جا ارسال کنید. تا زمانی که رسید ارسال نشود، سفارش برای بررسی ثبت نمی‌شود."
+        + f"بعد از پرداخت، تا <b>{RECEIPT_UPLOAD_WINDOW_MINUTES} دقیقه</b> فرصت دارید یک یا چند عکس/فایل رسید را همین‌جا بفرستید.\n"
+        + "بعد از ارسال همه رسیدها و توضیحات، دکمه <b>ثبت تراکنش</b> را بزنید تا رسیدها برای ادمین فروش ارسال شود."
     )
 
 
@@ -1295,14 +1495,20 @@ def receipt_pending_user_text(order: sqlite3.Row) -> str:
 def receipt_notify_admin_text(order: sqlite3.Row, receipt: sqlite3.Row) -> str:
     user = db.get_user(int(order["user_telegram_id"]))
     username = f"@{user['username']}" if user and user["username"] else "ندارد"
+    submitted = receipt["submitted_at"] if row_has(receipt, "submitted_at") and receipt["submitted_at"] else receipt["updated_at"]
+    note = receipt["user_caption"] if row_has(receipt, "user_caption") and receipt["user_caption"] else ""
     return (
         header("🧾 رسید جدید کارت‌به‌کارت", f"Receipt #{receipt['id']}")
         + f"سفارش: <code>#{order['id']}</code>\n"
         + f"کاربر: <code>{order['user_telegram_id']}</code> | {h(username)}\n"
         + f"مبلغ قابل پرداخت: <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b>\n"
-        + f"نوع سفارش: <code>{h(order['plan_key'])}</code>\n\n"
-        + "رسید را بررسی کنید و سپس تأیید یا رد را بزنید. برای هر دو حالت می‌توانید یادداشت بگذارید."
+        + f"نوع سفارش: <code>{h(order['plan_key'])}</code>\n"
+        + f"زمان ثبت رسید: <code>{h(fmt_jalali_datetime(submitted))}</code>\n"
+        + f"تعداد فایل‌ها: <b>{fmt_number(receipt_file_count(int(receipt['id'])))}</b>\n"
+        + (f"توضیح کاربر: <code>{h(note)}</code>\n" if note else "")
+        + "\nدر این پیام فقط خلاصه رسید آمده است. برای دریافت عکس/فایل‌ها، دکمه «مشاهده رسید» را بزنید."
     )
+
 
 db = DB(DATABASE_PATH)
 ensure_admin_schema()
@@ -1330,6 +1536,7 @@ class WalletStates(StatesGroup):
 
 class CardPaymentStates(StatesGroup):
     waiting_receipt = State()
+    waiting_receipt_bundle = State()
 
 
 class AdminStates(StatesGroup):
@@ -1339,12 +1546,27 @@ class AdminStates(StatesGroup):
     waiting_direct_message = State()
     waiting_broadcast_message = State()
     waiting_bot_lock_message = State()
-    waiting_coupon_line = State()
+    waiting_coupon_line = State()  # legacy fallback only
+    waiting_coupon_code = State()
+    waiting_coupon_percent = State()
+    waiting_coupon_users = State()
+    waiting_coupon_usage_limit = State()
+    waiting_coupon_per_user_limit = State()
+    waiting_coupon_min_order = State()
+    waiting_coupon_max_amount = State()
+    waiting_coupon_expires = State()
     waiting_disable_coupon = State()
-    waiting_add_admin_line = State()
+    waiting_add_admin_line = State()  # legacy fallback only
+    waiting_add_admin_chat_id = State()
+    waiting_add_admin_role = State()
     waiting_user_note = State()
     waiting_manual_service_amount = State()
-    waiting_card_line = State()
+    waiting_card_line = State()  # legacy fallback only
+    waiting_card_number = State()
+    waiting_card_owner = State()
+    waiting_card_bank = State()
+    waiting_card_note = State()
+    waiting_card_active = State()
     waiting_payment_review_note = State()
 
 
@@ -1438,16 +1660,43 @@ def order_payment_kb(
     *,
     allow_wallet: bool = True,
     allow_coupon: bool = True,
+    is_wallet_topup: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     if allow_coupon:
         rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
-    if allow_wallet and wallet_balance >= payable and payable > 0:
-        rows.append([("💰 پرداخت با کیف پول", f"pay_wallet:{order_id}")])
-    rows.append([("💳 کارت به کارت", f"pay_card:{order_id}")])
+    if is_wallet_topup:
+        rows.append([("💳 ثبت/ارسال رسید کارت‌به‌کارت", f"pay_card:{order_id}")])
+    elif allow_wallet and wallet_balance >= payable and wallet_balance >= 0:
+        label = "✅ فعال‌سازی سفارش رایگان" if payable <= 0 else "💰 پرداخت و فعال‌سازی از کیف پول"
+        rows.append([(label, f"pay_wallet:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
+
+def wallet_shortfall(payable: int, wallet_balance: int) -> int:
+    if wallet_balance < 0:
+        return max(payable - wallet_balance, -wallet_balance, WALLET_MIN_TOPUP)
+    return max(payable - wallet_balance, WALLET_MIN_TOPUP)
+
+
+def insufficient_wallet_kb(order_id: int, suggested_amount: int, back_callback: str) -> InlineKeyboardMarkup:
+    return inline([
+        [(f"➕ شارژ پیشنهادی کیف پول: {fmt_money(suggested_amount)}", f"wallet_topup_for:{order_id}:{suggested_amount}")],
+        [("💰 ورود به کیف پول", "wallet")],
+        [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")],
+    ])
+
+
+def transactions_kb(orders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for order in orders[:20]:
+        if str(order["status"]) in {"pending", "payment_rejected"} and str(order["plan_key"]).startswith("wallet_topup:"):
+            receipt = get_receipt_by_order(int(order["id"]))
+            if not receipt or str(receipt["status"]) == "waiting_receipt":
+                rows.append([(f"🧾 ثبت رسید تراکنش #{order['id']}", f"tx_receipt:{order['id']}")])
+    rows.append([("💰 کیف پول", "wallet"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
 
 def coupon_cancel_kb(order_id: int) -> InlineKeyboardMarkup:
     return inline([[("❌ انصراف", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")]])
@@ -1577,6 +1826,7 @@ def admin_users_kb() -> InlineKeyboardMarkup:
     return inline([
         [("🔎 جستجوی کاربر", "adm_user_search")],
         [("🆕 آخرین کاربران", "adm_recent_users"), ("🛒 کاربران خریدار", "adm_buyer_users")],
+        [("🗑 کاربران حذف‌شده", "adm_deleted_users")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -1595,6 +1845,13 @@ def admin_user_result_kb(users: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
     uid = int(user["telegram_id"])
     status = str(user["status"] if row_has(user, "status") else "active")
+    if status == "deleted":
+        return inline([
+            [("♻️ بازگردانی کاربر", f"adm_user_restore:{uid}")],
+            [("🧾 سفارش‌ها", f"adm_user_orders:{uid}"), ("📦 سرویس‌های کاربر", f"adm_user_services:{uid}")],
+            [("📝 یادداشت ادمین", f"adm_user_note:{uid}")],
+            [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
+        ])
     lock_btn = ("🔓 باز کردن کاربر", f"adm_user_unlock:{uid}") if status != "active" else ("🔒 قفل با اطلاع", f"adm_user_lock_notify:{uid}")
     return inline([
         [("📦 سرویس‌های کاربر", f"adm_user_services:{uid}"), ("🧾 سفارش‌ها", f"adm_user_orders:{uid}")],
@@ -1684,6 +1941,28 @@ def admin_admins_kb() -> InlineKeyboardMarkup:
     return inline([
         [("➕ اضافه کردن ادمین", "adm_admin_add"), ("📋 لیست ادمین‌ها", "adm_admin_list")],
         [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_role_select_kb() -> InlineKeyboardMarkup:
+    rows = [[(f"{role} — {ADMIN_ROLE_DESCRIPTIONS.get(role, '')[:28]}", f"adm_admin_role:{role}")] for role in ADMIN_ROLE_PERMISSIONS.keys()]
+    rows.append([("⬅️ بازگشت", "adm_admins"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def coupon_scope_select_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("همه کاربران", "adm_coupon_scope:all")],
+        [("فقط خرید اول", "adm_coupon_scope:first_purchase")],
+        [("فقط کاربران مشخص", "adm_coupon_scope:users")],
+        [("⬅️ بازگشت", "adm_coupons"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def card_active_select_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ فعال باشد", "adm_card_active:1"), ("⛔ غیرفعال باشد", "adm_card_active:0")],
+        [("⬅️ بازگشت", "adm_payments"), ("👑 منوی ادمین", "adm_home")],
     ])
 
 
@@ -1891,7 +2170,7 @@ def payment_text(plan: Plan, service_name: str, order_id: int, amount: int, disc
     text += discount_lines(details)
     text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
     text += f"💼 موجودی کیف پول: <b>{fmt_money(wallet_balance)}</b>\n\n"
-    text += "در حال حاضر روش فعال پرداخت، کارت‌به‌کارت است. بعد از ارسال رسید، سفارش شما برای ادمین فروش ارسال می‌شود و پس از تأیید، سرویس فعال خواهد شد."
+    text += "پرداخت مستقیم حذف شده است. اگر موجودی کیف پول کافی باشد، سفارش از کیف پول فعال می‌شود؛ اگر کافی نباشد باید ابتدا کیف پول را شارژ کنید."
     return text
 
 
@@ -1969,7 +2248,7 @@ def service_text(service: sqlite3.Row) -> str:
         "🔗 لینک اشتراک:\n<code>در انتظار آماده‌سازی لینک اشتراک</code>\n\n"
     )
     error_line = (
-        f"⚠️ خطای فعال‌سازی: <code>{h(service['pasarguard_sync_error'])}</code>\n\n"
+        "⚠️ فعال‌سازی سرویس کامل نشده است. لطفاً از بخش پشتیبانی یک تیکت ثبت کنید و مشکل را کامل توضیح دهید.\n\n"
         if 'pasarguard_sync_error' in service.keys() and service['pasarguard_sync_error'] else ""
     )
     return (
@@ -2023,9 +2302,14 @@ def wallet_text(user: sqlite3.Row) -> str:
     return text
 
 
-def wallet_amount_prompt() -> str:
-    return header("➕ افزایش موجودی کیف پول") + f"مبلغ دلخواه را به تومان وارد کنید.\n\nحداقل مبلغ واریز: <b>{fmt_money(WALLET_MIN_TOPUP)}</b>\n\nمثلاً: <code>100000</code>"
-
+def wallet_amount_prompt(suggested_amount: int | None = None) -> str:
+    text = header("➕ افزایش موجودی کیف پول")
+    text += "شما در این مرحله <b>کیف پول خودتان را شارژ می‌کنید</b>. بعد از تأیید رسید توسط ادمین فروش، موجودی به کیف پول اضافه می‌شود و سپس می‌توانید خرید/تمدید/افزایش حجم را از کیف پول انجام دهید.\n\n"
+    text += f"حداقل مبلغ واریز: <b>{fmt_money(WALLET_MIN_TOPUP)}</b>\n"
+    if suggested_amount and suggested_amount > 0:
+        text += f"مبلغ پیشنهادی برای سفارش انتخاب‌شده: <b>{fmt_money(suggested_amount)}</b>\n"
+    text += "\nمبلغ دلخواه را به تومان وارد کنید. مثلاً: <code>100000</code>"
+    return text
 
 def referral_invite_link(user: sqlite3.Row) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user['referral_code']}"
@@ -2176,18 +2460,38 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
     ok, reason = await order_activation_preflight(order, telegram_id)
     plan_key = str(order["plan_key"])
     is_wallet_topup = plan_key.startswith("wallet_topup:")
+    wallet_balance = int(user["wallet_balance"] or 0)
     if not ok:
         text += "\n\n⚠️ <b>این سفارش فعلاً قابل پرداخت نیست.</b>\n" + h(reason)
         markup = inline([[('🎫 پشتیبانی', 'ticket_new')], [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")]])
+    elif not is_wallet_topup and payable > 0 and (wallet_balance < payable or wallet_balance < 0):
+        suggested = wallet_shortfall(payable, wallet_balance)
+        shortage = max(payable - wallet_balance, 0)
+        if wallet_balance < 0:
+            text += (
+                "\n\n⚠️ <b>موجودی کیف پول شما منفی است.</b>\n"
+                f"موجودی فعلی: <b>{fmt_money(wallet_balance)}</b>\n"
+                f"برای انجام این سفارش حداقل باید <b>{fmt_money(suggested)}</b> کیف پول را شارژ کنید. "
+                f"حداقل شارژ کیف پول <b>{fmt_money(WALLET_MIN_TOPUP)}</b> است."
+            )
+        else:
+            text += (
+                "\n\n💰 <b>پرداخت این سفارش فقط از کیف پول انجام می‌شود.</b>\n"
+                f"موجودی فعلی شما: <b>{fmt_money(wallet_balance)}</b>\n"
+                f"کمبود موجودی: <b>{fmt_money(shortage)}</b>\n"
+                f"حداقل شارژ کیف پول <b>{fmt_money(WALLET_MIN_TOPUP)}</b> است؛ برای ادامه پیشنهاد می‌شود <b>{fmt_money(suggested)}</b> شارژ کنید."
+            )
+        markup = insufficient_wallet_kb(order_id, suggested, back_callback)
     else:
         markup = order_payment_kb(
             order_id,
             payable,
-            int(user["wallet_balance"]),
+            wallet_balance,
             back_callback,
             "⬅️ بازگشت",
             allow_wallet=not is_wallet_topup,
             allow_coupon=not is_wallet_topup,
+            is_wallet_topup=is_wallet_topup,
         )
     if isinstance(target, CallbackQuery):
         await edit_or_answer(target, text, markup)
@@ -2410,8 +2714,12 @@ async def coupon_finish(message: Message, state: FSMContext) -> None:
         referral_discount = 0
     base_for_coupon = max(amount - referral_discount, 0)
     coupon_discount = int(base_for_coupon * int(coupon_row_obj["percent"]) / 100)
-    max_discount_percent = int(coupon_row_obj["max_discount_percent"] or 40)
-    total_discount = min(referral_discount + coupon_discount, int(amount * max_discount_percent / 100))
+    if row_has(coupon_row_obj, "max_discount_amount") and coupon_row_obj["max_discount_amount"] is not None:
+        coupon_discount = min(coupon_discount, int(coupon_row_obj["max_discount_amount"]))
+    max_discount_percent = int(coupon_row_obj["max_discount_percent"] if row_has(coupon_row_obj, "max_discount_percent") and coupon_row_obj["max_discount_percent"] is not None else 100)
+    max_total_discount = int(amount * min(max_discount_percent, 100) / 100)
+    total_discount = min(referral_discount + coupon_discount, max_total_discount)
+    coupon_discount = max(total_discount - referral_discount, 0)
     order_discounts[order_id] = {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": code}
     save_order_coupon(order_id, int(user["telegram_id"]), code, coupon_discount, total_discount)
     await state.clear()
@@ -2431,6 +2739,24 @@ async def pay_wallet(callback: CallbackQuery) -> None:
     await complete_order(callback, int(user["telegram_id"]), int(callback.data.split(":", 1)[1]), "کیف پول", use_wallet=True)
 
 
+async def notify_sales_admins_about_receipt(bot: Bot, receipt_id: int) -> None:
+    receipt = get_receipt(receipt_id)
+    if not receipt:
+        return
+    order = get_order_any(int(receipt["order_id"]))
+    if not order:
+        return
+    targets = sales_admin_ids()
+    if not targets:
+        logger.warning("No sales admins found for receipt %s", receipt_id)
+        return
+    for admin_id in targets:
+        try:
+            await bot.send_message(admin_id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, int(order["id"])))
+        except Exception as exc:
+            logger.warning("Failed to notify sales admin %s about receipt %s: %s", admin_id, receipt_id, exc)
+
+
 @router.callback_query(F.data.startswith("pay_card:"))
 async def pay_card_start(callback: CallbackQuery, state: FSMContext) -> None:
     user = ensure_from_callback(callback)
@@ -2440,10 +2766,9 @@ async def pay_card_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not order or order["status"] not in {"pending", "payment_rejected"}:
         await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
         return
-    ok, reason = await order_activation_preflight(order, telegram_id)
-    if not ok:
-        await callback.answer("این سفارش فعلاً قابل پرداخت نیست.", show_alert=True)
-        await edit_or_answer(callback, header("⚠️ پرداخت موقتاً غیرفعال است") + h(reason), inline([[('🎫 پشتیبانی', 'ticket_new')], [('⬅️ بازگشت', f'pay_page:{order_id}'), ('🏠 منوی اصلی', 'home')]]))
+    if not str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("پرداخت مستقیم حذف شده است؛ ابتدا کیف پول را شارژ کنید.", show_alert=True)
+        await show_order_payment(callback, telegram_id, order_id)
         return
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     card = choose_payment_card()
@@ -2451,17 +2776,21 @@ async def pay_card_start(callback: CallbackQuery, state: FSMContext) -> None:
         await edit_or_answer(
             callback,
             header("💳 کارت‌به‌کارت موقتاً غیرفعال است")
-            + "در حال حاضر شماره کارت فعالی برای پرداخت ثبت نشده است. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
+            + "در حال حاضر شماره کارت فعالی برای شارژ کیف پول ثبت نشده است. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.",
             inline([[('🎫 پشتیبانی', 'ticket_new')], [('⬅️ بازگشت', f'pay_page:{order_id}'), ('🏠 منوی اصلی', 'home')]]),
         )
         return
     receipt_id = create_or_reset_payment_receipt(order, card, payable)
-    await state.set_state(CardPaymentStates.waiting_receipt)
+    receipt = get_receipt(receipt_id)
+    await state.set_state(CardPaymentStates.waiting_receipt_bundle)
     await state.update_data(order_id=order_id, receipt_id=receipt_id)
-    await edit_or_answer(callback, card_payment_instructions(order, card, payable), inline([[('❌ لغو ارسال رسید', f'pay_page:{order_id}')], [('🏠 منوی اصلی', 'home')]]))
+    text = card_payment_instructions(order, card, payable)
+    if receipt and row_has(receipt, "expires_at") and receipt["expires_at"]:
+        text += f"\n\n⏳ مهلت ثبت تراکنش: <code>{h(fmt_jalali_datetime(receipt['expires_at']))}</code>"
+    await edit_or_answer(callback, text, receipt_upload_kb(receipt_id, order_id, receipt_file_count(receipt_id) > 0))
 
 
-@router.message(CardPaymentStates.waiting_receipt)
+@router.message(CardPaymentStates.waiting_receipt_bundle)
 async def card_receipt_received(message: Message, state: FSMContext) -> None:
     user = ensure_from_message(message)
     data = await state.get_data()
@@ -2473,10 +2802,18 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("این سفارش دیگر قابل ثبت رسید نیست.", reply_markup=back_home_kb())
         return
+    if receipt_deadline_expired(receipt):
+        await state.clear()
+        await message.answer(
+            header("⏳ مهلت ثبت رسید تمام شد")
+            + f"برای این تراکنش فقط {RECEIPT_UPLOAD_WINDOW_MINUTES} دقیقه فرصت ارسال رسید وجود داشت. لطفاً از بخش کیف پول یک شارژ جدید ثبت کنید.",
+            reply_markup=wallet_kb(),
+        )
+        return
     text = normalize_digits((message.text or "").strip())
     if text in {"لغو", "انصراف", "cancel", "/cancel"}:
         await state.clear()
-        await message.answer("ارسال رسید لغو شد. سفارش هنوز پرداخت نشده است.", reply_markup=back_home_kb())
+        await message.answer("ارسال رسید لغو شد. تراکنش هنوز برای بررسی ارسال نشده است.", reply_markup=back_home_kb())
         return
     file_type = ""
     file_id = ""
@@ -2490,27 +2827,58 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
         file_type = "document"
         file_id = message.document.file_id
         unique_id = message.document.file_unique_id
-    else:
-        await message.answer("برای ثبت پرداخت باید عکس یا فایل رسید را همین‌جا ارسال کنید. اگر قصد ادامه ندارید، کلمه «لغو» را بفرستید.")
+    if file_id:
+        add_receipt_file(receipt_id, message, file_type, file_id, unique_id, message.caption)
+        count = receipt_file_count(receipt_id)
+        await message.answer(
+            header("✅ رسید اضافه شد")
+            + f"تا اینجا <b>{fmt_number(count)}</b> فایل رسید ثبت شده است. اگر رسید دیگری دارید بفرستید؛ در پایان دکمه ثبت تراکنش را بزنید.",
+            reply_markup=receipt_upload_kb(receipt_id, order_id, True),
+        )
         return
-    attach_receipt_file(receipt_id, message, file_type, file_id, unique_id, message.caption)
+    if text:
+        set_receipt_user_note(receipt_id, text)
+        count = receipt_file_count(receipt_id)
+        await message.answer(
+            header("📝 توضیح تراکنش ذخیره شد")
+            + ("حالا عکس/فایل رسید را بفرستید، یا اگر قبلاً رسیدها را فرستاده‌اید دکمه ثبت تراکنش را بزنید."),
+            reply_markup=receipt_upload_kb(receipt_id, order_id, count > 0),
+        )
+        return
+    await message.answer("برای این تراکنش عکس/فایل رسید یا توضیح متنی بفرستید. بعد از تکمیل، دکمه ثبت تراکنش را بزنید.", reply_markup=receipt_upload_kb(receipt_id, order_id, receipt_file_count(receipt_id) > 0))
+
+
+@router.callback_query(F.data.startswith("receipt_submit:"))
+async def receipt_submit(callback: CallbackQuery, state: FSMContext) -> None:
+    user = ensure_from_callback(callback)
+    receipt_id = int(callback.data.split(":", 1)[1])
+    receipt = get_receipt(receipt_id)
+    if not receipt or int(receipt["user_telegram_id"]) != int(user["telegram_id"]):
+        await callback.answer("رسید پیدا نشد.", show_alert=True)
+        return
+    order = db.get_order(int(receipt["order_id"]), int(user["telegram_id"]))
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("این تراکنش دیگر قابل ثبت نیست.", show_alert=True)
+        return
+    if receipt_deadline_expired(receipt):
+        await state.clear()
+        await edit_or_answer(
+            callback,
+            header("⏳ مهلت ثبت رسید تمام شد")
+            + f"مهلت {RECEIPT_UPLOAD_WINDOW_MINUTES} دقیقه‌ای این تراکنش تمام شده است. لطفاً از بخش کیف پول، شارژ جدید ثبت کنید.",
+            wallet_kb(),
+        )
+        return
+    if receipt_file_count(receipt_id) <= 0 and not (receipt["receipt_chat_id"] and receipt["receipt_message_id"]):
+        await callback.answer("ابتدا حداقل یک عکس یا فایل رسید ارسال کنید.", show_alert=True)
+        return
+    if not submit_payment_receipt(receipt_id):
+        await callback.answer("ثبت تراکنش انجام نشد. لطفاً دوباره بررسی کنید.", show_alert=True)
+        return
     await state.clear()
-    order = get_order_any(order_id) or order
-    receipt = get_receipt(receipt_id) or receipt
-    await message.answer(receipt_pending_user_text(order), reply_markup=inline([[('💳 تراکنش‌ها', 'home')], [('🏠 منوی اصلی', 'home')]]))
-    targets = sales_admin_ids()
-    if not targets:
-        logger.warning("No sales admins found for receipt %s", receipt_id)
-        return
-    for admin_id in targets:
-        try:
-            await message.bot.send_message(admin_id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, order_id))
-            try:
-                await message.bot.copy_message(admin_id, message.chat.id, message.message_id)
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.warning("Failed to notify sales admin %s about receipt %s: %s", admin_id, receipt_id, exc)
+    order = get_order_any(int(receipt["order_id"])) or order
+    await edit_or_answer(callback, receipt_pending_user_text(order), inline([[('💳 تراکنش‌ها', 'tx_list')], [('🏠 منوی اصلی', 'home')]]))
+    await notify_sales_admins_about_receipt(callback.bot, receipt_id)
 
 
 async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: int, method: str, use_wallet: bool) -> None:
@@ -2537,8 +2905,8 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         return
     wallet_used = 0
     if use_wallet:
-        if int(user["wallet_balance"]) < payable:
-            await callback.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت سفارش #{order_id}")
         wallet_used = payable
@@ -2587,8 +2955,8 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
         return
     wallet_used = 0
     if use_wallet:
-        if int(user["wallet_balance"]) < payable:
-            await callback.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت افزایش حجم سفارش #{order['id']}")
         wallet_used = payable
@@ -2635,8 +3003,8 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
         return
     wallet_used = 0
     if use_wallet:
-        if int(user["wallet_balance"]) < payable:
-            await callback.answer("موجودی کیف پول کافی نیست.", show_alert=True)
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت تمدید سفارش #{order['id']}")
         wallet_used = payable
@@ -3010,9 +3378,7 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس برای بررسی کیفیت اتصال آماده است.\n\n" + service_text(service), service_details_kb(service))
 
 
-@router.message(F.text == "💳 تراکنش‌ها")
-async def transactions(message: Message) -> None:
-    user = ensure_from_message(message)
+def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row]]:
     orders = db.list_orders(int(user["telegram_id"]))
     text = header("💳 تراکنش‌های شما")
     if not orders:
@@ -3030,8 +3396,58 @@ async def transactions(message: Message) -> None:
             }
             status = status_map.get(str(order["status"]), h(order["status"]))
             payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
-            text += f"{i}. <b>{status}</b>\n   🧾 شماره: <code>{order['id']}</code>\n   💰 مبلغ: <b>{fmt_money(payable)}</b>\n   📅 تاریخ: <code>{h(order['created_at'][:10])}</code>\n\n"
-    await message.answer(text, reply_markup=back_home_kb())
+            text += f"{i}. <b>{status}</b>\n   🧾 شماره: <code>{order['id']}</code>\n   💰 مبلغ: <b>{fmt_money(payable)}</b>\n   📅 تاریخ: <code>{h(fmt_jalali_datetime(order['created_at']))}</code>\n"
+            receipt = get_receipt_by_order(int(order["id"]))
+            if receipt and str(receipt["status"]) == "waiting_receipt" and row_has(receipt, "expires_at") and receipt["expires_at"]:
+                text += f"   ⏳ مهلت ارسال رسید: <code>{h(fmt_jalali_datetime(receipt['expires_at']))}</code>\n"
+            text += "\n"
+    return text, orders
+
+
+@router.message(F.text == "💳 تراکنش‌ها")
+async def transactions(message: Message) -> None:
+    user = ensure_from_message(message)
+    text, orders = transactions_text_for_user(user)
+    await message.answer(text, reply_markup=transactions_kb(orders))
+
+
+@router.callback_query(F.data == "tx_list")
+async def transactions_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    text, orders = transactions_text_for_user(user)
+    await edit_or_answer(callback, text, transactions_kb(orders))
+
+
+@router.callback_query(F.data.startswith("tx_receipt:"))
+async def transaction_receipt_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user = ensure_from_callback(callback)
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("این تراکنش قابل ثبت رسید نیست.", show_alert=True)
+        return
+    if not str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("برای خرید سرویس ابتدا کیف پول را شارژ کنید.", show_alert=True)
+        await show_order_payment(callback, int(user["telegram_id"]), order_id)
+        return
+    receipt = get_receipt_by_order(order_id)
+    if receipt and str(receipt["status"]) == "waiting_receipt" and receipt_deadline_expired(receipt):
+        await callback.answer("مهلت ارسال رسید این تراکنش تمام شده است؛ یک شارژ جدید ثبت کنید.", show_alert=True)
+        return
+    card = choose_payment_card()
+    if not card:
+        await edit_or_answer(callback, header("💳 کارت‌به‌کارت موقتاً غیرفعال است") + "در حال حاضر کارت فعالی ثبت نشده است.", inline([[('🎫 پشتیبانی', 'ticket_new')], [('🏠 منوی اصلی', 'home')]]))
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    receipt_id = int(receipt["id"]) if receipt and str(receipt["status"]) == "waiting_receipt" else create_or_reset_payment_receipt(order, card, payable)
+    receipt = get_receipt(receipt_id)
+    await state.set_state(CardPaymentStates.waiting_receipt_bundle)
+    await state.update_data(order_id=order_id, receipt_id=receipt_id)
+    text = card_payment_instructions(order, card, payable)
+    if receipt and row_has(receipt, "expires_at") and receipt["expires_at"]:
+        text += f"\n\n⏳ مهلت ثبت تراکنش: <code>{h(fmt_jalali_datetime(receipt['expires_at']))}</code>"
+    await edit_or_answer(callback, text, receipt_upload_kb(receipt_id, order_id, receipt_file_count(receipt_id) > 0))
 
 
 @router.message(F.text == "💰 کیف پول")
@@ -3051,18 +3467,50 @@ async def wallet_cb(callback: CallbackQuery, state: FSMContext) -> None:
 async def wallet_topup(callback: CallbackQuery, state: FSMContext) -> None:
     ensure_from_callback(callback)
     await state.set_state(WalletStates.waiting_amount)
+    await state.update_data(suggested_amount=None, source_order_id=None)
     await edit_or_answer(callback, wallet_amount_prompt(), wallet_amount_kb())
+
+
+@router.callback_query(F.data.startswith("wallet_topup_for:"))
+async def wallet_topup_for_order(callback: CallbackQuery, state: FSMContext) -> None:
+    user = ensure_from_callback(callback)
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
+        await callback.answer("درخواست شارژ معتبر نیست.", show_alert=True)
+        return
+    order_id = int(parts[1])
+    suggested = max(parse_amount(parts[2]) or WALLET_MIN_TOPUP, WALLET_MIN_TOPUP)
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("سفارش پیدا نشد یا دیگر قابل پرداخت نیست.", show_alert=True)
+        return
+    if str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("این سفارش خودش شارژ کیف پول است.", show_alert=True)
+        return
+    await state.set_state(WalletStates.waiting_amount)
+    await state.update_data(suggested_amount=suggested, source_order_id=order_id)
+    await edit_or_answer(callback, wallet_amount_prompt(suggested), wallet_amount_kb())
 
 
 @router.message(WalletStates.waiting_amount)
 async def wallet_topup_amount(message: Message, state: FSMContext) -> None:
     user = ensure_from_message(message)
+    data = await state.get_data()
+    suggested = data.get("suggested_amount")
     amount = parse_amount(message.text or "")
     if amount is None:
         await message.answer("❌ مبلغ معتبر نیست. فقط عدد وارد کنید.\nمثلاً: <code>100000</code>", reply_markup=wallet_amount_kb())
         return
     if amount < WALLET_MIN_TOPUP:
         await message.answer(f"❌ مبلغ واردشده کمتر از حداقل واریز است.\nحداقل واریز: <b>{fmt_money(WALLET_MIN_TOPUP)}</b>", reply_markup=wallet_amount_kb())
+        return
+    if suggested and int(suggested) > amount:
+        await message.answer(
+            f"⚠️ مبلغی که وارد کردید از مبلغ پیشنهادی کمتر است.\n"
+            f"مبلغ پیشنهادی برای سفارش انتخاب‌شده: <b>{fmt_money(int(suggested))}</b>\n"
+            "اگر با همین مبلغ ادامه دهید ممکن است بعد از تأیید رسید، هنوز موجودی کافی برای خرید نداشته باشید.",
+            reply_markup=wallet_amount_kb(),
+        )
         return
     order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "کارت به کارت")
     await state.clear()
@@ -3183,14 +3631,18 @@ async def admin_user_search_finish(message: Message, state: FSMContext) -> None:
     await message.answer(header("🔎 نتیجه جستجو") + f"{fmt_number(len(users))} کاربر پیدا شد:", reply_markup=admin_user_result_kb(users))
 
 
-@router.callback_query(F.data.in_({"adm_recent_users", "adm_buyer_users"}))
+@router.callback_query(F.data.in_({"adm_recent_users", "adm_buyer_users", "adm_deleted_users"}))
 async def admin_user_lists(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "users"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    users = list_all_users(limit=10, buyers_only=callback.data == "adm_buyer_users")
-    title = "🆕 آخرین کاربران" if callback.data == "adm_recent_users" else "🛒 کاربران خریدار"
-    await edit_or_answer(callback, header(title) + "برای مدیریت، یکی را انتخاب کنید.", admin_user_result_kb(users))
+    if callback.data == "adm_deleted_users":
+        users = list_all_users(limit=20, deleted_only=True)
+        title = "🗑 کاربران حذف‌شده"
+    else:
+        users = list_all_users(limit=10, buyers_only=callback.data == "adm_buyer_users")
+        title = "🆕 آخرین کاربران" if callback.data == "adm_recent_users" else "🛒 کاربران خریدار"
+    await edit_or_answer(callback, header(title) + ("کاربری پیدا نشد." if not users else "برای مدیریت، یکی را انتخاب کنید."), admin_user_result_kb(users))
 
 
 @router.callback_query(F.data.startswith("adm_user:"))
@@ -3246,6 +3698,18 @@ async def admin_user_unlock(callback: CallbackQuery) -> None:
     admin_log(callback.from_user.id, "USER_UNLOCK", "user", uid, "")
     user = get_user_admin(uid)
     await edit_or_answer(callback, header("✅ کاربر باز شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_restore:"))
+async def admin_user_restore(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "active", "restored by admin", "")
+    admin_log(callback.from_user.id, "USER_RESTORE", "user", uid, "soft delete restored")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("♻️ کاربر بازگردانی شد") + "کاربر دوباره فعال شد و به لیست‌های عادی برگشت.", admin_user_kb(user))
 
 
 @router.callback_query(F.data.startswith("adm_user_ban_notify:"))
@@ -3629,7 +4093,7 @@ async def admin_user_orders(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "adm_orders")
 async def admin_orders(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await edit_or_answer(callback, header("🧾 مدیریت سفارش‌ها") + "یک دسته را انتخاب کنید.", admin_orders_kb())
@@ -3637,7 +4101,7 @@ async def admin_orders(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_latest"}))
 async def admin_orders_list(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     status = None
@@ -3657,7 +4121,7 @@ async def admin_orders_list(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("adm_order:"))
 async def admin_order_details(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     oid = int(callback.data.split(":", 1)[1])
@@ -3706,44 +4170,83 @@ async def admin_card_add_start(callback: CallbackQuery, state: FSMContext) -> No
     if not require_admin_id(callback.from_user.id, "orders"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_card_line)
+    await state.set_state(AdminStates.waiting_card_number)
+    await state.update_data(card_number=None, owner_name=None, bank_name="", note="")
     await edit_or_answer(
         callback,
-        header("➕ افزودن کارت پرداخت")
-        + "اطلاعات کارت را با این فرمت بفرستید:\n\n"
-        + "<code>شماره کارت | نام صاحب کارت | نام بانک | توضیح اختیاری | active</code>\n\n"
-        + "مثال:\n<code>6037991234567890 | علی رضایی | ملی | پرداخت سرویس HowTooSee | 1</code>\n\n"
-        + pipe_escape_hint(),
+        header("➕ افزودن کارت پرداخت", "مرحله ۱ از ۵")
+        + "شماره کارت ۱۶ رقمی را وارد کنید. فقط عدد پذیرفته می‌شود و همان لحظه اعتبارسنجی می‌شود.",
         admin_back_kb("adm_payments"),
     )
 
 
-@router.message(AdminStates.waiting_card_line)
-async def admin_card_add_finish(message: Message, state: FSMContext) -> None:
+@router.message(AdminStates.waiting_card_number)
+async def admin_card_number_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = split_escaped_pipe(message.text or "")
-    if len(parts) < 2:
-        await message.answer("❌ فرمت درست نیست. حداقل شماره کارت و نام صاحب کارت را وارد کنید.")
-        return
-    card_number = normalize_card_number(parts[0])
-    owner_name = parts[1]
-    bank_name = parts[2] if len(parts) > 2 else ""
-    note = parts[3] if len(parts) > 3 else ""
-    active = 1
-    if len(parts) > 4:
-        active = 1 if normalize_digits(parts[4]).lower() in {"1", "true", "yes", "active", "فعال"} else 0
+    card_number = normalize_card_number(message.text or "")
     if len(card_number) != 16:
-        await message.answer("❌ شماره کارت باید دقیقاً ۱۶ رقم باشد.")
+        await message.answer("❌ شماره کارت باید دقیقاً ۱۶ رقم باشد. دوباره وارد کنید.")
         return
-    if not owner_name:
-        await message.answer("❌ نام صاحب کارت خالی است.")
+    await state.update_data(card_number=card_number)
+    await state.set_state(AdminStates.waiting_card_owner)
+    await message.answer(header("👤 نام صاحب کارت", "مرحله ۲ از ۵") + "نام صاحب کارت را دقیقاً مثل نام بانکی وارد کنید.", reply_markup=admin_back_kb("adm_payments"))
+
+
+@router.message(AdminStates.waiting_card_owner)
+async def admin_card_owner_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+        await message.answer("دسترسی ندارید.")
         return
-    card_id = add_payment_card_admin(card_number, owner_name, bank_name, note, active)
-    admin_log(message.from_user.id if message.from_user else 0, "PAYMENT_CARD_ADD", "payment_card", card_id, owner_name)
+    owner = (message.text or "").strip()
+    if len(owner) < 2:
+        await message.answer("❌ نام صاحب کارت خیلی کوتاه است.")
+        return
+    await state.update_data(owner_name=owner)
+    await state.set_state(AdminStates.waiting_card_bank)
+    await message.answer(header("🏦 نام بانک", "مرحله ۳ از ۵") + "نام بانک را وارد کنید. اگر نمی‌خواهید نمایش داده شود، علامت <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_payments"))
+
+
+@router.message(AdminStates.waiting_card_bank)
+async def admin_card_bank_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+        await message.answer("دسترسی ندارید.")
+        return
+    bank = (message.text or "").strip()
+    await state.update_data(bank_name="" if bank == "-" else bank)
+    await state.set_state(AdminStates.waiting_card_note)
+    await message.answer(header("📝 توضیح کارت", "مرحله ۴ از ۵") + "توضیح اختیاری برای کاربر یا تیم فروش وارد کنید. برای خالی گذاشتن <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_payments"))
+
+
+@router.message(AdminStates.waiting_card_note)
+async def admin_card_note_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+        await message.answer("دسترسی ندارید.")
+        return
+    note = (message.text or "").strip()
+    await state.update_data(note="" if note == "-" else note)
+    await state.set_state(AdminStates.waiting_card_active)
+    await message.answer(header("✅ وضعیت کارت", "مرحله ۵ از ۵") + "مشخص کنید کارت از همین حالا برای کاربران نمایش داده شود یا نه.", reply_markup=card_active_select_kb())
+
+
+@router.callback_query(F.data.startswith("adm_card_active:"))
+async def admin_card_active_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "orders"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    active = 1 if callback.data.endswith(":1") else 0
+    card_number = str(data.get("card_number") or "")
+    owner_name = str(data.get("owner_name") or "")
+    if len(card_number) != 16 or not owner_name:
+        await callback.answer("اطلاعات کارت ناقص است. دوباره شروع کنید.", show_alert=True)
+        await state.clear()
+        return
+    card_id = add_payment_card_admin(card_number, owner_name, str(data.get("bank_name") or ""), str(data.get("note") or ""), active)
+    admin_log(callback.from_user.id, "PAYMENT_CARD_ADD", "payment_card", card_id, owner_name)
     await state.clear()
-    await message.answer(header("✅ کارت ثبت شد") + payment_cards_text(), reply_markup=payment_cards_kb())
+    await edit_or_answer(callback, header("✅ کارت ثبت شد") + payment_cards_text(), payment_cards_kb())
 
 
 @router.callback_query(F.data.startswith("adm_card_toggle:"))
@@ -3774,7 +4277,7 @@ async def admin_card_delete(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("adm_receipt_view:"))
 async def admin_receipt_view(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     receipt_id = int(callback.data.split(":", 1)[1])
@@ -3784,20 +4287,29 @@ async def admin_receipt_view(callback: CallbackQuery) -> None:
         return
     order = get_order_any(int(receipt["order_id"]))
     await callback.answer("در حال ارسال رسید…")
-    try:
-        if receipt["receipt_chat_id"] and receipt["receipt_message_id"]:
+    files = list_receipt_files(receipt_id)
+    sent = 0
+    for file_row in files:
+        try:
+            await callback.bot.copy_message(callback.from_user.id, int(file_row["chat_id"]), int(file_row["message_id"]))
+            sent += 1
+        except Exception as exc:
+            logger.warning("Failed to copy receipt file %s for receipt %s: %s", file_row["id"], receipt_id, exc)
+    if not sent and receipt["receipt_chat_id"] and receipt["receipt_message_id"]:
+        try:
             await callback.bot.copy_message(callback.from_user.id, int(receipt["receipt_chat_id"]), int(receipt["receipt_message_id"]))
-        else:
-            await callback.bot.send_message(callback.from_user.id, "فایل رسید در دیتابیس پیام تلگرام ندارد.")
-    except Exception as exc:
-        await callback.bot.send_message(callback.from_user.id, f"ارسال رسید ناموفق بود: <code>{h(exc)}</code>")
+            sent += 1
+        except Exception as exc:
+            await callback.bot.send_message(callback.from_user.id, f"ارسال فایل رسید ناموفق بود: <code>{h(exc)}</code>")
+    if not sent:
+        await callback.bot.send_message(callback.from_user.id, "برای این رسید فایل قابل ارسال پیدا نشد.")
     if order:
         await callback.bot.send_message(callback.from_user.id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, int(order["id"])))
 
 
 @router.callback_query(F.data.startswith("adm_receipt_approve:"))
 async def admin_receipt_approve_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     receipt_id = int(callback.data.split(":", 1)[1])
@@ -3812,7 +4324,7 @@ async def admin_receipt_approve_start(callback: CallbackQuery, state: FSMContext
 
 @router.callback_query(F.data.startswith("adm_receipt_reject:"))
 async def admin_receipt_reject_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if not require_admin_id(callback.from_user.id, "orders"):
+    if not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     receipt_id = int(callback.data.split(":", 1)[1])
@@ -3827,7 +4339,7 @@ async def admin_receipt_reject_start(callback: CallbackQuery, state: FSMContext)
 
 @router.message(AdminStates.waiting_payment_review_note)
 async def admin_receipt_review_finish(message: Message, state: FSMContext) -> None:
-    if not require_admin_id(message.from_user.id if message.from_user else 0, "orders"):
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "payment_receipts"):
         await message.answer("دسترسی ندارید.")
         return
     data = await state.get_data()
@@ -4040,39 +4552,170 @@ async def admin_coupon_add(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "coupons"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_coupon_line)
-    sample = "VIP30 | 30 | all | 100 | 30\nUSER20 | 20 | users:123456,987654 | 10 | 7\nFIRST15 | 15 | first_purchase | 200 | 14"
-    await edit_or_answer(callback, header("➕ ساخت/ویرایش کد") + "فرمت را دقیق وارد کنید:\n<code>CODE | percent | scope | usage_limit | expires_days</code>\n\nScope می‌تواند <code>all</code>، <code>first_purchase</code> یا <code>users:ID1,ID2</code> باشد.\n\n" + pipe_escape_hint() + "\n\nنمونه:\n<code>" + h(sample) + "</code>", admin_back_kb("adm_coupons"))
+    await state.set_state(AdminStates.waiting_coupon_code)
+    await state.update_data(coupon={})
+    await edit_or_answer(callback, header("➕ ساخت/ویرایش کد", "مرحله ۱") + "کد تخفیف را وارد کنید. فقط حروف انگلیسی، عدد، خط تیره و آندرلاین؛ مثل <code>VIP100</code>.", admin_back_kb("adm_coupons"))
 
 
-@router.message(AdminStates.waiting_coupon_line)
-async def admin_coupon_add_finish(message: Message, state: FSMContext) -> None:
+@router.message(AdminStates.waiting_coupon_code)
+async def admin_coupon_code_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = split_escaped_pipe(message.text or "")
-    if len(parts) < 5:
-        await message.answer("❌ فرمت اشتباه است. نمونه: <code>VIP30 | 30 | all | 100 | 30</code>")
+    code = (message.text or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
+        await message.answer("❌ کد باید ۳ تا ۴۰ کاراکتر و فقط شامل A-Z، عدد، - یا _ باشد.")
         return
-    code = parts[0].upper()
-    percent = parse_amount(parts[1])
-    scope_raw = parts[2]
-    usage_limit = parse_amount(parts[3])
-    expires_days = parse_amount(parts[4])
-    if not code or percent is None or percent <= 0 or percent > 90:
-        await message.answer("❌ کد یا درصد معتبر نیست.")
+    await state.update_data(coupon={"code": code})
+    await state.set_state(AdminStates.waiting_coupon_percent)
+    await message.answer(header("درصد تخفیف", "مرحله ۲") + "درصد تخفیف را از ۱ تا ۱۰۰ وارد کنید. ۱۰۰٪ برای کدهای رایگان/هدیه مجاز است.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_percent)
+async def admin_coupon_percent_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
         return
-    scope = scope_raw
-    targets = ""
-    if scope_raw.startswith("users:"):
-        scope = "users"
-        targets = scope_raw.replace("users:", "", 1).replace(" ", "")
-    if scope not in {"all", "users", "first_purchase"}:
-        await message.answer("❌ Scope معتبر نیست. از all، first_purchase یا users:ID1,ID2 استفاده کنید.")
+    percent = parse_amount(message.text or "")
+    if percent is None or percent < 1 or percent > 100:
+        await message.answer("❌ درصد باید عددی بین ۱ تا ۱۰۰ باشد.")
         return
-    create_coupon_admin(code, int(percent), f"کد تخفیف {code}", scope, targets, usage_limit, expires_days, message.from_user.id if message.from_user else 0)
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    coupon["percent"] = int(percent)
+    await state.update_data(coupon=coupon)
+    await message.answer(header("محدوده استفاده", "مرحله ۳") + "مشخص کنید کد برای چه کسانی قابل استفاده باشد.", reply_markup=coupon_scope_select_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_scope:"))
+async def admin_coupon_scope_step(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    scope = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    coupon["scope"] = scope
+    coupon["targets"] = ""
+    await state.update_data(coupon=coupon)
+    if scope == "users":
+        await state.set_state(AdminStates.waiting_coupon_users)
+        await edit_or_answer(callback, header("کاربران مجاز", "مرحله ۴") + "چت‌آیدی کاربران مجاز را با کاما یا فاصله وارد کنید. مثال: <code>123456 987654</code>", admin_back_kb("adm_coupons"))
+        return
+    await state.set_state(AdminStates.waiting_coupon_usage_limit)
+    await edit_or_answer(callback, header("سقف مصرف کل", "مرحله ۴") + "حداکثر تعداد مصرف کل را وارد کنید. برای نامحدود <code>-</code> بفرستید.", admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_users)
+async def admin_coupon_users_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ids = [normalize_digits(x) for x in re.split(r"[,\s]+", message.text or "") if normalize_digits(x).isdigit()]
+    if not ids:
+        await message.answer("❌ حداقل یک چت‌آیدی معتبر وارد کنید.")
+        return
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    coupon["targets"] = ",".join(ids)
+    await state.update_data(coupon=coupon)
+    await state.set_state(AdminStates.waiting_coupon_usage_limit)
+    await message.answer(header("سقف مصرف کل", "مرحله ۵") + "حداکثر تعداد مصرف کل را وارد کنید. برای نامحدود <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_usage_limit)
+async def admin_coupon_usage_limit_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.text or "").strip()
+    value = None if raw == "-" else parse_amount(raw)
+    if raw != "-" and (value is None or value < 1):
+        await message.answer("❌ عدد معتبر وارد کنید یا برای نامحدود <code>-</code> بفرستید.")
+        return
+    data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    coupon["usage_limit"] = value
+    await state.update_data(coupon=coupon)
+    await state.set_state(AdminStates.waiting_coupon_per_user_limit)
+    await message.answer(header("سقف مصرف هر کاربر") + "هر کاربر چند بار بتواند از این کد استفاده کند؟ معمولاً <code>1</code> مناسب است.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_per_user_limit)
+async def admin_coupon_per_user_limit_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    value = parse_amount(message.text or "")
+    if value is None or value < 1:
+        await message.answer("❌ یک عدد مثبت وارد کنید.")
+        return
+    data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    coupon["per_user_limit"] = int(value)
+    await state.update_data(coupon=coupon)
+    await state.set_state(AdminStates.waiting_coupon_min_order)
+    await message.answer(header("حداقل مبلغ خرید") + "اگر کد فقط برای خریدهای بالای یک مبلغ است، آن مبلغ را وارد کنید. برای بدون محدودیت <code>0</code> بفرستید.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_min_order)
+async def admin_coupon_min_order_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    value = parse_amount(message.text or "")
+    if value is None:
+        await message.answer("❌ مبلغ معتبر نیست. برای بدون محدودیت <code>0</code> بفرستید.")
+        return
+    data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    coupon["min_order_amount"] = int(value)
+    await state.update_data(coupon=coupon)
+    await state.set_state(AdminStates.waiting_coupon_max_amount)
+    await message.answer(header("سقف مبلغ تخفیف") + "اگر مثلاً کد ۲۰٪ حداکثر تا ۳۰ هزار تومان باشد، <code>30000</code> وارد کنید. برای بدون سقف <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_max_amount)
+async def admin_coupon_max_amount_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.text or "").strip()
+    value = None if raw == "-" else parse_amount(raw)
+    if raw != "-" and value is None:
+        await message.answer("❌ مبلغ معتبر نیست یا برای بدون سقف <code>-</code> بفرستید.")
+        return
+    data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    coupon["max_discount_amount"] = value
+    await state.update_data(coupon=coupon)
+    await state.set_state(AdminStates.waiting_coupon_expires)
+    await message.answer(header("انقضا") + "تعداد روزهای اعتبار کد را وارد کنید. برای بدون تاریخ انقضا <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_expires)
+async def admin_coupon_expires_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.text or "").strip()
+    expires_days = None if raw == "-" else parse_amount(raw)
+    if raw != "-" and (expires_days is None or expires_days < 1):
+        await message.answer("❌ تعداد روز معتبر وارد کنید یا برای بدون انقضا <code>-</code> بفرستید.")
+        return
+    data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    create_coupon_admin(
+        coupon["code"], int(coupon["percent"]), f"کد تخفیف {coupon['code']}", coupon.get("scope", "all"), coupon.get("targets", ""),
+        coupon.get("usage_limit"), expires_days, message.from_user.id if message.from_user else 0,
+        per_user_limit=int(coupon.get("per_user_limit", 1)),
+        max_discount_percent=100,
+        max_discount_amount=coupon.get("max_discount_amount"),
+        min_order_amount=int(coupon.get("min_order_amount", 0)),
+    )
     await state.clear()
-    await message.answer(header("✅ کد تخفیف ذخیره شد") + f"کد <code>{h(code)}</code> با تخفیف <b>{percent}%</b> فعال شد.", reply_markup=admin_coupon_kb())
+    await message.answer(
+        header("✅ کد تخفیف ذخیره شد")
+        + f"کد <code>{h(coupon['code'])}</code> با تخفیف <b>{coupon['percent']}٪</b> فعال شد.\n"
+        + f"حداقل خرید: <b>{fmt_money(int(coupon.get('min_order_amount', 0)))}</b>\n"
+        + (f"سقف مبلغ تخفیف: <b>{fmt_money(int(coupon['max_discount_amount']))}</b>\n" if coupon.get("max_discount_amount") else "سقف مبلغ تخفیف: <b>ندارد</b>\n"),
+        reply_markup=admin_coupon_kb(),
+    )
 
 
 @router.callback_query(F.data == "adm_coupon_disable")
@@ -4156,25 +4799,42 @@ async def admin_admin_add_start(callback: CallbackQuery, state: FSMContext) -> N
     if not require_admin_id(callback.from_user.id, "*"):
         await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_add_admin_line)
-    await edit_or_answer(callback, header("➕ اضافه کردن ادمین") + "فرمت:\n<code>chat_id | role</code>\n\nRole: <code>super</code>، <code>sales</code>، <code>support</code>، <code>marketing</code>", admin_back_kb("adm_admins"))
+    await state.set_state(AdminStates.waiting_add_admin_chat_id)
+    await edit_or_answer(callback, header("➕ اضافه کردن ادمین", "مرحله ۱") + "چت‌آیدی عددی ادمین جدید را وارد کنید. اگر چت‌آیدی خودش را نمی‌داند، از ربات‌هایی مثل userinfobot می‌تواند بگیرد.", admin_back_kb("adm_admins"))
 
 
-@router.message(AdminStates.waiting_add_admin_line)
-async def admin_admin_add_finish(message: Message, state: FSMContext) -> None:
+@router.message(AdminStates.waiting_add_admin_chat_id)
+async def admin_admin_chat_id_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
         await message.answer("دسترسی ندارید.")
         return
-    parts = split_escaped_pipe(message.text or "")
-    if len(parts) < 2:
-        await message.answer("❌ فرمت اشتباه است. نمونه: <code>123456789 | support</code>")
+    uid_s = normalize_digits((message.text or "").strip())
+    if not uid_s.lstrip("-").isdigit():
+        await message.answer("❌ چت‌آیدی باید عددی باشد.")
         return
-    uid_s = normalize_digits(parts[0])
-    role = parts[1].lower()
-    if not uid_s.isdigit() or role not in ADMIN_ROLE_PERMISSIONS:
-        await message.answer("❌ چت‌آیدی یا سطح دسترسی معتبر نیست.")
+    await state.update_data(target_admin_id=int(uid_s))
+    await state.set_state(AdminStates.waiting_add_admin_role)
+    role_text = header("سطح دسترسی", "مرحله ۲")
+    for role, desc in ADMIN_ROLE_DESCRIPTIONS.items():
+        role_text += f"• <code>{h(role)}</code>: {h(desc)}\n"
+    role_text += "\nیک نقش را از دکمه‌ها انتخاب کنید."
+    await message.answer(role_text, reply_markup=admin_role_select_kb())
+
+
+@router.callback_query(F.data.startswith("adm_admin_role:"))
+async def admin_admin_role_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
-    uid = int(uid_s)
+    role = callback.data.split(":", 1)[1]
+    if role not in ADMIN_ROLE_PERMISSIONS:
+        await callback.answer("نقش معتبر نیست.", show_alert=True)
+        return
+    data = await state.get_data()
+    uid = int(data.get("target_admin_id", 0))
+    if not uid:
+        await callback.answer("چت‌آیدی ثبت نشده است؛ دوباره شروع کنید.", show_alert=True)
+        return
     with closing(db.connect()) as conn:
         conn.execute(
             """
@@ -4182,12 +4842,12 @@ async def admin_admin_add_finish(message: Message, state: FSMContext) -> None:
             VALUES (?, ?, ?, 1, ?)
             ON CONFLICT(telegram_id) DO UPDATE SET role = excluded.role, is_active = 1
             """,
-            (uid, role, message.from_user.id if message.from_user else None, now_iso()),
+            (uid, role, callback.from_user.id, now_iso()),
         )
         conn.commit()
-    admin_log(message.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
+    admin_log(callback.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
     await state.clear()
-    await message.answer(header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.", reply_markup=admin_admins_kb())
+    await edit_or_answer(callback, header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.\n{h(ADMIN_ROLE_DESCRIPTIONS.get(role, ''))}", admin_admins_kb())
 
 
 @router.callback_query(F.data == "adm_admin_list")
@@ -4251,3 +4911,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+

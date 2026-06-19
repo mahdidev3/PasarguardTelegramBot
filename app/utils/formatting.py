@@ -18,3 +18,6 @@ def fmt_number(value: int | float) -> str:
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     return f"{value:,}".replace(",", "٬")
+
+
+
