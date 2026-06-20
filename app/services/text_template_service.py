@@ -1,3 +1,4 @@
+
 """Editable text templates for Phase 2."""
 
 from __future__ import annotations
@@ -135,6 +136,9 @@ async def reset_template(key: str, admin_id: int) -> tuple[bool, str]:
     if not default:
         return False, "برای این متن، پیش‌فرض داخلی تعریف نشده است."
     return await update_template(key, default["body"], admin_id)
+
+
+
 
 
 

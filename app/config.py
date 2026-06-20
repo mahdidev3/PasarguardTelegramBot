@@ -1,3 +1,4 @@
+
 """Central configuration module.
 
 Phase 0 introduces this module as the single future home for settings. The
@@ -104,6 +105,9 @@ settings = Settings(
     pasarguard_username_prefix=os.getenv("PASARGUARD_USERNAME_PREFIX", "").strip()[:20],
     pasarguard_username_suffix=os.getenv("PASARGUARD_USERNAME_SUFFIX", "").strip()[:20],
 )
+
+
+
 
 
 

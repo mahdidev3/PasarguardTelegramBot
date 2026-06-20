@@ -1,3 +1,4 @@
+
 """Database-backed plan catalog service for Phase 2."""
 
 from __future__ import annotations
@@ -296,6 +297,9 @@ async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
         legacy_module.DATA_ADDON_PACKAGES.clear()
         for a in addons:
             legacy_module.DATA_ADDON_PACKAGES[a.key] = legacy_module.DataAddon(a.key, a.title, a.data_gb, a.price, a.badge or "")
+
+
+
 
 
 

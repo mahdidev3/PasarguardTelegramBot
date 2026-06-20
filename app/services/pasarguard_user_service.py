@@ -1,3 +1,4 @@
+
 """Pasarguard user/service operations for Phase 4.5 and 4.6.
 
 This module bridges the legacy SQLite service records with Pasarguard users.
@@ -763,6 +764,9 @@ def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
         if len(report.errors) > 15:
             lines.append(f"… و {len(report.errors) - 15} خطای دیگر")
     return "\n".join(lines)
+
+
+
 
 
 

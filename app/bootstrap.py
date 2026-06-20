@@ -1,3 +1,4 @@
+
 """Application bootstrap for the staged refactor."""
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ async def bootstrap_phase1() -> None:
     except Exception:
         # Legacy catalog sync is a bridge only; failing here should not hide DB init errors.
         pass
+
+
+
 
 
 

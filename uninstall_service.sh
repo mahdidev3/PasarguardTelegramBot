@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -16,5 +17,7 @@ systemctl daemon-reload
 systemctl reset-failed "$SERVICE_NAME" || true
 
 echo "Removed: $SERVICE_NAME"
+
+
 
 

@@ -1,3 +1,4 @@
+
 """Template governance and plan-template sync for Pasarguard Phase 4."""
 
 from __future__ import annotations
@@ -378,6 +379,9 @@ def render_sync_report(report: TemplateSyncReport) -> str:
     if report.dry_run and report.actions:
         lines.append("\nیادآوری: این خروجی فقط برنامه تغییرات است؛ برای اعمال واقعی باید گزینه «اعمال Sync Templateها» را اجرا کنید.")
     return "\n".join(lines)
+
+
+
 
 
 

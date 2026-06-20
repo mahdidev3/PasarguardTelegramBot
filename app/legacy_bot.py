@@ -1,3 +1,4 @@
+
 import asyncio
 import html
 import logging
@@ -3952,8 +3953,12 @@ async def admin_service_status(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "services"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    _, _, sid_s, status = callback.data.split(":")
-    sid = int(sid_s)
+    try:
+        _, sid_s, status = callback.data.split(":", 2)
+        sid = int(sid_s)
+    except (ValueError, TypeError):
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
     admin_update_service_status(sid, status, f"set by admin {callback.from_user.id}")
     admin_log(callback.from_user.id, "SERVICE_STATUS", "service", sid, status)
     service = db.get_service(sid)
@@ -3985,9 +3990,13 @@ async def admin_service_add_data(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "services"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    _, _, sid_s, gb_s = callback.data.split(":")
-    sid = int(sid_s)
-    gb = float(gb_s)
+    try:
+        _, sid_s, gb_s = callback.data.split(":", 2)
+        sid = int(sid_s)
+        gb = float(gb_s)
+    except (ValueError, TypeError):
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
     admin_add_data_to_service(sid, gb)
     admin_log(callback.from_user.id, "SERVICE_ADD_DATA", "service", sid, f"+{gb}GB")
     service = db.get_service(sid)
@@ -4001,9 +4010,13 @@ async def admin_service_add_days(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "services"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    _, _, sid_s, days_s = callback.data.split(":")
-    sid = int(sid_s)
-    days = int(days_s)
+    try:
+        _, sid_s, days_s = callback.data.split(":", 2)
+        sid = int(sid_s)
+        days = int(days_s)
+    except (ValueError, TypeError):
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
     admin_add_days_to_service(sid, days)
     admin_log(callback.from_user.id, "SERVICE_ADD_DAYS", "service", sid, f"+{days} days")
     service = db.get_service(sid)
@@ -4042,8 +4055,12 @@ async def admin_manual_service_plan(callback: CallbackQuery, state: FSMContext) 
     if not require_admin_id(callback.from_user.id, "manual_service"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    _, _, uid_s, plan_key = callback.data.split(":")
-    uid = int(uid_s)
+    try:
+        _, uid_s, plan_key = callback.data.split(":", 2)
+        uid = int(uid_s)
+    except (ValueError, TypeError):
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
     if plan_key not in PLANS:
         await callback.answer("پلن پیدا نشد.", show_alert=True)
         return
@@ -4911,6 +4928,9 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
 
 
 

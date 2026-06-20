@@ -1,3 +1,4 @@
+
 """CSV/XLSX report export service for Phase 3.
 
 The project is still in a staged migration: core legacy data may live in the
@@ -371,6 +372,9 @@ async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtoosee_reports
             path, _, _ = await build_report_file(key, "csv", base / "parts")
             zf.write(path, arcname=f"{key}.csv")
     return zip_path
+
+
+
 
 
 

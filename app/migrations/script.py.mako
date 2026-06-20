@@ -1,3 +1,4 @@
+
 """${message}
 
 Revision ID: ${up_revision}
@@ -20,6 +21,9 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     ${downgrades if downgrades else "pass"}
+
+
+
 
 
 

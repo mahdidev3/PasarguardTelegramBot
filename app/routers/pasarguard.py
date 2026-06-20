@@ -1,3 +1,4 @@
+
 """Phase 4 Pasarguard admin router.
 
 This checkpoint adds the safe connection layer and template/plan sync controls.
@@ -285,6 +286,9 @@ async def pg_template_apply_finish(message: Message, state: FSMContext) -> None:
     report = await sync_plan_templates(message.from_user.id, dry_run=False)
     await audit_log(message.from_user.id, "PASARGUARD_TEMPLATE_APPLY", "pasarguard", "templates", f"actions={report.action_count}; failed={report.failed_count}")
     await message.answer(header("✅ نتیجه Sync Templateها") + f"<pre>{h(render_sync_report(report))}</pre>", reply_markup=pg_home_kb())
+
+
+
 
 
 

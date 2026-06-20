@@ -1,3 +1,4 @@
+
 r"""Small helpers for admin line parsing.
 
 Admin forms historically use pipe-separated values.  Text fields may need a
@@ -45,6 +46,9 @@ def split_escaped_pipe(line: str, maxsplit: int = -1) -> list[str]:
 
 def pipe_escape_hint() -> str:
     return "برای استفاده از کاراکتر | داخل متن، آن را به شکل <code>\\|</code> بنویسید."
+
+
+
 
 
 

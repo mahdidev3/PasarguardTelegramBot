@@ -1,3 +1,4 @@
+
 """Complete backup service for Phase 3/3.1.
 
 Creates a ZIP checkpoint that includes PostgreSQL tables, legacy SQLite tables,
@@ -369,6 +370,9 @@ def inspect_backup_file(zip_path: str | Path) -> dict[str, Any]:
         manifest["file_name"] = path.name
         manifest["file_size"] = path.stat().st_size
         return manifest
+
+
+
 
 
 
