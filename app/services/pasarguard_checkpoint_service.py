@@ -1,4 +1,3 @@
-
 """Pasarguard checkpoint backup/restore/reconcile service for Phase 4.8.
 
 This service upgrades Phase 3 backups from "bot DB checkpoint" to
@@ -466,7 +465,7 @@ async def reconcile_backup_with_pasarguard(zip_path: str | Path, *, admin_id: in
                             created = await client.create_user_from_template({
                                 "user_template_id": _remote_id(template),
                                 "username": username,
-                                "note": desired.get("note") or "[HOWTOOSEE_BOT_RESTORE]",
+                                "note": desired.get("note") or "[HOWTOSEE_BOT_RESTORE]",
                             })
                             item.applied = True
                             users_by_username[str(created.get("username") or username)] = created
@@ -527,6 +526,9 @@ def render_reconcile_report(report: PasarguardReconcileReport) -> str:
     if not report.actions and not report.errors:
         lines.append("\n✅ اختلافی بین backup desired_state و پنل فعلی پیدا نشد.")
     return "\n".join(lines)
+
+
+
 
 
 

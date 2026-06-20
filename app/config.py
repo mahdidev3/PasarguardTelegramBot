@@ -1,4 +1,3 @@
-
 """Central configuration module.
 
 Phase 0 introduces this module as the single future home for settings. The
@@ -81,9 +80,9 @@ class Settings:
 settings = Settings(
     bot_token=os.getenv("BOT_TOKEN", "").strip(),
     bot_username=os.getenv("BOT_USERNAME", "HowToSeeWorld_bot").strip().lstrip("@"),
-    channel_username=os.getenv("CHANNEL_USERNAME", "HowTooSeeWorld").strip().lstrip("@"),
+    channel_username=os.getenv("CHANNEL_USERNAME", "HowToSeeWorld").strip().lstrip("@"),
     channel_link=os.getenv("CHANNEL_LINK", "").strip(),
-    brand_name=os.getenv("BRAND_NAME", "HowTooSee | Premium VPN").strip(),
+    brand_name=os.getenv("BRAND_NAME", "HowToSee | Premium VPN").strip(),
     database_path=os.getenv("DATABASE_PATH", "bot.db").strip(),
     database_url=os.getenv("DATABASE_URL", "").strip(),
     subscription_base_url=os.getenv("SUBSCRIPTION_BASE_URL", "https://example.com/sub").rstrip("/"),
@@ -105,6 +104,9 @@ settings = Settings(
     pasarguard_username_prefix=os.getenv("PASARGUARD_USERNAME_PREFIX", "").strip()[:20],
     pasarguard_username_suffix=os.getenv("PASARGUARD_USERNAME_SUFFIX", "").strip()[:20],
 )
+
+
+
 
 
 

@@ -1,4 +1,3 @@
-
 """Pasarguard user/service operations for Phase 4.5 and 4.6.
 
 This module bridges the legacy SQLite service records with Pasarguard users.
@@ -132,15 +131,15 @@ def sanitize_remote_username(value: str, telegram_id: int, service_id: int) -> s
 
 def build_managed_note(*, telegram_id: int, service_id: int, order_id: int | None, plan_key: str, action: str) -> str:
     return (
-        "[HOWTOOSEE_BOT_START]\n"
-        f"managed_by=howtoosee_bot\n"
+        "[HOWTOSEE_BOT_START]\n"
+        f"managed_by=howtosee_bot\n"
         f"marker={managed_marker()}\n"
         f"action={action}\n"
         f"plan_key={plan_key}\n"
         f"telegram_id={telegram_id}\n"
         f"service_id={service_id}\n"
         f"order_id={order_id or ''}\n"
-        "[HOWTOOSEE_BOT_END]"
+        "[HOWTOSEE_BOT_END]"
     )[:500]
 
 
@@ -764,6 +763,9 @@ def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
         if len(report.errors) > 15:
             lines.append(f"… و {len(report.errors) - 15} خطای دیگر")
     return "\n".join(lines)
+
+
+
 
 
 

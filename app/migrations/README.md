@@ -1,4 +1,3 @@
-
 # Migrations
 
 Phase 1 introduces SQLAlchemy models and PostgreSQL storage. For this checkpoint
@@ -13,6 +12,9 @@ Alembic revisions with:
 alembic revision --autogenerate -m "phase1 schema"
 alembic upgrade head
 ```
+
+
+
 
 
 

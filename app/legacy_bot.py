@@ -1,4 +1,3 @@
-
 import asyncio
 import html
 import logging
@@ -40,6 +39,7 @@ from app.bootstrap import bootstrap_phase1
 from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
+from app.services.ticket_service import upsert_admin_role
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
@@ -66,7 +66,7 @@ from app.routers.settings import settings_router
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("howtoosee-bot")
+logger = logging.getLogger("howtosee-bot")
 
 
 # -----------------------------
@@ -74,9 +74,9 @@ logger = logging.getLogger("howtoosee-bot")
 # -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "HowToSeeWorld_bot").strip().lstrip("@")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "HowTooSeeWorld").strip().lstrip("@")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "HowToSeeWorld").strip().lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}").strip()
-BRAND_NAME = os.getenv("BRAND_NAME", "HowTooSee | Premium VPN").strip()
+BRAND_NAME = os.getenv("BRAND_NAME", "HowToSee | Premium VPN").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db").strip()
 SUBSCRIPTION_BASE_URL = os.getenv("SUBSCRIPTION_BASE_URL", "https://example.com/sub").rstrip("/")
 REFERRAL_COMMISSION_PERCENT = int(os.getenv("REFERRAL_COMMISSION_PERCENT", "10"))
@@ -807,6 +807,7 @@ ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
     "sales": {"dashboard", "orders", "payment_receipts"},
     "support": {"dashboard", "users", "services", "direct_message"},
     "marketing": {"dashboard", "broadcast", "coupons", "reports"},
+    "appearance": {"dashboard", "appearance"},
 }
 
 ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
@@ -814,6 +815,7 @@ ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
     "sales": "فقط مدیریت سفارش‌ها و بررسی رسیدهای کارت‌به‌کارت؛ بدون بلاک/حذف کاربر و بدون تغییر کیف پول.",
     "support": "پشتیبانی کاربران، مشاهده/مدیریت سرویس‌ها و ارسال پیام مستقیم؛ بدون دسترسی مالی حساس.",
     "marketing": "کمپین، پیام همگانی، کد تخفیف و گزارش‌ها؛ بدون دسترسی عملیاتی به کاربران/پرداخت.",
+    "appearance": "فقط تغییرات ظاهری ربات، متن‌ها، پیام‌ها، ایموجی‌ها و قالب‌های نمایشی.",
 }
 
 
@@ -940,7 +942,7 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     service_id: Optional[int] = None
     if plan_key.startswith("wallet_topup:"):
-        db.add_wallet(telegram_id, payable, "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
+        db.add_wallet(telegram_id, int(order["amount"]), "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
     elif plan_key in PLANS:
         service_name = (order["service_name"] if row_has(order, "service_name") and order["service_name"] else make_service_name(telegram_id))
         service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
@@ -1667,12 +1669,19 @@ def order_payment_kb(
     if allow_coupon:
         rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
     if is_wallet_topup:
-        rows.append([("💳 ثبت/ارسال رسید کارت‌به‌کارت", f"pay_card:{order_id}")])
+        rows.append([("💳 پرداخت", f"pay_methods:{order_id}")])
     elif allow_wallet and wallet_balance >= payable and wallet_balance >= 0:
         label = "✅ فعال‌سازی سفارش رایگان" if payable <= 0 else "💰 پرداخت و فعال‌سازی از کیف پول"
         rows.append([(label, f"pay_wallet:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
+
+
+def payment_methods_kb(order_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("💳 کارت‌به‌کارت", f"pay_card:{order_id}")],
+        [("⬅️ بازگشت به بررسی پرداخت", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")],
+    ])
 
 
 def wallet_shortfall(payable: int, wallet_balance: int) -> int:
@@ -1809,10 +1818,16 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("💰 کیف پول کاربران", "adm_wallet_start")],
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
-        [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
         [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
         [("🔌 Pasarguard", "adm_pasarguard")],
     ]
+    appearance_row: list[tuple[str, str]] = []
+    if admin_has(admin_id, "appearance"):
+        appearance_row.append(("🎨 تغییرات ظاهری ربات", "adm_texts"))
+    if admin_has(admin_id, "*"):
+        appearance_row.append(("🔒 قفل بات", "adm_bot_lock"))
+    if appearance_row:
+        rows.append(appearance_row)
     if admin_has(admin_id, "*"):
         rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
     rows.append([("🏠 منوی اصلی کاربر", "home")])
@@ -1853,12 +1868,16 @@ def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
             [("📝 یادداشت ادمین", f"adm_user_note:{uid}")],
             [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
         ])
-    lock_btn = ("🔓 باز کردن کاربر", f"adm_user_unlock:{uid}") if status != "active" else ("🔒 قفل با اطلاع", f"adm_user_lock_notify:{uid}")
+
+    status_row = (
+        [("✅ رفع بلاک با اطلاع", f"adm_user_unban_notify:{uid}"), ("✅ رفع بلاک بی‌صدا", f"adm_user_unban_silent:{uid}")]
+        if status in {"banned", "locked"} else
+        [("🚫 بلاک با اطلاع", f"adm_user_ban_notify:{uid}"), ("🚫 بلاک بی‌صدا", f"adm_user_ban_silent:{uid}")]
+    )
     return inline([
         [("📦 سرویس‌های کاربر", f"adm_user_services:{uid}"), ("🧾 سفارش‌ها", f"adm_user_orders:{uid}")],
         [("💰 تغییر کیف پول", f"adm_user_wallet:{uid}"), ("✉️ پیام مستقیم", f"adm_user_msg:{uid}")],
-        [lock_btn, ("🔕 قفل بی‌صدا", f"adm_user_lock_silent:{uid}")],
-        [("🚫 بلاک با اطلاع", f"adm_user_ban_notify:{uid}"), ("🚫 بلاک بی‌صدا", f"adm_user_ban_silent:{uid}")],
+        status_row,
         [("🗑 حذف کاربر", f"adm_user_delete:{uid}"), ("🎁 ریست تست رایگان", f"adm_user_reset_free:{uid}")],
         [("📝 یادداشت ادمین", f"adm_user_note:{uid}"), ("➕ ساخت سرویس دستی", f"adm_manual_service:{uid}")],
         [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
@@ -2003,11 +2022,13 @@ def admin_user_text(user: sqlite3.Row) -> str:
     orders = db.list_orders(int(user["telegram_id"]), 5)
     stats = db.referral_stats(int(user["telegram_id"]))
     status = user["status"] if row_has(user, "status") else "active"
+    if status == "locked":
+        status = "banned"
     username = f"@{user['username']}" if user["username"] else "ثبت نشده"
     note = user["admin_note"] if row_has(user, "admin_note") and user["admin_note"] else "ندارد"
     return (
         header("👤 پروفایل کاربر", str(user["telegram_id"]))
-        + f"👤 یوزرنیم: <b>{h(username)}</b>\n"
+        + f"👤 نام کاربری: <b>{h(username)}</b>\n"
         + f"🪪 نام: <b>{h(user['first_name'] or 'ثبت نشده')}</b>\n"
         + f"📅 عضویت: <code>{h(user['created_at'][:10])}</code>\n"
         + f"⛔ وضعیت: <b>{h(status)}</b>\n"
@@ -2183,10 +2204,11 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
     details = order_discount_details(int(order["id"]), order)
 
     if plan_key.startswith("wallet_topup:"):
-        text = header("💳 پرداخت شارژ کیف پول", f"سفارش #{order['id']}")
+        text = header("💳 بررسی شارژ کیف پول", f"سفارش #{order['id']}")
         text += f"💰 مبلغ شارژ کیف پول: <b>{fmt_money(amount)}</b>\n"
+        text += discount_lines(details)
         text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
-        text += "بعد از ارسال رسید و تأیید ادمین فروش، موجودی کیف پول شما به همین مقدار افزایش پیدا می‌کند."
+        text += "اگر کد تخفیف دارید، ابتدا آن را اعمال کنید. سپس دکمه پرداخت را بزنید و در مرحله بعد روش پرداخت را انتخاب کنید."
         return text, "wallet", payable
 
     if plan_key.startswith("addon:"):
@@ -2364,7 +2386,7 @@ def account_text(user: sqlite3.Row) -> str:
     return (
         header("📊 اطلاعات حساب شما")
         + f"🧾 شناسه کاربری: <code>{user['telegram_id']}</code>\n"
-        + f"👤 یوزرنیم: <b>{h(username)}</b>\n"
+        + f"👤 نام کاربری: <b>{h(username)}</b>\n"
         + f"💰 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n"
         + f"📦 سرویس‌های فعال: <b>{fmt_number(len(services))}</b>\n"
         + f"💎 دعوت‌های موفق: <b>{fmt_number(stats['rewarded'])}</b>\n"
@@ -2491,7 +2513,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
             back_callback,
             "⬅️ بازگشت",
             allow_wallet=not is_wallet_topup,
-            allow_coupon=not is_wallet_topup,
+            allow_coupon=True,
             is_wallet_topup=is_wallet_topup,
         )
     if isinstance(target, CallbackQuery):
@@ -2511,9 +2533,7 @@ def user_block_message(user_row: sqlite3.Row) -> Optional[str]:
     notice = user_row["locked_notice"] if row_has(user_row, "locked_notice") else None
     if notice:
         return str(notice)
-    if status == "locked":
-        return "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
-    if status == "banned":
+    if status in {"locked", "banned"}:
         return "🚫 دسترسی شما به ربات محدود شده است."
     if status == "deleted":
         return "این حساب از سیستم حذف شده است."
@@ -2683,9 +2703,6 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not order or order["status"] != "pending":
         await callback.answer("سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
-    if str(order["plan_key"]).startswith("wallet_topup:"):
-        await callback.answer("کد تخفیف برای شارژ کیف پول قابل استفاده نیست.", show_alert=True)
-        return
     await state.set_state(CouponStates.waiting_code)
     await state.update_data(order_id=order_id)
     text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید."
@@ -2756,6 +2773,27 @@ async def notify_sales_admins_about_receipt(bot: Bot, receipt_id: int) -> None:
             await bot.send_message(admin_id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, int(order["id"])))
         except Exception as exc:
             logger.warning("Failed to notify sales admin %s about receipt %s: %s", admin_id, receipt_id, exc)
+
+
+@router.callback_query(F.data.startswith("pay_methods:"))
+async def pay_methods(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, telegram_id)
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
+        return
+    if not str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("روش‌های پرداخت مستقیم برای خرید سرویس حذف شده است.", show_alert=True)
+        await show_order_payment(callback, telegram_id, order_id)
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    text = header("💳 انتخاب روش پرداخت", f"سفارش #{order_id}")
+    text += f"✅ مبلغ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
+    text += "لطفاً یکی از روش‌های پرداخت را انتخاب کنید. فعلاً فقط کارت‌به‌کارت فعال است."
+    await edit_or_answer(callback, text, payment_methods_kb(order_id))
 
 
 @router.callback_query(F.data.startswith("pay_card:"))
@@ -3045,14 +3083,14 @@ async def my_services_cb(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
     services = db.list_services(int(user["telegram_id"]))
     active = [s for s in services if s["status"] != "deleted"]
-    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را بسازید." if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
+    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را دریافت کنید" if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
     await edit_or_answer(callback, text, services_kb(services))
 
 
 async def show_my_services(message: Message, telegram_id: int) -> None:
     services = db.list_services(telegram_id)
     active = [s for s in services if s["status"] != "deleted"]
-    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را بسازید." if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
+    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را دریافت کنید" if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
     await message.answer(text, reply_markup=services_kb(services))
 
 
@@ -3513,9 +3551,8 @@ async def wallet_topup_amount(message: Message, state: FSMContext) -> None:
             reply_markup=wallet_amount_kb(),
         )
         return
-    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "کارت به کارت")
+    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "none")
     await state.clear()
-    await message.answer(header("💳 ادامه شارژ کیف پول") + "برای تکمیل شارژ، رسید کارت‌به‌کارت را ثبت کنید. موجودی بعد از تأیید ادمین فروش اضافه می‌شود.")
     await show_order_payment(message, int(user["telegram_id"]), order_id)
 
 
@@ -3616,7 +3653,7 @@ async def admin_user_search_start(callback: CallbackQuery, state: FSMContext) ->
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_user_search)
-    await edit_or_answer(callback, header("🔎 جستجوی کاربر") + "چت‌آیدی، یوزرنیم، یا نام کاربر را وارد کنید.", admin_back_kb("adm_users"))
+    await edit_or_answer(callback, header("🔎 جستجوی کاربر") + "چت‌آیدی، نام کاربری، یا نام کاربر را وارد کنید.", admin_back_kb("adm_users"))
 
 
 @router.message(AdminStates.waiting_user_search)
@@ -3662,43 +3699,56 @@ async def admin_user_profile(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("adm_user_lock_notify:"))
 async def admin_user_lock_notify(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "users"):
-        await callback.answer("دسترسی ندارید.", show_alert=True)
-        return
-    uid = int(callback.data.split(":", 1)[1])
-    notice = "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
-    update_user_status(uid, "locked", "locked by admin", notice)
-    admin_log(callback.from_user.id, "USER_LOCK_NOTIFY", "user", uid, notice)
-    try:
-        await callback.bot.send_message(uid, notice)
-    except Exception:
-        pass
-    user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر با اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+    # Backward compatibility for old inline buttons: old "lock" now means "block".
+    await admin_user_ban_notify(callback)
 
 
 @router.callback_query(F.data.startswith("adm_user_lock_silent:"))
 async def admin_user_lock_silent(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "users"):
-        await callback.answer("دسترسی ندارید.", show_alert=True)
-        return
-    uid = int(callback.data.split(":", 1)[1])
-    update_user_status(uid, "locked", "silent lock by admin", "")
-    admin_log(callback.from_user.id, "USER_LOCK_SILENT", "user", uid, "")
-    user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر بدون اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+    # Backward compatibility for old inline buttons: old "lock" now means "block".
+    await admin_user_ban_silent(callback)
 
 
 @router.callback_query(F.data.startswith("adm_user_unlock:"))
 async def admin_user_unlock(callback: CallbackQuery) -> None:
+    # Backward compatibility for old inline buttons.
     if not require_admin_id(callback.from_user.id, "users"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     uid = int(callback.data.split(":", 1)[1])
     update_user_status(uid, "active", "", "")
-    admin_log(callback.from_user.id, "USER_UNLOCK", "user", uid, "")
+    admin_log(callback.from_user.id, "USER_UNBLOCK_COMPAT", "user", uid, "")
     user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر باز شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_unban_notify:"))
+async def admin_user_unban_notify(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    notice = "✅ دسترسی شما به ربات دوباره فعال شد."
+    update_user_status(uid, "active", "", "")
+    admin_log(callback.from_user.id, "USER_UNBAN_NOTIFY", "user", uid, notice)
+    try:
+        await callback.bot.send_message(uid, notice)
+    except Exception:
+        pass
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "کاربر با اطلاع‌رسانی از بلاک خارج شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_unban_silent:"))
+async def admin_user_unban_silent(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "active", "", "")
+    admin_log(callback.from_user.id, "USER_UNBAN_SILENT", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "کاربر بدون اطلاع‌رسانی از بلاک خارج شد.", admin_user_kb(user))
 
 
 @router.callback_query(F.data.startswith("adm_user_restore:"))
@@ -3814,7 +3864,7 @@ async def admin_wallet_start(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_user_search)
-    await edit_or_answer(callback, header("💰 کیف پول کاربران") + "اول کاربر را با چت‌آیدی یا یوزرنیم جستجو کنید، سپس گزینه تغییر کیف پول را بزنید.", admin_back_kb("adm_home"))
+    await edit_or_answer(callback, header("💰 کیف پول کاربران") + "اول کاربر را با چت‌آیدی یا نام کاربری جستجو کنید، سپس گزینه تغییر کیف پول را بزنید.", admin_back_kb("adm_home"))
 
 
 @router.callback_query(F.data.startswith("adm_user_msg:"))
@@ -4415,7 +4465,7 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
         if is_wallet_topup:
             user_row = db.get_user(int(order["user_telegram_id"]))
             user_text = header("✅ شارژ کیف پول تأیید شد", f"سفارش #{order['id']}")
-            user_text += f"رسید پرداخت شما تأیید شد و مبلغ <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b> به کیف پول شما اضافه شد.\n"
+            user_text += f"رسید پرداخت شما تأیید شد و مبلغ <b>{fmt_money(int(order['amount']))}</b> به کیف پول شما اضافه شد.\n"
             if user_row:
                 user_text += f"موجودی فعلی کیف پول: <b>{fmt_money(int(user_row['wallet_balance']))}</b>\n"
             if note:
@@ -4862,6 +4912,10 @@ async def admin_admin_role_finish(callback: CallbackQuery, state: FSMContext) ->
             (uid, role, callback.from_user.id, now_iso()),
         )
         conn.commit()
+    try:
+        await upsert_admin_role(uid, role, callback.from_user.id)
+    except Exception as exc:
+        logger.warning("Failed to sync admin %s to PostgreSQL role table: %s", uid, exc)
     admin_log(callback.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
     await state.clear()
     await edit_or_answer(callback, header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.\n{h(ADMIN_ROLE_DESCRIPTIONS.get(role, ''))}", admin_admins_kb())
@@ -4928,6 +4982,9 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
 
 
 

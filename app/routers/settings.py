@@ -1,5 +1,4 @@
-
-"""Phase 2 editable text templates router."""
+"""Appearance/text customization router."""
 
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKe
 
 from app.services.admin_audit_service import audit_log
 from app.services.text_template_service import get_template, list_templates, reset_template, update_template
-from app.services.ticket_service import is_admin
+from app.services.ticket_service import has_appearance_access
 
 settings_router = Router(name="phase2_settings")
 
@@ -37,7 +36,8 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def text_home_kb() -> InlineKeyboardMarkup:
     return inline([
-        [("📋 لیست متن‌ها", "adm_texts_list")],
+        [("📋 متن‌ها و پیام‌ها", "adm_texts_list")],
+        [("🎨 راهنمای تغییرات ظاهری", "adm_appearance_help")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -53,7 +53,7 @@ def text_list_kb(rows_: list[Any]) -> InlineKeyboardMarkup:
 def text_view_kb(key: str) -> InlineKeyboardMarkup:
     return inline([
         [("✏️ ویرایش متن", f"adm_text_edit:{key}"), ("↩️ متن پیش‌فرض", f"adm_text_reset:{key}")],
-        [("⬅️ لیست متن‌ها", "adm_texts_list"), ("👑 منوی ادمین", "adm_home")],
+        [("⬅️ متن‌ها و پیام‌ها", "adm_texts_list"), ("👑 منوی ادمین", "adm_home")],
     ])
 
 
@@ -71,21 +71,35 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) 
 
 @settings_router.callback_query(F.data == "adm_texts")
 async def admin_texts(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    text = header("✏️ تغییر متن‌ها و پیام‌ها")
-    text += "از این بخش می‌توانید جمله‌ها و پیام‌های اصلی ربات را بدون تغییر کد ویرایش کنید."
+    text = header("🎨 تغییرات ظاهری ربات")
+    text += "از این بخش می‌توانید ظاهر متنی ربات را مدیریت کنید؛ مثل متن‌ها، پیام‌ها، ایموجی‌ها و قالب‌های HTML تلگرام. این بخش فقط برای سوپر ادمین و ادمین ظاهر فعال است."
+    await edit_or_answer(callback, text, text_home_kb())
+
+
+@settings_router.callback_query(F.data == "adm_appearance_help")
+async def admin_appearance_help(callback: CallbackQuery) -> None:
+    if not await has_appearance_access(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    text = header("🎨 راهنمای تغییرات ظاهری")
+    text += (
+        "در حال حاضر تغییرات ظاهری از مسیر قالب‌های متنی انجام می‌شود؛ یعنی می‌توانید متن، ایموجی، تیترها و HTML مجاز تلگرام "
+        "مثل <code>&lt;b&gt;</code>، <code>&lt;i&gt;</code> و <code>&lt;code&gt;</code> را تغییر دهید.\n\n"
+        "برای تغییر واقعی دکمه‌ها و چیدمان، باید قالب/کیبورد مربوطه در کد اضافه شود؛ این پنل فعلاً نقطه مرکزی تغییرات ظاهری قابل ویرایش است."
+    )
     await edit_or_answer(callback, text, text_home_kb())
 
 
 @settings_router.callback_query(F.data == "adm_texts_list")
 async def admin_texts_list(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     rows = await list_templates()
-    text = header("📋 متن‌های قابل ویرایش")
+    text = header("📋 متن‌ها و پیام‌های قابل ویرایش")
     for tpl in rows:
         active = "✅" if tpl.is_active else "⛔"
         text += f"{active} <code>{h(tpl.key)}</code> — {h(tpl.title)} — <b>{h(tpl.group_name)}</b>\n"
@@ -94,7 +108,7 @@ async def admin_texts_list(callback: CallbackQuery) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_view:"))
 async def admin_text_view(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -112,7 +126,7 @@ async def admin_text_view(callback: CallbackQuery) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_edit:"))
 async def admin_text_edit(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -129,7 +143,7 @@ async def admin_text_edit(callback: CallbackQuery, state: FSMContext) -> None:
 
 @settings_router.message(TextTemplateStates.waiting_body)
 async def admin_text_edit_finish(message: Message, state: FSMContext) -> None:
-    if not message.from_user or not await is_admin(message.from_user.id):
+    if not message.from_user or not await has_appearance_access(message.from_user.id):
         await message.answer("دسترسی ندارید.")
         return
     data = await state.get_data()
@@ -145,7 +159,7 @@ async def admin_text_edit_finish(message: Message, state: FSMContext) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_reset:"))
 async def admin_text_reset(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -160,6 +174,9 @@ async def admin_text_reset(callback: CallbackQuery) -> None:
         text += f"عنوان: <b>{h(tpl.title)}</b>\nگروه: <b>{h(tpl.group_name)}</b>\nمتغیرهای مجاز: <code>{h(tpl.allowed_placeholders or '-')}</code>\n\n<b>متن فعلی:</b>\n{body}"
         if callback.message:
             await callback.message.answer(text, reply_markup=text_view_kb(key), disable_web_page_preview=True)
+
+
+
 
 
 

@@ -1,4 +1,3 @@
-
 """Pasarguard admin panel utilities for Phase 4.9.
 
 This module powers the Telegram admin UI around the Pasarguard integration:
@@ -160,7 +159,7 @@ def is_managed_remote_user(remote: dict[str, Any]) -> bool:
     configured_prefix = (settings.pasarguard_username_prefix or "").lower()
     return (
         marker in note
-        or "[HOWTOOSEE_BOT_START]" in note
+        or "[HOWTOSEE_BOT_START]" in note
         or username.startswith(configured_prefix)
         or username.startswith("howtosee_")
     )
@@ -182,7 +181,7 @@ async def current_desired_state_zip() -> Path:
     pg_data = await _pg_tables()
     desired_templates = desired_templates_from_pg_data(pg_data)
     desired_users = desired_users_from_data(sqlite_data, pg_data)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="howtoosee-pg-current-"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="howtosee-pg-current-"))
     write_jsonl(tmp_dir / "external" / "pasarguard_desired_templates.jsonl", desired_templates)
     write_jsonl(tmp_dir / "external" / "pasarguard_desired_state.jsonl", desired_users)
     manifest = {
@@ -408,6 +407,9 @@ __all__ = [
     "render_snapshots",
     "render_sync_logs",
 ]
+
+
+
 
 
 

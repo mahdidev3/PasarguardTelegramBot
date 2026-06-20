@@ -1,4 +1,3 @@
-
 """CSV/XLSX report export service for Phase 3.
 
 The project is still in a staged migration: core legacy data may live in the
@@ -350,7 +349,7 @@ def _write_xlsx(path: Path, title: str, rows: list[dict[str, Any]]) -> None:
     wb.save(path)
 
 
-async def build_report_file(report_key: str, file_format: str, output_dir: str | Path = "/tmp/howtoosee_reports") -> tuple[Path, int, str]:
+async def build_report_file(report_key: str, file_format: str, output_dir: str | Path = "/tmp/howtosee_reports") -> tuple[Path, int, str]:
     spec, rows = await collect_report_rows(report_key)
     ext = "xlsx" if file_format == "xlsx" else "csv"
     path = Path(output_dir) / f"report-{report_key}-{_now_stamp()}.{ext}"
@@ -361,7 +360,7 @@ async def build_report_file(report_key: str, file_format: str, output_dir: str |
     return path, len(rows), spec.title
 
 
-async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtoosee_reports") -> Path:
+async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtosee_reports") -> Path:
     import zipfile
 
     base = Path(output_dir)
@@ -372,6 +371,9 @@ async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtoosee_reports
             path, _, _ = await build_report_file(key, "csv", base / "parts")
             zf.write(path, arcname=f"{key}.csv")
     return zip_path
+
+
+
 
 
 

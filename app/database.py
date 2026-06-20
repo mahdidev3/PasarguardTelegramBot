@@ -1,4 +1,3 @@
-
 """Async SQLAlchemy database setup for Phase 1.
 
 Phase 1 moves new stateful features to PostgreSQL. Existing legacy handlers are
@@ -73,6 +72,9 @@ async def init_database() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+
 
 
 

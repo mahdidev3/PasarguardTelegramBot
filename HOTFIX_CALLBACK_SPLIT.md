@@ -10,3 +10,6 @@ Affected handlers in `app/legacy_bot.py`:
 - `adm_manual_service_plan:<uid>:<plan_key>`
 
 The handlers now parse with `split(":", 2)` and return a safe Telegram alert instead of crashing when malformed callback data arrives.
+
+
+

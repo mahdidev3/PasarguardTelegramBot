@@ -1,4 +1,3 @@
-
 """Application entrypoint.
 
 Run the bot with:
@@ -16,6 +15,9 @@ from app.legacy_bot import main
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
 
 
 

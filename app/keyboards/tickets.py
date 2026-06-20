@@ -1,4 +1,3 @@
-
 """Inline keyboards for Phase 1 ticket flows."""
 
 from __future__ import annotations
@@ -31,11 +30,11 @@ def ticket_category_kb() -> InlineKeyboardMarkup:
 
 
 def ticket_subject_kb() -> InlineKeyboardMarkup:
-    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+    return inline([[('⬅️ تغییر عنوان', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
 
 
 def ticket_body_kb() -> InlineKeyboardMarkup:
-    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+    return inline([[('⬅️ تغییر عنوان', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
 
 
 def user_ticket_list_kb(ticket_rows: list[object], back: str = "ticket_home") -> InlineKeyboardMarkup:
@@ -46,13 +45,17 @@ def user_ticket_list_kb(ticket_rows: list[object], back: str = "ticket_home") ->
     return inline(rows)
 
 
-def user_ticket_view_kb(ticket_id: int) -> InlineKeyboardMarkup:
-    return inline(
-        [
-            [("✉️ ارسال پاسخ/فایل", f"ticket_reply:{ticket_id}"), ("✅ بستن تیکت", f"ticket_user_close:{ticket_id}")],
-            [("⬅️ تیکت‌های من", "ticket_my_open"), ("🏠 منوی اصلی", "home")],
-        ]
-    )
+def user_ticket_view_kb(ticket_id: int, status: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if status == "closed":
+        # A closed ticket must not show the "close ticket" button again.
+        rows.append([("✉️ ارسال پاسخ/بازگشایی", f"ticket_reply:{ticket_id}")])
+    else:
+        rows.append([("✉️ ارسال پاسخ/فایل", f"ticket_reply:{ticket_id}"), ("✅ بستن تیکت", f"ticket_user_close:{ticket_id}")])
+    rows.append([("⬅️ تیکت‌های من", "ticket_my_open"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
 
 
 def admin_ticket_home_kb() -> InlineKeyboardMarkup:
@@ -106,6 +109,9 @@ def admin_ticket_files_kb(ticket_id: int, file_messages: list[object]) -> Inline
 
 def confirm_cancel_kb(back_callback: str) -> InlineKeyboardMarkup:
     return inline([[('❌ لغو', back_callback), ('👑 منوی ادمین', 'adm_home')]])
+
+
+
 
 
 

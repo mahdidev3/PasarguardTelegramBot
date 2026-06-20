@@ -1,4 +1,3 @@
-
 """Complete backup service for Phase 3/3.1.
 
 Creates a ZIP checkpoint that includes PostgreSQL tables, legacy SQLite tables,
@@ -254,7 +253,7 @@ def _desired_pasarguard_state(sqlite_data: dict[str, list[dict[str, Any]]], pg_d
     return output
 
 
-async def create_complete_backup(admin_id: int | None = None, output_dir: str | Path = "/tmp/howtoosee_backups", bot: Bot | None = None) -> tuple[Path, dict[str, Any]]:
+async def create_complete_backup(admin_id: int | None = None, output_dir: str | Path = "/tmp/howtosee_backups", bot: Bot | None = None) -> tuple[Path, dict[str, Any]]:
     base = Path(output_dir) / f"backup-work-{_stamp()}"
     base.mkdir(parents=True, exist_ok=True)
     sqlite_data = _sqlite_tables()
@@ -337,7 +336,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     checksums_dir.mkdir(parents=True, exist_ok=True)
     (checksums_dir / "sha256.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
 
-    zip_path = Path(output_dir) / f"backup-howtoosee-{_stamp()}.zip"
+    zip_path = Path(output_dir) / f"backup-howtosee-{_stamp()}.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(p for p in base.rglob("*") if p.is_file()):
@@ -370,6 +369,9 @@ def inspect_backup_file(zip_path: str | Path) -> dict[str, Any]:
         manifest["file_name"] = path.name
         manifest["file_size"] = path.stat().st_size
         return manifest
+
+
+
 
 
 

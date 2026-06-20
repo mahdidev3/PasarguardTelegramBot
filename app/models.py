@@ -1,4 +1,3 @@
-
 """SQLAlchemy models for Phase 1 PostgreSQL storage.
 
 The schema mirrors the current bot entities and adds the complete ticket and
@@ -523,6 +522,9 @@ class PasarguardRemoteSnapshot(Base):
     state_json: Mapped[dict | list | None] = mapped_column(JSON)
     created_by: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+
 
 
 

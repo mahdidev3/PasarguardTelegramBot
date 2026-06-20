@@ -1,4 +1,3 @@
-
 """Editable text templates for Phase 2."""
 
 from __future__ import annotations
@@ -44,7 +43,7 @@ DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
         "title": "راهنمای ثبت تیکت",
         "group": "ticket",
         "placeholders": "",
-        "body": "موضوع تیکت را کوتاه وارد کنید.\n\nدر مرحله بعد متن کامل مشکل را بفرستید. اگر می‌خواهید عکس، ویدیو، فایل، ویس یا توضیح بفرستید، تا حد امکان همه را در همان یک پیام و همراه کپشن ارسال کنید تا تیکت کامل ثبت شود.",
+        "body": "عنوان تیکت را کوتاه وارد کنید.\n\nدر مرحله بعد متن کامل مشکل را بفرستید. اگر می‌خواهید عکس، ویدیو، فایل، ویس یا توضیح بفرستید، تا حد امکان همه را در همان یک پیام و همراه کپشن ارسال کنید تا تیکت کامل ثبت شود.",
     },
     "bot.locked": {
         "title": "پیام قفل بودن بات",
@@ -136,6 +135,9 @@ async def reset_template(key: str, admin_id: int) -> tuple[bool, str]:
     if not default:
         return False, "برای این متن، پیش‌فرض داخلی تعریف نشده است."
     return await update_template(key, default["body"], admin_id)
+
+
+
 
 
 

@@ -1,4 +1,3 @@
-
 """Ticket service layer for users and admins."""
 
 from __future__ import annotations
@@ -24,13 +23,16 @@ from app.models import (
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 TICKET_CATEGORY_LABELS: dict[str, str] = {
-    "service": "📦 مربوط به سرویس",
-    "order": "🧾 مربوط به سفارش",
-    "wallet": "💰 کیف پول",
+    # These are user-facing ticket title presets. Internally we still store
+    # category/related_type for backward compatibility, but the user flow no
+    # longer asks for a separate "related to" category.
+    "service": "📦 مشکل اتصال یا سرویس",
+    "order": "🧾 مشکل پرداخت یا سفارش",
+    "wallet": "💰 مشکل کیف پول",
     "technical": "🛠 مشکل فنی",
-    "account": "👤 حساب کاربری",
+    "account": "👤 مشکل حساب کاربری",
     "general": "❓ سوال عمومی",
-    "other": "موارد دیگر",
+    "other": "✍️ موارد دیگر",
 }
 
 TICKET_STATUS_LABELS: dict[str, str] = {
@@ -54,6 +56,7 @@ ADMIN_ROLE_LABELS: dict[str, str] = {
     "sales": "مدیریت فروش",
     "support": "پشتیبانی",
     "marketing": "مدیریت مارکتینگ",
+    "appearance": "مدیریت ظاهر",
 }
 
 
@@ -98,12 +101,35 @@ async def seed_bootstrap_admins(admin_ids: set[int]) -> None:
                 admin.is_active = True
 
 
+async def upsert_admin_role(telegram_id: int, role: str, added_by: int | None = None) -> None:
+    """Keep the PostgreSQL admin table in sync with the legacy admin panel."""
+    async with session_scope() as session:
+        result = await session.execute(select(Admin).where(Admin.telegram_id == telegram_id))
+        admin = result.scalar_one_or_none()
+        if admin is None:
+            session.add(Admin(telegram_id=telegram_id, role=role, added_by=added_by, is_active=True))
+        else:
+            admin.role = role
+            admin.added_by = added_by
+            admin.is_active = True
+
+
 async def is_admin(telegram_id: int) -> bool:
     async with session_scope() as session:
         result = await session.execute(
             select(Admin).where(Admin.telegram_id == telegram_id, Admin.is_active.is_(True))
         )
         return result.scalar_one_or_none() is not None
+
+
+async def has_appearance_access(telegram_id: int) -> bool:
+    """Allow only super admins and the dedicated appearance role to edit visual/text content."""
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Admin.role).where(Admin.telegram_id == telegram_id, Admin.is_active.is_(True))
+        )
+        role = str(result.scalar_one_or_none() or "")
+    return role in {"super", "appearance"}
 
 
 async def active_admin_ids() -> list[int]:
@@ -364,6 +390,9 @@ async def ticket_stats() -> TicketStats:
         waiting_user_count = await count_where("waiting_user")
         closed_count = await count_where("closed")
         return TicketStats(open_count, waiting_admin_count, waiting_user_count, closed_count)
+
+
+
 
 
 

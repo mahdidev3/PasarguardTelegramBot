@@ -1,4 +1,3 @@
-
 """Phase 1 ticket router.
 
 This router is included before the legacy catch-all router, so ticket buttons and
@@ -101,14 +100,11 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) 
 
 
 async def render_ticket(ticket: Any, admin_view: bool = False) -> str:
-    category = TICKET_CATEGORY_LABELS.get(ticket.category, ticket.category)
     status = TICKET_STATUS_LABELS.get(ticket.status, ticket.status)
     priority = TICKET_PRIORITY_LABELS.get(ticket.priority, ticket.priority)
     assignee = await admin_assignee_label(getattr(ticket, "assigned_admin_id", None), admin_view=admin_view)
     text = header("🎫 تیکت", f"#{ticket.id}")
     text += f"👤 کاربر: <code>{ticket.user_telegram_id}</code>\n"
-    text += f"📌 دسته: <b>{h(category)}</b>\n"
-    text += f"🔗 ارتباط: <code>{h(ticket.related_type)}:{h(ticket.related_id or '-')}</code>\n"
     text += f"🚦 وضعیت: <b>{h(status)}</b>\n"
     text += f"⚡ اولویت: <b>{h(priority)}</b>\n"
     text += f"👮 مسئول: <b>{h(assignee)}</b>\n"
@@ -239,37 +235,51 @@ async def ticket_new(callback: CallbackQuery, state: FSMContext) -> None:
     await edit_or_answer(
         callback,
         header("🎫 تیکت جدید")
-        + "نوع مشکل را انتخاب کنید. اگر مشکل مربوط به سرویس یا سفارش خاصی است، همان گزینه را بزنید و بعد در عنوان/متن تیکت شناسه، نام سرویس یا شماره سفارش را هم بنویسید.",
+        + "عنوان تیکت را انتخاب کنید. اگر هیچ‌کدام مناسب نبود، «موارد دیگر» را بزنید و عنوان دلخواه خودتان را وارد کنید.",
         ticket_category_kb(),
     )
 
 
 @ticket_router.callback_query(F.data.startswith("ticket_cat:"))
 async def ticket_category(callback: CallbackQuery, state: FSMContext) -> None:
-    category = callback.data.split(":", 1)[1]
-    if category not in TICKET_CATEGORY_LABELS:
-        await callback.answer("نوع تیکت نامعتبر است.", show_alert=True)
+    selected_key = callback.data.split(":", 1)[1]
+    if selected_key not in TICKET_CATEGORY_LABELS:
+        await callback.answer("عنوان تیکت نامعتبر است.", show_alert=True)
         return
+
+    if selected_key == "other":
+        await state.update_data(
+            ticket_flow={
+                "category": "general",
+                "related_type": "general",
+                "related_id": None,
+            }
+        )
+        await state.set_state(TicketStates.waiting_subject)
+        await edit_or_answer(
+            callback,
+            header("🧾 عنوان تیکت", "موارد دیگر")
+            + "یک عنوان کوتاه و واضح برای تیکت وارد کنید.\n\nمثلاً: <code>درخواست بررسی حساب</code>",
+            ticket_subject_kb(),
+        )
+        return
+
+    subject = TICKET_CATEGORY_LABELS.get(selected_key, selected_key)
     await state.update_data(
         ticket_flow={
-            "category": category,
-            "related_type": category if category != "general" else "general",
+            "category": "general",
+            "related_type": "general",
             "related_id": None,
+            "subject": subject[:255],
         }
     )
-    await state.set_state(TicketStates.waiting_subject)
-    selected = TICKET_CATEGORY_LABELS.get(category, category)
-    hint = ""
-    if category == "service":
-        hint = "\n\nاگر این تیکت مربوط به سرویس خاصی است، نام یا شناسه سرویس را در عنوان یا متن تیکت بنویسید."
-    elif category == "order":
-        hint = "\n\nاگر این تیکت مربوط به سفارش خاصی است، شماره سفارش را در عنوان یا متن تیکت بنویسید."
+    await state.set_state(TicketStates.waiting_body)
     await edit_or_answer(
         callback,
-        header("🧾 عنوان تیکت", selected)
-        + "یک عنوان کوتاه وارد کنید.\n\nمثلاً: <code>مشکل اتصال سرویس</code> یا <code>سوال درباره کیف پول</code>"
-        + hint,
-        ticket_subject_kb(),
+        header("✉️ متن تیکت", subject)
+        + "حالا توضیح کامل تیکت را فقط در یک پیام بفرستید.\n\n"
+        + "اگر عکس، ویدیو یا فایل دارید، توضیح را در کپشن همان پیام بنویسید. اگر ویس می‌فرستید، همان ویس به عنوان پیام تیکت ثبت می‌شود.",
+        ticket_body_kb(),
     )
 
 
@@ -328,13 +338,12 @@ async def ticket_body(message: Message, state: FSMContext) -> None:
     await message.answer(
         header("✅ تیکت ساخته شد", f"#{ticket.id}")
         + "پیام شما ثبت شد و ادمین‌ها می‌توانند پاسخ بدهند.",
-        reply_markup=user_ticket_view_kb(ticket.id),
+        reply_markup=user_ticket_view_kb(ticket.id, ticket.status),
     )
     await notify_admins(
         message.bot,
         header("🆕 تیکت جدید", f"#{ticket.id}")
         + f"👤 کاربر: <code>{uid}</code>\n"
-        + f"📌 دسته: <b>{h(TICKET_CATEGORY_LABELS.get(flow['category'], flow['category']))}</b>\n"
         + f"🧾 عنوان: <b>{h(flow['subject'])}</b>",
     )
 
@@ -362,7 +371,7 @@ async def ticket_view(callback: CallbackQuery) -> None:
     if not ticket or ticket.user_telegram_id != uid:
         await callback.answer("تیکت پیدا نشد.", show_alert=True)
         return
-    await edit_or_answer(callback, await render_ticket(ticket), user_ticket_view_kb(ticket_id))
+    await edit_or_answer(callback, await render_ticket(ticket), user_ticket_view_kb(ticket_id, ticket.status))
 
 
 @ticket_router.callback_query(F.data.startswith("ticket_reply:"))
@@ -380,7 +389,7 @@ async def ticket_reply_start(callback: CallbackQuery, state: FSMContext) -> None
         callback,
         header("✉️ پاسخ تیکت")
         + "پاسخ، فایل، عکس، ویدیو یا ویس را تا حد ممکن در یک پیام بفرستید. اگر فایل/عکس/ویدیو دارید، توضیح را در کپشن همان پیام بنویسید.",
-        user_ticket_view_kb(ticket_id),
+        user_ticket_view_kb(ticket_id, ticket.status),
     )
 
 
@@ -397,7 +406,7 @@ async def ticket_user_reply_finish(message: Message, state: FSMContext) -> None:
     payload = extract_message_payload(message)
     await add_ticket_message(ticket_id, "user", uid, **payload)
     await state.clear()
-    await message.answer("✅ پاسخ شما ثبت شد.", reply_markup=user_ticket_view_kb(ticket_id))
+    await message.answer("✅ پاسخ شما ثبت شد.", reply_markup=user_ticket_view_kb(ticket_id, ticket.status))
     await notify_admins(message.bot, header("📨 پاسخ جدید کاربر", f"تیکت #{ticket_id}") + f"👤 کاربر: <code>{uid}</code>")
 
 
@@ -709,6 +718,9 @@ async def admin_ticket_file_send(callback: CallbackQuery) -> None:
         await callback.answer("فایل ارسال شد.")
     except Exception:
         await callback.answer("ارسال فایل ناموفق بود. شاید فایل از سمت تلگرام در دسترس نباشد.", show_alert=True)
+
+
+
 
 
 

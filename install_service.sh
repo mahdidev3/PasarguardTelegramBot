@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -39,6 +38,9 @@ systemctl --no-pager --full status "$SERVICE_NAME" || true
 echo
  echo "Installed and started: $SERVICE_NAME"
 echo "Logs: journalctl -u $SERVICE_NAME -f"
+
+
+
 
 
 
