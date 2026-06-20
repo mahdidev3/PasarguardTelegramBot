@@ -40,7 +40,7 @@ from app.bootstrap import bootstrap_phase1
 from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
-from app.services.ticket_service import upsert_admin_role
+from app.services.ticket_service import deactivate_admin_role, upsert_admin_role
 from app.services.plan_service import upsert_plan_from_line
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
@@ -618,6 +618,7 @@ def ensure_admin_schema() -> None:
             CREATE TABLE IF NOT EXISTS admins (
                 telegram_id INTEGER PRIMARY KEY,
                 role TEXT NOT NULL DEFAULT 'support',
+                display_name TEXT,
                 added_by INTEGER,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
@@ -790,6 +791,7 @@ def ensure_admin_schema() -> None:
             ("users", "locked_notice", "ALTER TABLE users ADD COLUMN locked_notice TEXT"),
             ("users", "admin_note", "ALTER TABLE users ADD COLUMN admin_note TEXT"),
             ("users", "deleted_at", "ALTER TABLE users ADD COLUMN deleted_at TEXT"),
+            ("admins", "display_name", "ALTER TABLE admins ADD COLUMN display_name TEXT"),
             ("services", "admin_note", "ALTER TABLE services ADD COLUMN admin_note TEXT"),
             ("services", "locked_reason", "ALTER TABLE services ADD COLUMN locked_reason TEXT"),
             ("services", "pasarguard_user_id", "ALTER TABLE services ADD COLUMN pasarguard_user_id INTEGER"),
@@ -826,20 +828,20 @@ def ensure_admin_schema() -> None:
         for admin_id in BOOTSTRAP_SUPER_ADMIN_IDS:
             conn.execute(
                 """
-                INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
-                VALUES (?, 'super', NULL, 1, ?)
-                ON CONFLICT(telegram_id) DO UPDATE SET role = 'super', is_active = 1
+                INSERT INTO admins (telegram_id, role, display_name, added_by, is_active, created_at)
+                VALUES (?, 'super', ?, NULL, 1, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET role = 'super', is_active = 1, display_name = COALESCE(admins.display_name, excluded.display_name)
                 """,
-                (admin_id, now_iso()),
+                (admin_id, str(admin_id), now_iso()),
             )
         for admin_id in SALES_ADMIN_CHAT_IDS:
             conn.execute(
                 """
-                INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
-                VALUES (?, 'sales', NULL, 1, ?)
-                ON CONFLICT(telegram_id) DO UPDATE SET role = CASE WHEN role = 'super' THEN role ELSE 'sales' END, is_active = 1
+                INSERT INTO admins (telegram_id, role, display_name, added_by, is_active, created_at)
+                VALUES (?, 'sales', ?, NULL, 1, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET role = CASE WHEN role = 'super' THEN role ELSE 'sales' END, is_active = 1, display_name = COALESCE(admins.display_name, excluded.display_name)
                 """,
-                (admin_id, now_iso()),
+                (admin_id, str(admin_id), now_iso()),
             )
         defaults = {
             "bot_locked": "0",
@@ -925,6 +927,60 @@ def admin_log(admin_id: int, action: str, target_type: str = "", target_id: Any 
             "INSERT INTO admin_logs (admin_telegram_id, action, target_type, target_id, details, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (admin_id, action, target_type, str(target_id or ""), details, now_iso()),
         )
+        conn.commit()
+
+
+def admin_display_name(row_or_id: Any) -> str:
+    """Return the admin display name. If it is empty, use the chat id as the name."""
+    try:
+        if isinstance(row_or_id, sqlite3.Row):
+            if "display_name" in row_or_id.keys() and row_or_id["display_name"]:
+                return str(row_or_id["display_name"])
+            return str(row_or_id["telegram_id"])
+    except Exception:
+        pass
+    return str(row_or_id or "-")
+
+
+def get_admin_record(telegram_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM admins WHERE telegram_id = ?", (telegram_id,)).fetchone()
+
+
+def upsert_admin_local(telegram_id: int, role: str, added_by: int | None, display_name: str | None = None) -> None:
+    clean_name = (display_name or str(telegram_id)).strip() or str(telegram_id)
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO admins (telegram_id, role, display_name, added_by, is_active, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                role = excluded.role,
+                display_name = excluded.display_name,
+                added_by = COALESCE(excluded.added_by, admins.added_by),
+                is_active = 1
+            """,
+            (telegram_id, role, clean_name, added_by, now_iso()),
+        )
+        conn.commit()
+
+
+def set_admin_display_name_local(telegram_id: int, display_name: str) -> None:
+    clean_name = (display_name or str(telegram_id)).strip() or str(telegram_id)
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE admins SET display_name = ? WHERE telegram_id = ?", (clean_name, telegram_id))
+        conn.commit()
+
+
+def set_admin_active_local(telegram_id: int, is_active: bool) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE admins SET is_active = ? WHERE telegram_id = ?", (1 if is_active else 0, telegram_id))
+        conn.commit()
+
+
+def set_admin_role_local(telegram_id: int, role: str, changed_by: int | None = None) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE admins SET role = ?, added_by = COALESCE(?, added_by), is_active = 1 WHERE telegram_id = ?", (role, changed_by, telegram_id))
         conn.commit()
 
 
@@ -1990,6 +2046,8 @@ class AdminStates(StatesGroup):
     waiting_add_admin_line = State()  # legacy fallback only
     waiting_add_admin_chat_id = State()
     waiting_add_admin_role = State()
+    waiting_add_admin_name = State()
+    waiting_edit_admin_name = State()
     waiting_user_note = State()
     waiting_manual_service_amount = State()
     waiting_card_line = State()  # legacy fallback only
@@ -2419,10 +2477,53 @@ def admin_admins_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def admin_role_select_kb() -> InlineKeyboardMarkup:
+def admin_role_select_kb(back: str = "adm_admins") -> InlineKeyboardMarkup:
     rows = [[(f"{role} — {ADMIN_ROLE_DESCRIPTIONS.get(role, '')[:28]}", f"adm_admin_role:{role}")] for role in ADMIN_ROLE_PERMISSIONS.keys()]
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_edit_role_select_kb(uid: int) -> InlineKeyboardMarkup:
+    rows = [[(f"{role} — {ADMIN_ROLE_DESCRIPTIONS.get(role, '')[:28]}", f"adm_admin_edit_role:{uid}:{role}")] for role in ADMIN_ROLE_PERMISSIONS.keys()]
+    rows.append([("⬅️ بازگشت", f"adm_admin_view:{uid}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_name_skip_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("استفاده از چت‌آیدی به عنوان نام", "adm_admin_name_skip")],
+        [("⬅️ بازگشت", "adm_admin_add"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_list_kb(rows_data: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for a in rows_data[:50]:
+        status = "✅" if int(a["is_active"]) else "⛔"
+        rows.append([(f"{status} {admin_display_name(a)} — {a['role']}", f"adm_admin_view:{a['telegram_id']}")])
     rows.append([("⬅️ بازگشت", "adm_admins"), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
+
+
+def admin_detail_kb(admin_row: sqlite3.Row, viewer_id: int) -> InlineKeyboardMarkup:
+    uid = int(admin_row["telegram_id"])
+    active = int(admin_row["is_active"]) == 1
+    rows: list[list[tuple[str, str]]] = [
+        [("✏️ تغییر نام", f"adm_admin_edit_name:{uid}"), ("👮 تغییر نقش", f"adm_admin_change_role:{uid}")],
+    ]
+    if active:
+        rows.append([("🗑 حذف/غیرفعال کردن ادمین", f"adm_admin_delete_ask:{uid}")])
+    else:
+        rows.append([("✅ فعال‌سازی دوباره", f"adm_admin_restore:{uid}")])
+    rows.append([("⬅️ لیست ادمین‌ها", "adm_admin_list"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_delete_confirm_kb(uid: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ بله، حذف/غیرفعال شود", f"adm_admin_delete_do:{uid}")],
+        [("❌ لغو", f"adm_admin_view:{uid}"), ("👑 منوی ادمین", "adm_home")],
+    ])
 
 
 def coupon_scope_select_kb() -> InlineKeyboardMarkup:
@@ -6257,7 +6358,13 @@ async def admin_admins(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "*"):
         await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
-    await edit_or_answer(callback, header("👮 مدیریت ادمین‌ها") + "ادمین جدید اضافه کنید یا لیست ادمین‌ها را ببینید.", admin_admins_kb())
+    await edit_or_answer(
+        callback,
+        header("👮 مدیریت ادمین‌ها")
+        + "اینجا می‌توانید ادمین اضافه کنید، برای ادمین‌ها نام نمایشی بگذارید، نقششان را ویرایش کنید یا آن‌ها را حذف/غیرفعال کنید.\n\n"
+        + "اگر نامی برای ادمین ثبت نشود، همان چت‌آیدی به عنوان نام نمایش داده می‌شود.",
+        admin_admins_kb(),
+    )
 
 
 @router.callback_query(F.data == "adm_admin_add")
@@ -6265,6 +6372,7 @@ async def admin_admin_add_start(callback: CallbackQuery, state: FSMContext) -> N
     if not require_admin_id(callback.from_user.id, "*"):
         await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
+    await state.clear()
     await state.set_state(AdminStates.waiting_add_admin_chat_id)
     await edit_or_answer(callback, header("➕ اضافه کردن ادمین", "مرحله ۱") + "چت‌آیدی عددی ادمین جدید را وارد کنید. اگر چت‌آیدی خودش را نمی‌داند، از ربات‌هایی مثل userinfobot می‌تواند بگیرد.", admin_back_kb("adm_admins"))
 
@@ -6288,7 +6396,7 @@ async def admin_admin_chat_id_step(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("adm_admin_role:"))
-async def admin_admin_role_finish(callback: CallbackQuery, state: FSMContext) -> None:
+async def admin_admin_role_step(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "*"):
         await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
@@ -6301,23 +6409,70 @@ async def admin_admin_role_finish(callback: CallbackQuery, state: FSMContext) ->
     if not uid:
         await callback.answer("چت‌آیدی ثبت نشده است؛ دوباره شروع کنید.", show_alert=True)
         return
-    with closing(db.connect()) as conn:
-        conn.execute(
-            """
-            INSERT INTO admins (telegram_id, role, added_by, is_active, created_at)
-            VALUES (?, ?, ?, 1, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET role = excluded.role, is_active = 1
-            """,
-            (uid, role, callback.from_user.id, now_iso()),
-        )
-        conn.commit()
+    await state.update_data(target_admin_role=role)
+    await state.set_state(AdminStates.waiting_add_admin_name)
+    await edit_or_answer(
+        callback,
+        header("نام ادمین", "مرحله ۳")
+        + f"برای ادمین <code>{uid}</code> یک نام نمایشی وارد کنید.\n\n"
+        + "اگر نام نمی‌خواهید، دکمه زیر را بزنید تا همان چت‌آیدی به عنوان نام ذخیره شود.",
+        admin_name_skip_kb(),
+    )
+
+
+async def finish_admin_add(message_or_callback: Any, state: FSMContext, display_name: str | None) -> None:
+    data = await state.get_data()
+    uid = int(data.get("target_admin_id", 0))
+    role = str(data.get("target_admin_role") or "")
+    actor_id = int(message_or_callback.from_user.id)
+    if not uid or role not in ADMIN_ROLE_PERMISSIONS:
+        await state.clear()
+        if isinstance(message_or_callback, CallbackQuery):
+            await message_or_callback.answer("اطلاعات ناقص است؛ دوباره شروع کنید.", show_alert=True)
+        else:
+            await message_or_callback.answer("اطلاعات ناقص است؛ دوباره شروع کنید.")
+        return
+    clean_name = (display_name or str(uid)).strip() or str(uid)
+    upsert_admin_local(uid, role, actor_id, clean_name)
     try:
-        await upsert_admin_role(uid, role, callback.from_user.id)
+        await upsert_admin_role(uid, role, actor_id, clean_name)
     except Exception as exc:
         logger.warning("Failed to sync admin %s to PostgreSQL role table: %s", uid, exc)
-    admin_log(callback.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
+    admin_log(actor_id, "ADMIN_UPSERT", "admin", uid, f"role={role}, name={clean_name}")
     await state.clear()
-    await edit_or_answer(callback, header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.\n{h(ADMIN_ROLE_DESCRIPTIONS.get(role, ''))}", admin_admins_kb())
+    text = (
+        header("✅ ادمین ذخیره شد")
+        + f"نام: <b>{h(clean_name)}</b>\n"
+        + f"چت‌آیدی: <code>{uid}</code>\n"
+        + f"سطح: <b>{h(role)}</b>\n\n"
+        + h(ADMIN_ROLE_DESCRIPTIONS.get(role, ""))
+    )
+    if isinstance(message_or_callback, CallbackQuery):
+        await edit_or_answer(message_or_callback, text, admin_admins_kb())
+    else:
+        await message_or_callback.answer(text, reply_markup=admin_admins_kb())
+
+
+@router.message(AdminStates.waiting_add_admin_name)
+async def admin_admin_name_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    name = (message.text or "").strip()
+    if len(name) > 80:
+        await message.answer("❌ نام ادمین حداکثر می‌تواند ۸۰ کاراکتر باشد.")
+        return
+    await finish_admin_add(message, state, name)
+
+
+@router.callback_query(F.data == "adm_admin_name_skip")
+async def admin_admin_name_skip(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    data = await state.get_data()
+    uid = int(data.get("target_admin_id", 0) or 0)
+    await finish_admin_add(callback, state, str(uid) if uid else None)
 
 
 @router.callback_query(F.data == "adm_admin_list")
@@ -6326,12 +6481,203 @@ async def admin_admin_list(callback: CallbackQuery) -> None:
         await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
         return
     with closing(db.connect()) as conn:
-        rows = list(conn.execute("SELECT * FROM admins ORDER BY created_at DESC LIMIT 50").fetchall())
+        rows = list(conn.execute("SELECT * FROM admins ORDER BY is_active DESC, created_at DESC LIMIT 50").fetchall())
     text = header("📋 لیست ادمین‌ها")
-    for a in rows:
-        active = "✅" if int(a["is_active"]) else "⛔"
-        text += f"{active} <code>{a['telegram_id']}</code> — <b>{h(a['role'])}</b> — {h(a['created_at'][:10])}\n"
-    await edit_or_answer(callback, text, admin_admins_kb())
+    if not rows:
+        text += "ادمینی ثبت نشده است."
+    else:
+        text += "برای ویرایش یا حذف، روی ادمین بزنید.\n\n"
+        for a in rows:
+            active = "✅ فعال" if int(a["is_active"]) else "⛔ غیرفعال"
+            text += f"{active} — <b>{h(admin_display_name(a))}</b> — <code>{a['telegram_id']}</code> — نقش: <b>{h(a['role'])}</b>\n"
+    await edit_or_answer(callback, text, admin_list_kb(rows))
+
+
+@router.callback_query(F.data.startswith("adm_admin_view:"))
+async def admin_admin_view(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid_s = callback.data.split(":", 1)[1]
+    if not uid_s.lstrip("-").isdigit():
+        await callback.answer("شناسه معتبر نیست.", show_alert=True)
+        return
+    row = get_admin_record(int(uid_s))
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    active = "✅ فعال" if int(row["is_active"]) else "⛔ غیرفعال"
+    bootstrap_note = "\n⚠️ این ادمین از ENV به عنوان سوپرادمین اصلی تعریف شده و با ری‌استارت دوباره فعال می‌شود." if int(row["telegram_id"]) in BOOTSTRAP_SUPER_ADMIN_IDS else ""
+    text = (
+        header("👮 جزئیات ادمین")
+        + f"نام: <b>{h(admin_display_name(row))}</b>\n"
+        + f"چت‌آیدی: <code>{row['telegram_id']}</code>\n"
+        + f"نقش: <b>{h(row['role'])}</b>\n"
+        + f"وضعیت: <b>{active}</b>\n"
+        + f"تاریخ اضافه‌شدن: <code>{h(row['created_at'][:16])}</code>\n"
+        + bootstrap_note
+    )
+    await edit_or_answer(callback, text, admin_detail_kb(row, callback.from_user.id))
+
+
+@router.callback_query(F.data.startswith("adm_admin_edit_name:"))
+async def admin_admin_edit_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_edit_admin_name)
+    await state.update_data(edit_admin_id=uid)
+    await edit_or_answer(
+        callback,
+        header("✏️ تغییر نام ادمین")
+        + f"نام فعلی: <b>{h(admin_display_name(row))}</b>\n"
+        + f"چت‌آیدی: <code>{uid}</code>\n\n"
+        + "نام جدید را بفرستید. اگر نام را خالی یا فقط خط تیره <code>-</code> بفرستید، همان چت‌آیدی به عنوان نام ذخیره می‌شود.",
+        admin_back_kb(f"adm_admin_view:{uid}"),
+    )
+
+
+@router.message(AdminStates.waiting_edit_admin_name)
+async def admin_admin_edit_name_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    uid = int(data.get("edit_admin_id", 0) or 0)
+    row = get_admin_record(uid)
+    if not row:
+        await state.clear()
+        await message.answer("ادمین پیدا نشد.", reply_markup=admin_admins_kb())
+        return
+    raw = (message.text or "").strip()
+    name = str(uid) if raw in {"", "-"} else raw
+    if len(name) > 80:
+        await message.answer("❌ نام ادمین حداکثر می‌تواند ۸۰ کاراکتر باشد.")
+        return
+    set_admin_display_name_local(uid, name)
+    try:
+        await upsert_admin_role(uid, str(row["role"]), message.from_user.id if message.from_user else None, name)
+    except Exception as exc:
+        logger.warning("Failed to sync admin display name %s to PostgreSQL: %s", uid, exc)
+    admin_log(message.from_user.id if message.from_user else 0, "ADMIN_NAME_UPDATE", "admin", uid, f"name={name}")
+    await state.clear()
+    await message.answer(header("✅ نام ادمین تغییر کرد") + f"نام جدید: <b>{h(name)}</b>\nچت‌آیدی: <code>{uid}</code>", reply_markup=admin_detail_kb(get_admin_record(uid), message.from_user.id if message.from_user else 0))
+
+
+@router.callback_query(F.data.startswith("adm_admin_change_role:"))
+async def admin_admin_change_role(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    if uid in BOOTSTRAP_SUPER_ADMIN_IDS:
+        await callback.answer("نقش سوپرادمین اصلی که در ENV تعریف شده قابل تغییر نیست.", show_alert=True)
+        return
+    text = header("👮 تغییر نقش ادمین") + f"ادمین: <b>{h(admin_display_name(row))}</b>\nچت‌آیدی: <code>{uid}</code>\nنقش فعلی: <b>{h(row['role'])}</b>\n\nنقش جدید را انتخاب کنید."
+    await edit_or_answer(callback, text, admin_edit_role_select_kb(uid))
+
+
+@router.callback_query(F.data.startswith("adm_admin_edit_role:"))
+async def admin_admin_edit_role_finish(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    try:
+        _, uid_s, role = callback.data.split(":", 2)
+        uid = int(uid_s)
+    except Exception:
+        await callback.answer("اطلاعات نقش معتبر نیست.", show_alert=True)
+        return
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    if uid in BOOTSTRAP_SUPER_ADMIN_IDS:
+        await callback.answer("نقش سوپرادمین اصلی که در ENV تعریف شده قابل تغییر نیست.", show_alert=True)
+        return
+    if role not in ADMIN_ROLE_PERMISSIONS:
+        await callback.answer("نقش معتبر نیست.", show_alert=True)
+        return
+    set_admin_role_local(uid, role, callback.from_user.id)
+    try:
+        await upsert_admin_role(uid, role, callback.from_user.id, admin_display_name(row))
+    except Exception as exc:
+        logger.warning("Failed to sync admin role %s to PostgreSQL: %s", uid, exc)
+    admin_log(callback.from_user.id, "ADMIN_ROLE_UPDATE", "admin", uid, f"role={role}")
+    await edit_or_answer(callback, header("✅ نقش ادمین تغییر کرد") + f"ادمین: <b>{h(admin_display_name(row))}</b>\nچت‌آیدی: <code>{uid}</code>\nنقش جدید: <b>{h(role)}</b>", admin_detail_kb(get_admin_record(uid), callback.from_user.id))
+
+
+@router.callback_query(F.data.startswith("adm_admin_delete_ask:"))
+async def admin_admin_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    if uid == callback.from_user.id:
+        await callback.answer("نمی‌توانید دسترسی خودتان را حذف کنید.", show_alert=True)
+        return
+    if uid in BOOTSTRAP_SUPER_ADMIN_IDS:
+        await callback.answer("این سوپرادمین از ENV تعریف شده و از داخل پنل حذف نمی‌شود.", show_alert=True)
+        return
+    text = header("🗑 حذف/غیرفعال کردن ادمین") + f"آیا مطمئن هستید می‌خواهید دسترسی <b>{h(admin_display_name(row))}</b> با چت‌آیدی <code>{uid}</code> را حذف/غیرفعال کنید؟"
+    await edit_or_answer(callback, text, admin_delete_confirm_kb(uid))
+
+
+@router.callback_query(F.data.startswith("adm_admin_delete_do:"))
+async def admin_admin_delete_do(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    if uid == callback.from_user.id:
+        await callback.answer("نمی‌توانید دسترسی خودتان را حذف کنید.", show_alert=True)
+        return
+    if uid in BOOTSTRAP_SUPER_ADMIN_IDS:
+        await callback.answer("این سوپرادمین از ENV تعریف شده و از داخل پنل حذف نمی‌شود.", show_alert=True)
+        return
+    set_admin_active_local(uid, False)
+    try:
+        await deactivate_admin_role(uid)
+    except Exception as exc:
+        logger.warning("Failed to deactivate admin %s in PostgreSQL: %s", uid, exc)
+    admin_log(callback.from_user.id, "ADMIN_DEACTIVATE", "admin", uid, f"name={admin_display_name(row)}")
+    await edit_or_answer(callback, header("✅ ادمین حذف/غیرفعال شد") + f"ادمین <b>{h(admin_display_name(row))}</b> دیگر به پنل مدیریت دسترسی ندارد.", admin_admins_kb())
+
+
+@router.callback_query(F.data.startswith("adm_admin_restore:"))
+async def admin_admin_restore(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپر ادمین اجازه دارد.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    row = get_admin_record(uid)
+    if not row:
+        await callback.answer("ادمین پیدا نشد.", show_alert=True)
+        return
+    set_admin_active_local(uid, True)
+    try:
+        await upsert_admin_role(uid, str(row["role"]), callback.from_user.id, admin_display_name(row))
+    except Exception as exc:
+        logger.warning("Failed to restore admin %s in PostgreSQL: %s", uid, exc)
+    admin_log(callback.from_user.id, "ADMIN_RESTORE", "admin", uid, f"role={row['role']}")
+    await edit_or_answer(callback, header("✅ ادمین فعال شد") + f"ادمین <b>{h(admin_display_name(row))}</b> دوباره فعال شد.", admin_detail_kb(get_admin_record(uid), callback.from_user.id))
 
 
 @router.callback_query(F.data == "adm_logs")

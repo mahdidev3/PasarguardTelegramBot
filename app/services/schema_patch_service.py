@@ -40,6 +40,9 @@ async def apply_runtime_schema_patches() -> None:
         await conn.execute(text("ALTER TABLE IF EXISTS services ADD COLUMN IF NOT EXISTS pasarguard_sync_status VARCHAR(40)"))
         await conn.execute(text("ALTER TABLE IF EXISTS services ADD COLUMN IF NOT EXISTS pasarguard_sync_error TEXT"))
 
+        # Admin display names for the admin-management panel.
+        await conn.execute(text("ALTER TABLE IF EXISTS admins ADD COLUMN IF NOT EXISTS display_name VARCHAR(120)"))
+
 
 
 

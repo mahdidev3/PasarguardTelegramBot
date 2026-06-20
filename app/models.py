@@ -129,6 +129,7 @@ class Admin(Base, TimestampMixin):
 
     telegram_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     role: Mapped[str] = mapped_column(String(32), default="support", nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(120))
     added_by: Mapped[int | None] = mapped_column(BigInteger)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 

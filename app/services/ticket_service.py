@@ -95,23 +95,38 @@ async def seed_bootstrap_admins(admin_ids: set[int]) -> None:
             result = await session.execute(select(Admin).where(Admin.telegram_id == admin_id))
             admin = result.scalar_one_or_none()
             if admin is None:
-                session.add(Admin(telegram_id=admin_id, role="super", is_active=True))
+                session.add(Admin(telegram_id=admin_id, role="super", display_name=str(admin_id), is_active=True))
             else:
                 admin.role = "super"
+                if not getattr(admin, "display_name", None):
+                    admin.display_name = str(admin_id)
                 admin.is_active = True
 
 
-async def upsert_admin_role(telegram_id: int, role: str, added_by: int | None = None) -> None:
+async def upsert_admin_role(telegram_id: int, role: str, added_by: int | None = None, display_name: str | None = None) -> None:
     """Keep the PostgreSQL admin table in sync with the legacy admin panel."""
     async with session_scope() as session:
         result = await session.execute(select(Admin).where(Admin.telegram_id == telegram_id))
         admin = result.scalar_one_or_none()
         if admin is None:
-            session.add(Admin(telegram_id=telegram_id, role=role, added_by=added_by, is_active=True))
+            session.add(Admin(telegram_id=telegram_id, role=role, added_by=added_by, display_name=(display_name or str(telegram_id)), is_active=True))
         else:
             admin.role = role
             admin.added_by = added_by
+            if display_name is not None:
+                admin.display_name = display_name or str(telegram_id)
+            elif not getattr(admin, "display_name", None):
+                admin.display_name = str(telegram_id)
             admin.is_active = True
+
+
+async def deactivate_admin_role(telegram_id: int) -> None:
+    """Disable an admin in PostgreSQL while keeping its audit/history row."""
+    async with session_scope() as session:
+        result = await session.execute(select(Admin).where(Admin.telegram_id == telegram_id))
+        admin = result.scalar_one_or_none()
+        if admin is not None:
+            admin.is_active = False
 
 
 async def is_admin(telegram_id: int) -> bool:
