@@ -47,3 +47,5 @@ echo "Logs: journalctl -u $SERVICE_NAME -f"
 
 
 
+
+

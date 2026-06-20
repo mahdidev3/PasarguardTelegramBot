@@ -3,15 +3,12 @@
 # فایل: .env.example
 ================================================================================
 
-
 BOT_TOKEN=8930264914:AAGOwZowZoxrUugR7UhVLyaLgLQluFfnBWs
 BOT_USERNAME=HowToSeeWorld_bot
 CHANNEL_USERNAME=HowTooSeeWorld
 CHANNEL_LINK=https://t.me/HowTooSeeWorld
 BRAND_NAME=HowTooSee | Premium VPN
-
 DATABASE_URL=postgresql+asyncpg://pasarguard_telegram_bot:89f8f2a7bffd053087849e960365175a38e4bea242aca51bbe94621d4292934d@127.0.0.1:5432/pasarguard_telegram_bot
-
 SUBSCRIPTION_BASE_URL=https://docdev.pangshanbebazar.ir:2087/sub
 REFERRAL_COMMISSION_PERCENT=10
 REFERRED_DISCOUNT_PERCENT=5
@@ -19,9 +16,7 @@ FREE_TEST_MB=150
 WALLET_MIN_TOPUP=50000
 RECEIPT_UPLOAD_WINDOW_MINUTES=20
 SERVICE_NAME_PREFIX=howtosee_
-
 ADMIN_CHAT_IDS=6413811117
-
 PASARGUARD_ENABLED=true
 PASARGUARD_BASE_URL=https://docdev.pangshanbebazar.ir:2087
 PASARGUARD_ADMIN_USERNAME=pasarguard_telegram_bot
@@ -33,17 +28,12 @@ PASARGUARD_MANAGED_PREFIX=HTS_BOT
 PASARGUARD_TEMPLATE_GROUP_IDS=1
 PASARGUARD_USERNAME_PREFIX=
 PASARGUARD_USERNAME_SUFFIX=
-
 SALES_ADMIN_CHAT_IDS=483137754
-
-
-
 
 
 ================================================================================
 # فایل: .gitignore
 ================================================================================
-
 
 # Python
 __pycache__/
@@ -97,10 +87,12 @@ merged_codes.txt
 
 
 
+
+
+
 ================================================================================
 # فایل: alembic.ini
 ================================================================================
-
 
 [alembic]
 script_location = app/migrations
@@ -149,12 +141,14 @@ datefmt = %H:%M:%S
 
 
 
+
+
+
 ================================================================================
 # فایل: app/__init__.py
 ================================================================================
 
-
-"""HowTooSee / Pasarguard bot package."""
+"""HowToSee / Pasarguard bot package."""
 
 __all__ = ["__version__"]
 
@@ -168,10 +162,12 @@ __version__ = "0.1.0-phase0"
 
 
 
+
+
+
 ================================================================================
 # فایل: app/bootstrap.py
 ================================================================================
-
 
 """Application bootstrap for the staged refactor."""
 
@@ -207,10 +203,12 @@ async def bootstrap_phase1() -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/config.py
 ================================================================================
-
 
 """Central configuration module.
 
@@ -294,9 +292,9 @@ class Settings:
 settings = Settings(
     bot_token=os.getenv("BOT_TOKEN", "").strip(),
     bot_username=os.getenv("BOT_USERNAME", "HowToSeeWorld_bot").strip().lstrip("@"),
-    channel_username=os.getenv("CHANNEL_USERNAME", "HowTooSeeWorld").strip().lstrip("@"),
+    channel_username=os.getenv("CHANNEL_USERNAME", "HowToSeeWorld").strip().lstrip("@"),
     channel_link=os.getenv("CHANNEL_LINK", "").strip(),
-    brand_name=os.getenv("BRAND_NAME", "HowTooSee | Premium VPN").strip(),
+    brand_name=os.getenv("BRAND_NAME", "HowToSee | Premium VPN").strip(),
     database_path=os.getenv("DATABASE_PATH", "bot.db").strip(),
     database_url=os.getenv("DATABASE_URL", "").strip(),
     subscription_base_url=os.getenv("SUBSCRIPTION_BASE_URL", "https://example.com/sub").rstrip("/"),
@@ -327,10 +325,12 @@ settings = Settings(
 
 
 
+
+
+
 ================================================================================
 # فایل: app/database.py
 ================================================================================
-
 
 """Async SQLAlchemy database setup for Phase 1.
 
@@ -415,10 +415,12 @@ async def init_database() -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/db.py
 ================================================================================
-
 
 """Compatibility re-export for the Phase 1 async database layer."""
 
@@ -440,12 +442,17 @@ __all__ = [
 
 
 
+
+
+
 ================================================================================
 # فایل: app/keyboards/__init__.py
 ================================================================================
 
-
 """Keyboard builders package."""
+
+
+
 
 
 
@@ -459,8 +466,10 @@ __all__ = [
 # فایل: app/keyboards/admin.py
 ================================================================================
 
-
 """Admin keyboard builders placeholder."""
+
+
+
 
 
 
@@ -474,8 +483,10 @@ __all__ = [
 # فایل: app/keyboards/backup.py
 ================================================================================
 
-
 """Backup keyboard builders placeholder."""
+
+
+
 
 
 
@@ -489,8 +500,10 @@ __all__ = [
 # فایل: app/keyboards/broadcast.py
 ================================================================================
 
-
 """Broadcast keyboard builders placeholder."""
+
+
+
 
 
 
@@ -504,8 +517,10 @@ __all__ = [
 # فایل: app/keyboards/plans.py
 ================================================================================
 
-
 """Plans keyboard builders placeholder."""
+
+
+
 
 
 
@@ -519,8 +534,10 @@ __all__ = [
 # فایل: app/keyboards/reports.py
 ================================================================================
 
-
 """Reports keyboard builders placeholder."""
+
+
+
 
 
 
@@ -533,7 +550,6 @@ __all__ = [
 ================================================================================
 # فایل: app/keyboards/tickets.py
 ================================================================================
-
 
 """Inline keyboards for Phase 1 ticket flows."""
 
@@ -567,11 +583,11 @@ def ticket_category_kb() -> InlineKeyboardMarkup:
 
 
 def ticket_subject_kb() -> InlineKeyboardMarkup:
-    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+    return inline([[('⬅️ تغییر عنوان', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
 
 
 def ticket_body_kb() -> InlineKeyboardMarkup:
-    return inline([[('⬅️ تغییر نوع مشکل', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
+    return inline([[('⬅️ تغییر عنوان', 'ticket_new'), ('🏠 منوی اصلی', 'home')]])
 
 
 def user_ticket_list_kb(ticket_rows: list[object], back: str = "ticket_home") -> InlineKeyboardMarkup:
@@ -582,13 +598,17 @@ def user_ticket_list_kb(ticket_rows: list[object], back: str = "ticket_home") ->
     return inline(rows)
 
 
-def user_ticket_view_kb(ticket_id: int) -> InlineKeyboardMarkup:
-    return inline(
-        [
-            [("✉️ ارسال پاسخ/فایل", f"ticket_reply:{ticket_id}"), ("✅ بستن تیکت", f"ticket_user_close:{ticket_id}")],
-            [("⬅️ تیکت‌های من", "ticket_my_open"), ("🏠 منوی اصلی", "home")],
-        ]
-    )
+def user_ticket_view_kb(ticket_id: int, status: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if status == "closed":
+        # A closed ticket must not show the "close ticket" button again.
+        rows.append([("✉️ ارسال پاسخ/بازگشایی", f"ticket_reply:{ticket_id}")])
+    else:
+        rows.append([("✉️ ارسال پاسخ/فایل", f"ticket_reply:{ticket_id}"), ("✅ بستن تیکت", f"ticket_user_close:{ticket_id}")])
+    rows.append([("⬅️ تیکت‌های من", "ticket_my_open"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
 
 
 def admin_ticket_home_kb() -> InlineKeyboardMarkup:
@@ -651,12 +671,17 @@ def confirm_cancel_kb(back_callback: str) -> InlineKeyboardMarkup:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/keyboards/user.py
 ================================================================================
 
-
 """User keyboard builders placeholder."""
+
+
+
 
 
 
@@ -669,7 +694,6 @@ def confirm_cancel_kb(back_callback: str) -> InlineKeyboardMarkup:
 ================================================================================
 # فایل: app/legacy_bot.py
 ================================================================================
-
 
 import asyncio
 import html
@@ -712,6 +736,7 @@ from app.bootstrap import bootstrap_phase1
 from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
+from app.services.ticket_service import upsert_admin_role
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
@@ -738,7 +763,7 @@ from app.routers.settings import settings_router
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger("howtoosee-bot")
+logger = logging.getLogger("howtosee-bot")
 
 
 # -----------------------------
@@ -746,9 +771,9 @@ logger = logging.getLogger("howtoosee-bot")
 # -----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "HowToSeeWorld_bot").strip().lstrip("@")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "HowTooSeeWorld").strip().lstrip("@")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "HowToSeeWorld").strip().lstrip("@")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", f"https://t.me/{CHANNEL_USERNAME}").strip()
-BRAND_NAME = os.getenv("BRAND_NAME", "HowTooSee | Premium VPN").strip()
+BRAND_NAME = os.getenv("BRAND_NAME", "HowToSee | Premium VPN").strip()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db").strip()
 SUBSCRIPTION_BASE_URL = os.getenv("SUBSCRIPTION_BASE_URL", "https://example.com/sub").rstrip("/")
 REFERRAL_COMMISSION_PERCENT = int(os.getenv("REFERRAL_COMMISSION_PERCENT", "10"))
@@ -1479,6 +1504,7 @@ ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
     "sales": {"dashboard", "orders", "payment_receipts"},
     "support": {"dashboard", "users", "services", "direct_message"},
     "marketing": {"dashboard", "broadcast", "coupons", "reports"},
+    "appearance": {"dashboard", "appearance"},
 }
 
 ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
@@ -1486,6 +1512,7 @@ ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
     "sales": "فقط مدیریت سفارش‌ها و بررسی رسیدهای کارت‌به‌کارت؛ بدون بلاک/حذف کاربر و بدون تغییر کیف پول.",
     "support": "پشتیبانی کاربران، مشاهده/مدیریت سرویس‌ها و ارسال پیام مستقیم؛ بدون دسترسی مالی حساس.",
     "marketing": "کمپین، پیام همگانی، کد تخفیف و گزارش‌ها؛ بدون دسترسی عملیاتی به کاربران/پرداخت.",
+    "appearance": "فقط تغییرات ظاهری ربات، متن‌ها، پیام‌ها، ایموجی‌ها و قالب‌های نمایشی.",
 }
 
 
@@ -1612,7 +1639,7 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     service_id: Optional[int] = None
     if plan_key.startswith("wallet_topup:"):
-        db.add_wallet(telegram_id, payable, "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
+        db.add_wallet(telegram_id, int(order["amount"]), "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
     elif plan_key in PLANS:
         service_name = (order["service_name"] if row_has(order, "service_name") and order["service_name"] else make_service_name(telegram_id))
         service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
@@ -2339,12 +2366,19 @@ def order_payment_kb(
     if allow_coupon:
         rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
     if is_wallet_topup:
-        rows.append([("💳 ثبت/ارسال رسید کارت‌به‌کارت", f"pay_card:{order_id}")])
+        rows.append([("💳 پرداخت", f"pay_methods:{order_id}")])
     elif allow_wallet and wallet_balance >= payable and wallet_balance >= 0:
         label = "✅ فعال‌سازی سفارش رایگان" if payable <= 0 else "💰 پرداخت و فعال‌سازی از کیف پول"
         rows.append([(label, f"pay_wallet:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
+
+
+def payment_methods_kb(order_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("💳 کارت‌به‌کارت", f"pay_card:{order_id}")],
+        [("⬅️ بازگشت به بررسی پرداخت", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")],
+    ])
 
 
 def wallet_shortfall(payable: int, wallet_balance: int) -> int:
@@ -2481,10 +2515,16 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("💰 کیف پول کاربران", "adm_wallet_start")],
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
-        [("✏️ تغییر متن‌ها", "adm_texts"), ("🔒 قفل بات", "adm_bot_lock")],
         [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
         [("🔌 Pasarguard", "adm_pasarguard")],
     ]
+    appearance_row: list[tuple[str, str]] = []
+    if admin_has(admin_id, "appearance"):
+        appearance_row.append(("🎨 تغییرات ظاهری ربات", "adm_texts"))
+    if admin_has(admin_id, "*"):
+        appearance_row.append(("🔒 قفل بات", "adm_bot_lock"))
+    if appearance_row:
+        rows.append(appearance_row)
     if admin_has(admin_id, "*"):
         rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
     rows.append([("🏠 منوی اصلی کاربر", "home")])
@@ -2525,12 +2565,16 @@ def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
             [("📝 یادداشت ادمین", f"adm_user_note:{uid}")],
             [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
         ])
-    lock_btn = ("🔓 باز کردن کاربر", f"adm_user_unlock:{uid}") if status != "active" else ("🔒 قفل با اطلاع", f"adm_user_lock_notify:{uid}")
+
+    status_row = (
+        [("✅ رفع بلاک با اطلاع", f"adm_user_unban_notify:{uid}"), ("✅ رفع بلاک بی‌صدا", f"adm_user_unban_silent:{uid}")]
+        if status in {"banned", "locked"} else
+        [("🚫 بلاک با اطلاع", f"adm_user_ban_notify:{uid}"), ("🚫 بلاک بی‌صدا", f"adm_user_ban_silent:{uid}")]
+    )
     return inline([
         [("📦 سرویس‌های کاربر", f"adm_user_services:{uid}"), ("🧾 سفارش‌ها", f"adm_user_orders:{uid}")],
         [("💰 تغییر کیف پول", f"adm_user_wallet:{uid}"), ("✉️ پیام مستقیم", f"adm_user_msg:{uid}")],
-        [lock_btn, ("🔕 قفل بی‌صدا", f"adm_user_lock_silent:{uid}")],
-        [("🚫 بلاک با اطلاع", f"adm_user_ban_notify:{uid}"), ("🚫 بلاک بی‌صدا", f"adm_user_ban_silent:{uid}")],
+        status_row,
         [("🗑 حذف کاربر", f"adm_user_delete:{uid}"), ("🎁 ریست تست رایگان", f"adm_user_reset_free:{uid}")],
         [("📝 یادداشت ادمین", f"adm_user_note:{uid}"), ("➕ ساخت سرویس دستی", f"adm_manual_service:{uid}")],
         [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
@@ -2675,11 +2719,13 @@ def admin_user_text(user: sqlite3.Row) -> str:
     orders = db.list_orders(int(user["telegram_id"]), 5)
     stats = db.referral_stats(int(user["telegram_id"]))
     status = user["status"] if row_has(user, "status") else "active"
+    if status == "locked":
+        status = "banned"
     username = f"@{user['username']}" if user["username"] else "ثبت نشده"
     note = user["admin_note"] if row_has(user, "admin_note") and user["admin_note"] else "ندارد"
     return (
         header("👤 پروفایل کاربر", str(user["telegram_id"]))
-        + f"👤 یوزرنیم: <b>{h(username)}</b>\n"
+        + f"👤 نام کاربری: <b>{h(username)}</b>\n"
         + f"🪪 نام: <b>{h(user['first_name'] or 'ثبت نشده')}</b>\n"
         + f"📅 عضویت: <code>{h(user['created_at'][:10])}</code>\n"
         + f"⛔ وضعیت: <b>{h(status)}</b>\n"
@@ -2855,10 +2901,11 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
     details = order_discount_details(int(order["id"]), order)
 
     if plan_key.startswith("wallet_topup:"):
-        text = header("💳 پرداخت شارژ کیف پول", f"سفارش #{order['id']}")
+        text = header("💳 بررسی شارژ کیف پول", f"سفارش #{order['id']}")
         text += f"💰 مبلغ شارژ کیف پول: <b>{fmt_money(amount)}</b>\n"
+        text += discount_lines(details)
         text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
-        text += "بعد از ارسال رسید و تأیید ادمین فروش، موجودی کیف پول شما به همین مقدار افزایش پیدا می‌کند."
+        text += "اگر کد تخفیف دارید، ابتدا آن را اعمال کنید. سپس دکمه پرداخت را بزنید و در مرحله بعد روش پرداخت را انتخاب کنید."
         return text, "wallet", payable
 
     if plan_key.startswith("addon:"):
@@ -3036,7 +3083,7 @@ def account_text(user: sqlite3.Row) -> str:
     return (
         header("📊 اطلاعات حساب شما")
         + f"🧾 شناسه کاربری: <code>{user['telegram_id']}</code>\n"
-        + f"👤 یوزرنیم: <b>{h(username)}</b>\n"
+        + f"👤 نام کاربری: <b>{h(username)}</b>\n"
         + f"💰 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n"
         + f"📦 سرویس‌های فعال: <b>{fmt_number(len(services))}</b>\n"
         + f"💎 دعوت‌های موفق: <b>{fmt_number(stats['rewarded'])}</b>\n"
@@ -3163,7 +3210,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
             back_callback,
             "⬅️ بازگشت",
             allow_wallet=not is_wallet_topup,
-            allow_coupon=not is_wallet_topup,
+            allow_coupon=True,
             is_wallet_topup=is_wallet_topup,
         )
     if isinstance(target, CallbackQuery):
@@ -3183,9 +3230,7 @@ def user_block_message(user_row: sqlite3.Row) -> Optional[str]:
     notice = user_row["locked_notice"] if row_has(user_row, "locked_notice") else None
     if notice:
         return str(notice)
-    if status == "locked":
-        return "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
-    if status == "banned":
+    if status in {"locked", "banned"}:
         return "🚫 دسترسی شما به ربات محدود شده است."
     if status == "deleted":
         return "این حساب از سیستم حذف شده است."
@@ -3355,9 +3400,6 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not order or order["status"] != "pending":
         await callback.answer("سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
-    if str(order["plan_key"]).startswith("wallet_topup:"):
-        await callback.answer("کد تخفیف برای شارژ کیف پول قابل استفاده نیست.", show_alert=True)
-        return
     await state.set_state(CouponStates.waiting_code)
     await state.update_data(order_id=order_id)
     text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید."
@@ -3428,6 +3470,27 @@ async def notify_sales_admins_about_receipt(bot: Bot, receipt_id: int) -> None:
             await bot.send_message(admin_id, receipt_notify_admin_text(order, receipt), reply_markup=receipt_admin_kb(receipt_id, int(order["id"])))
         except Exception as exc:
             logger.warning("Failed to notify sales admin %s about receipt %s: %s", admin_id, receipt_id, exc)
+
+
+@router.callback_query(F.data.startswith("pay_methods:"))
+async def pay_methods(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, telegram_id)
+    if not order or order["status"] not in {"pending", "payment_rejected"}:
+        await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
+        return
+    if not str(order["plan_key"]).startswith("wallet_topup:"):
+        await callback.answer("روش‌های پرداخت مستقیم برای خرید سرویس حذف شده است.", show_alert=True)
+        await show_order_payment(callback, telegram_id, order_id)
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    text = header("💳 انتخاب روش پرداخت", f"سفارش #{order_id}")
+    text += f"✅ مبلغ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
+    text += "لطفاً یکی از روش‌های پرداخت را انتخاب کنید. فعلاً فقط کارت‌به‌کارت فعال است."
+    await edit_or_answer(callback, text, payment_methods_kb(order_id))
 
 
 @router.callback_query(F.data.startswith("pay_card:"))
@@ -3717,14 +3780,14 @@ async def my_services_cb(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
     services = db.list_services(int(user["telegram_id"]))
     active = [s for s in services if s["status"] != "deleted"]
-    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را بسازید." if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
+    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را دریافت کنید" if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
     await edit_or_answer(callback, text, services_kb(services))
 
 
 async def show_my_services(message: Message, telegram_id: int) -> None:
     services = db.list_services(telegram_id)
     active = [s for s in services if s["status"] != "deleted"]
-    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را بسازید." if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
+    text = header("📦 سرویس‌های من") + ("هنوز سرویس فعالی ندارید. از بخش خرید سرویس می‌توانید اولین سرویس خود را دریافت کنید" if not active else "برای دیدن جزئیات، یکی از سرویس‌ها را انتخاب کنید:")
     await message.answer(text, reply_markup=services_kb(services))
 
 
@@ -4185,9 +4248,8 @@ async def wallet_topup_amount(message: Message, state: FSMContext) -> None:
             reply_markup=wallet_amount_kb(),
         )
         return
-    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "کارت به کارت")
+    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "none")
     await state.clear()
-    await message.answer(header("💳 ادامه شارژ کیف پول") + "برای تکمیل شارژ، رسید کارت‌به‌کارت را ثبت کنید. موجودی بعد از تأیید ادمین فروش اضافه می‌شود.")
     await show_order_payment(message, int(user["telegram_id"]), order_id)
 
 
@@ -4288,7 +4350,7 @@ async def admin_user_search_start(callback: CallbackQuery, state: FSMContext) ->
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_user_search)
-    await edit_or_answer(callback, header("🔎 جستجوی کاربر") + "چت‌آیدی، یوزرنیم، یا نام کاربر را وارد کنید.", admin_back_kb("adm_users"))
+    await edit_or_answer(callback, header("🔎 جستجوی کاربر") + "چت‌آیدی، نام کاربری، یا نام کاربر را وارد کنید.", admin_back_kb("adm_users"))
 
 
 @router.message(AdminStates.waiting_user_search)
@@ -4334,43 +4396,56 @@ async def admin_user_profile(callback: CallbackQuery, state: FSMContext) -> None
 
 @router.callback_query(F.data.startswith("adm_user_lock_notify:"))
 async def admin_user_lock_notify(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "users"):
-        await callback.answer("دسترسی ندارید.", show_alert=True)
-        return
-    uid = int(callback.data.split(":", 1)[1])
-    notice = "⛔ حساب شما موقتاً محدود شده است. برای پیگیری با پشتیبانی تماس بگیرید."
-    update_user_status(uid, "locked", "locked by admin", notice)
-    admin_log(callback.from_user.id, "USER_LOCK_NOTIFY", "user", uid, notice)
-    try:
-        await callback.bot.send_message(uid, notice)
-    except Exception:
-        pass
-    user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر با اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+    # Backward compatibility for old inline buttons: old "lock" now means "block".
+    await admin_user_ban_notify(callback)
 
 
 @router.callback_query(F.data.startswith("adm_user_lock_silent:"))
 async def admin_user_lock_silent(callback: CallbackQuery) -> None:
-    if not require_admin_id(callback.from_user.id, "users"):
-        await callback.answer("دسترسی ندارید.", show_alert=True)
-        return
-    uid = int(callback.data.split(":", 1)[1])
-    update_user_status(uid, "locked", "silent lock by admin", "")
-    admin_log(callback.from_user.id, "USER_LOCK_SILENT", "user", uid, "")
-    user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر قفل شد") + "کاربر بدون اطلاع‌رسانی قفل شد.", admin_user_kb(user))
+    # Backward compatibility for old inline buttons: old "lock" now means "block".
+    await admin_user_ban_silent(callback)
 
 
 @router.callback_query(F.data.startswith("adm_user_unlock:"))
 async def admin_user_unlock(callback: CallbackQuery) -> None:
+    # Backward compatibility for old inline buttons.
     if not require_admin_id(callback.from_user.id, "users"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     uid = int(callback.data.split(":", 1)[1])
     update_user_status(uid, "active", "", "")
-    admin_log(callback.from_user.id, "USER_UNLOCK", "user", uid, "")
+    admin_log(callback.from_user.id, "USER_UNBLOCK_COMPAT", "user", uid, "")
     user = get_user_admin(uid)
-    await edit_or_answer(callback, header("✅ کاربر باز شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "دسترسی کاربر دوباره فعال شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_unban_notify:"))
+async def admin_user_unban_notify(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    notice = "✅ دسترسی شما به ربات دوباره فعال شد."
+    update_user_status(uid, "active", "", "")
+    admin_log(callback.from_user.id, "USER_UNBAN_NOTIFY", "user", uid, notice)
+    try:
+        await callback.bot.send_message(uid, notice)
+    except Exception:
+        pass
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "کاربر با اطلاع‌رسانی از بلاک خارج شد.", admin_user_kb(user))
+
+
+@router.callback_query(F.data.startswith("adm_user_unban_silent:"))
+async def admin_user_unban_silent(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "users"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    update_user_status(uid, "active", "", "")
+    admin_log(callback.from_user.id, "USER_UNBAN_SILENT", "user", uid, "")
+    user = get_user_admin(uid)
+    await edit_or_answer(callback, header("✅ بلاک کاربر برداشته شد") + "کاربر بدون اطلاع‌رسانی از بلاک خارج شد.", admin_user_kb(user))
 
 
 @router.callback_query(F.data.startswith("adm_user_restore:"))
@@ -4486,7 +4561,7 @@ async def admin_wallet_start(callback: CallbackQuery, state: FSMContext) -> None
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_user_search)
-    await edit_or_answer(callback, header("💰 کیف پول کاربران") + "اول کاربر را با چت‌آیدی یا یوزرنیم جستجو کنید، سپس گزینه تغییر کیف پول را بزنید.", admin_back_kb("adm_home"))
+    await edit_or_answer(callback, header("💰 کیف پول کاربران") + "اول کاربر را با چت‌آیدی یا نام کاربری جستجو کنید، سپس گزینه تغییر کیف پول را بزنید.", admin_back_kb("adm_home"))
 
 
 @router.callback_query(F.data.startswith("adm_user_msg:"))
@@ -5087,7 +5162,7 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
         if is_wallet_topup:
             user_row = db.get_user(int(order["user_telegram_id"]))
             user_text = header("✅ شارژ کیف پول تأیید شد", f"سفارش #{order['id']}")
-            user_text += f"رسید پرداخت شما تأیید شد و مبلغ <b>{fmt_money(max(int(order['amount']) - int(order['discount_amount']), 0))}</b> به کیف پول شما اضافه شد.\n"
+            user_text += f"رسید پرداخت شما تأیید شد و مبلغ <b>{fmt_money(int(order['amount']))}</b> به کیف پول شما اضافه شد.\n"
             if user_row:
                 user_text += f"موجودی فعلی کیف پول: <b>{fmt_money(int(user_row['wallet_balance']))}</b>\n"
             if note:
@@ -5534,6 +5609,10 @@ async def admin_admin_role_finish(callback: CallbackQuery, state: FSMContext) ->
             (uid, role, callback.from_user.id, now_iso()),
         )
         conn.commit()
+    try:
+        await upsert_admin_role(uid, role, callback.from_user.id)
+    except Exception as exc:
+        logger.warning("Failed to sync admin %s to PostgreSQL role table: %s", uid, exc)
     admin_log(callback.from_user.id, "ADMIN_UPSERT", "admin", uid, f"role={role}")
     await state.clear()
     await edit_or_answer(callback, header("✅ ادمین ذخیره شد") + f"چت‌آیدی <code>{uid}</code> با سطح <b>{h(role)}</b> فعال شد.\n{h(ADMIN_ROLE_DESCRIPTIONS.get(role, ''))}", admin_admins_kb())
@@ -5609,10 +5688,12 @@ if __name__ == "__main__":
 
 
 
+
+
+
 ================================================================================
 # فایل: app/migrations/env.py
 ================================================================================
-
 
 from __future__ import annotations
 
@@ -5665,10 +5746,12 @@ else:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/migrations/README.md
 ================================================================================
-
 
 # Migrations
 
@@ -5693,10 +5776,12 @@ alembic upgrade head
 
 
 
+
+
+
 ================================================================================
 # فایل: app/migrations/script.py.mako
 ================================================================================
-
 
 """${message}
 
@@ -5729,6 +5814,9 @@ def downgrade() -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/migrations/versions/.gitkeep
 ================================================================================
@@ -5736,17 +5824,9 @@ def downgrade() -> None:
 
 
 
-
-
-
-
-
-
-
 ================================================================================
 # فایل: app/models.py
 ================================================================================
-
 
 """SQLAlchemy models for Phase 1 PostgreSQL storage.
 
@@ -6281,10 +6361,12 @@ class PasarguardRemoteSnapshot(Base):
 
 
 
+
+
+
 ================================================================================
 # فایل: app/repositories/__init__.py
 ================================================================================
-
 
 """Repository layer package.
 
@@ -6299,12 +6381,17 @@ Future phases move raw database queries here.
 
 
 
+
+
+
 ================================================================================
 # فایل: app/repositories/orders.py
 ================================================================================
 
-
 """Order repository placeholder."""
+
+
+
 
 
 
@@ -6318,8 +6405,10 @@ Future phases move raw database queries here.
 # فایل: app/repositories/services.py
 ================================================================================
 
-
 """Service repository placeholder."""
+
+
+
 
 
 
@@ -6332,7 +6421,6 @@ Future phases move raw database queries here.
 ================================================================================
 # فایل: app/repositories/users.py
 ================================================================================
-
 
 """User repository placeholder.
 
@@ -6347,10 +6435,12 @@ Phase 1 will move user reads/writes from app.legacy_bot.DB into this module.
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/__init__.py
 ================================================================================
-
 
 """Router package.
 
@@ -6365,10 +6455,12 @@ Feature routers will be moved here gradually from app.legacy_bot.
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/admin.py
 ================================================================================
-
 
 """Admin router placeholder for the staged refactor.
 
@@ -6384,10 +6476,12 @@ app.legacy_bot to keep behavior stable for testing.
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/backup.py
 ================================================================================
-
 
 """Phase 3 backup and restore admin router."""
 
@@ -6612,7 +6706,7 @@ async def restore_file_received(message: Message, state: FSMContext) -> None:
     if not message.document or not (message.document.file_name or "").endswith(".zip"):
         await message.answer("❌ لطفاً فایل ZIP بک‌آپ را ارسال کنید.")
         return
-    restore_dir = Path("/tmp/howtoosee_restore_uploads")
+    restore_dir = Path("/tmp/howtosee_restore_uploads")
     restore_dir.mkdir(parents=True, exist_ok=True)
     dest = restore_dir / f"restore-{message.from_user.id}-{message.document.file_unique_id}.zip"
     file_info = await message.bot.get_file(message.document.file_id)
@@ -6705,10 +6799,12 @@ async def restore_confirm(message: Message, state: FSMContext) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/broadcast.py
 ================================================================================
-
 
 """Phase 2 media/file/button broadcast router."""
 
@@ -6964,10 +7060,12 @@ async def admin_broadcast_send_confirmed(message: Message, state: FSMContext) ->
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/pasarguard.py
 ================================================================================
-
 
 """Phase 4 Pasarguard admin router.
 
@@ -7265,10 +7363,12 @@ async def pg_template_apply_finish(message: Message, state: FSMContext) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/plans.py
 ================================================================================
-
 
 """Phase 2 admin plan management router."""
 
@@ -7607,10 +7707,12 @@ async def admin_plans_sync(callback: CallbackQuery) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/reports.py
 ================================================================================
-
 
 """Phase 3 admin reports router: CSV/XLSX exports and usage report."""
 
@@ -7738,12 +7840,14 @@ async def build_all_reports(callback: CallbackQuery) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/settings.py
 ================================================================================
 
-
-"""Phase 2 editable text templates router."""
+"""Appearance/text customization router."""
 
 from __future__ import annotations
 
@@ -7757,7 +7861,7 @@ from aiogram.types import CallbackQuery, Message, InlineKeyboardButton, InlineKe
 
 from app.services.admin_audit_service import audit_log
 from app.services.text_template_service import get_template, list_templates, reset_template, update_template
-from app.services.ticket_service import is_admin
+from app.services.ticket_service import has_appearance_access
 
 settings_router = Router(name="phase2_settings")
 
@@ -7781,7 +7885,8 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 def text_home_kb() -> InlineKeyboardMarkup:
     return inline([
-        [("📋 لیست متن‌ها", "adm_texts_list")],
+        [("📋 متن‌ها و پیام‌ها", "adm_texts_list")],
+        [("🎨 راهنمای تغییرات ظاهری", "adm_appearance_help")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -7797,7 +7902,7 @@ def text_list_kb(rows_: list[Any]) -> InlineKeyboardMarkup:
 def text_view_kb(key: str) -> InlineKeyboardMarkup:
     return inline([
         [("✏️ ویرایش متن", f"adm_text_edit:{key}"), ("↩️ متن پیش‌فرض", f"adm_text_reset:{key}")],
-        [("⬅️ لیست متن‌ها", "adm_texts_list"), ("👑 منوی ادمین", "adm_home")],
+        [("⬅️ متن‌ها و پیام‌ها", "adm_texts_list"), ("👑 منوی ادمین", "adm_home")],
     ])
 
 
@@ -7815,21 +7920,35 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) 
 
 @settings_router.callback_query(F.data == "adm_texts")
 async def admin_texts(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    text = header("✏️ تغییر متن‌ها و پیام‌ها")
-    text += "از این بخش می‌توانید جمله‌ها و پیام‌های اصلی ربات را بدون تغییر کد ویرایش کنید."
+    text = header("🎨 تغییرات ظاهری ربات")
+    text += "از این بخش می‌توانید ظاهر متنی ربات را مدیریت کنید؛ مثل متن‌ها، پیام‌ها، ایموجی‌ها و قالب‌های HTML تلگرام. این بخش فقط برای سوپر ادمین و ادمین ظاهر فعال است."
+    await edit_or_answer(callback, text, text_home_kb())
+
+
+@settings_router.callback_query(F.data == "adm_appearance_help")
+async def admin_appearance_help(callback: CallbackQuery) -> None:
+    if not await has_appearance_access(callback.from_user.id):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    text = header("🎨 راهنمای تغییرات ظاهری")
+    text += (
+        "در حال حاضر تغییرات ظاهری از مسیر قالب‌های متنی انجام می‌شود؛ یعنی می‌توانید متن، ایموجی، تیترها و HTML مجاز تلگرام "
+        "مثل <code>&lt;b&gt;</code>، <code>&lt;i&gt;</code> و <code>&lt;code&gt;</code> را تغییر دهید.\n\n"
+        "برای تغییر واقعی دکمه‌ها و چیدمان، باید قالب/کیبورد مربوطه در کد اضافه شود؛ این پنل فعلاً نقطه مرکزی تغییرات ظاهری قابل ویرایش است."
+    )
     await edit_or_answer(callback, text, text_home_kb())
 
 
 @settings_router.callback_query(F.data == "adm_texts_list")
 async def admin_texts_list(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     rows = await list_templates()
-    text = header("📋 متن‌های قابل ویرایش")
+    text = header("📋 متن‌ها و پیام‌های قابل ویرایش")
     for tpl in rows:
         active = "✅" if tpl.is_active else "⛔"
         text += f"{active} <code>{h(tpl.key)}</code> — {h(tpl.title)} — <b>{h(tpl.group_name)}</b>\n"
@@ -7838,7 +7957,7 @@ async def admin_texts_list(callback: CallbackQuery) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_view:"))
 async def admin_text_view(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -7856,7 +7975,7 @@ async def admin_text_view(callback: CallbackQuery) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_edit:"))
 async def admin_text_edit(callback: CallbackQuery, state: FSMContext) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -7873,7 +7992,7 @@ async def admin_text_edit(callback: CallbackQuery, state: FSMContext) -> None:
 
 @settings_router.message(TextTemplateStates.waiting_body)
 async def admin_text_edit_finish(message: Message, state: FSMContext) -> None:
-    if not message.from_user or not await is_admin(message.from_user.id):
+    if not message.from_user or not await has_appearance_access(message.from_user.id):
         await message.answer("دسترسی ندارید.")
         return
     data = await state.get_data()
@@ -7889,7 +8008,7 @@ async def admin_text_edit_finish(message: Message, state: FSMContext) -> None:
 
 @settings_router.callback_query(F.data.startswith("adm_text_reset:"))
 async def admin_text_reset(callback: CallbackQuery) -> None:
-    if not await is_admin(callback.from_user.id):
+    if not await has_appearance_access(callback.from_user.id):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     key = callback.data.split(":", 1)[1]
@@ -7913,10 +8032,12 @@ async def admin_text_reset(callback: CallbackQuery) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/tickets.py
 ================================================================================
-
 
 """Phase 1 ticket router.
 
@@ -8020,14 +8141,11 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup=None) 
 
 
 async def render_ticket(ticket: Any, admin_view: bool = False) -> str:
-    category = TICKET_CATEGORY_LABELS.get(ticket.category, ticket.category)
     status = TICKET_STATUS_LABELS.get(ticket.status, ticket.status)
     priority = TICKET_PRIORITY_LABELS.get(ticket.priority, ticket.priority)
     assignee = await admin_assignee_label(getattr(ticket, "assigned_admin_id", None), admin_view=admin_view)
     text = header("🎫 تیکت", f"#{ticket.id}")
     text += f"👤 کاربر: <code>{ticket.user_telegram_id}</code>\n"
-    text += f"📌 دسته: <b>{h(category)}</b>\n"
-    text += f"🔗 ارتباط: <code>{h(ticket.related_type)}:{h(ticket.related_id or '-')}</code>\n"
     text += f"🚦 وضعیت: <b>{h(status)}</b>\n"
     text += f"⚡ اولویت: <b>{h(priority)}</b>\n"
     text += f"👮 مسئول: <b>{h(assignee)}</b>\n"
@@ -8158,37 +8276,51 @@ async def ticket_new(callback: CallbackQuery, state: FSMContext) -> None:
     await edit_or_answer(
         callback,
         header("🎫 تیکت جدید")
-        + "نوع مشکل را انتخاب کنید. اگر مشکل مربوط به سرویس یا سفارش خاصی است، همان گزینه را بزنید و بعد در عنوان/متن تیکت شناسه، نام سرویس یا شماره سفارش را هم بنویسید.",
+        + "عنوان تیکت را انتخاب کنید. اگر هیچ‌کدام مناسب نبود، «موارد دیگر» را بزنید و عنوان دلخواه خودتان را وارد کنید.",
         ticket_category_kb(),
     )
 
 
 @ticket_router.callback_query(F.data.startswith("ticket_cat:"))
 async def ticket_category(callback: CallbackQuery, state: FSMContext) -> None:
-    category = callback.data.split(":", 1)[1]
-    if category not in TICKET_CATEGORY_LABELS:
-        await callback.answer("نوع تیکت نامعتبر است.", show_alert=True)
+    selected_key = callback.data.split(":", 1)[1]
+    if selected_key not in TICKET_CATEGORY_LABELS:
+        await callback.answer("عنوان تیکت نامعتبر است.", show_alert=True)
         return
+
+    if selected_key == "other":
+        await state.update_data(
+            ticket_flow={
+                "category": "general",
+                "related_type": "general",
+                "related_id": None,
+            }
+        )
+        await state.set_state(TicketStates.waiting_subject)
+        await edit_or_answer(
+            callback,
+            header("🧾 عنوان تیکت", "موارد دیگر")
+            + "یک عنوان کوتاه و واضح برای تیکت وارد کنید.\n\nمثلاً: <code>درخواست بررسی حساب</code>",
+            ticket_subject_kb(),
+        )
+        return
+
+    subject = TICKET_CATEGORY_LABELS.get(selected_key, selected_key)
     await state.update_data(
         ticket_flow={
-            "category": category,
-            "related_type": category if category != "general" else "general",
+            "category": "general",
+            "related_type": "general",
             "related_id": None,
+            "subject": subject[:255],
         }
     )
-    await state.set_state(TicketStates.waiting_subject)
-    selected = TICKET_CATEGORY_LABELS.get(category, category)
-    hint = ""
-    if category == "service":
-        hint = "\n\nاگر این تیکت مربوط به سرویس خاصی است، نام یا شناسه سرویس را در عنوان یا متن تیکت بنویسید."
-    elif category == "order":
-        hint = "\n\nاگر این تیکت مربوط به سفارش خاصی است، شماره سفارش را در عنوان یا متن تیکت بنویسید."
+    await state.set_state(TicketStates.waiting_body)
     await edit_or_answer(
         callback,
-        header("🧾 عنوان تیکت", selected)
-        + "یک عنوان کوتاه وارد کنید.\n\nمثلاً: <code>مشکل اتصال سرویس</code> یا <code>سوال درباره کیف پول</code>"
-        + hint,
-        ticket_subject_kb(),
+        header("✉️ متن تیکت", subject)
+        + "حالا توضیح کامل تیکت را فقط در یک پیام بفرستید.\n\n"
+        + "اگر عکس، ویدیو یا فایل دارید، توضیح را در کپشن همان پیام بنویسید. اگر ویس می‌فرستید، همان ویس به عنوان پیام تیکت ثبت می‌شود.",
+        ticket_body_kb(),
     )
 
 
@@ -8247,13 +8379,12 @@ async def ticket_body(message: Message, state: FSMContext) -> None:
     await message.answer(
         header("✅ تیکت ساخته شد", f"#{ticket.id}")
         + "پیام شما ثبت شد و ادمین‌ها می‌توانند پاسخ بدهند.",
-        reply_markup=user_ticket_view_kb(ticket.id),
+        reply_markup=user_ticket_view_kb(ticket.id, ticket.status),
     )
     await notify_admins(
         message.bot,
         header("🆕 تیکت جدید", f"#{ticket.id}")
         + f"👤 کاربر: <code>{uid}</code>\n"
-        + f"📌 دسته: <b>{h(TICKET_CATEGORY_LABELS.get(flow['category'], flow['category']))}</b>\n"
         + f"🧾 عنوان: <b>{h(flow['subject'])}</b>",
     )
 
@@ -8281,7 +8412,7 @@ async def ticket_view(callback: CallbackQuery) -> None:
     if not ticket or ticket.user_telegram_id != uid:
         await callback.answer("تیکت پیدا نشد.", show_alert=True)
         return
-    await edit_or_answer(callback, await render_ticket(ticket), user_ticket_view_kb(ticket_id))
+    await edit_or_answer(callback, await render_ticket(ticket), user_ticket_view_kb(ticket_id, ticket.status))
 
 
 @ticket_router.callback_query(F.data.startswith("ticket_reply:"))
@@ -8299,7 +8430,7 @@ async def ticket_reply_start(callback: CallbackQuery, state: FSMContext) -> None
         callback,
         header("✉️ پاسخ تیکت")
         + "پاسخ، فایل، عکس، ویدیو یا ویس را تا حد ممکن در یک پیام بفرستید. اگر فایل/عکس/ویدیو دارید، توضیح را در کپشن همان پیام بنویسید.",
-        user_ticket_view_kb(ticket_id),
+        user_ticket_view_kb(ticket_id, ticket.status),
     )
 
 
@@ -8316,7 +8447,7 @@ async def ticket_user_reply_finish(message: Message, state: FSMContext) -> None:
     payload = extract_message_payload(message)
     await add_ticket_message(ticket_id, "user", uid, **payload)
     await state.clear()
-    await message.answer("✅ پاسخ شما ثبت شد.", reply_markup=user_ticket_view_kb(ticket_id))
+    await message.answer("✅ پاسخ شما ثبت شد.", reply_markup=user_ticket_view_kb(ticket_id, ticket.status))
     await notify_admins(message.bot, header("📨 پاسخ جدید کاربر", f"تیکت #{ticket_id}") + f"👤 کاربر: <code>{uid}</code>")
 
 
@@ -8637,10 +8768,12 @@ async def admin_ticket_file_send(callback: CallbackQuery) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/routers/user.py
 ================================================================================
-
 
 """User router placeholder for the staged refactor.
 
@@ -8656,12 +8789,17 @@ app.legacy_bot to keep behavior stable for testing.
 
 
 
+
+
+
 ================================================================================
 # فایل: app/schemas/__init__.py
 ================================================================================
 
-
 """DTO/schema package for backup, restore and exports."""
+
+
+
 
 
 
@@ -8675,8 +8813,10 @@ app.legacy_bot to keep behavior stable for testing.
 # فایل: app/services/__init__.py
 ================================================================================
 
-
 """Service layer package."""
+
+
+
 
 
 
@@ -8689,7 +8829,6 @@ app.legacy_bot to keep behavior stable for testing.
 ================================================================================
 # فایل: app/services/admin_audit_service.py
 ================================================================================
-
 
 """Admin audit logging for PostgreSQL-backed Phase 1 features."""
 
@@ -8725,10 +8864,12 @@ async def audit_log(
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/backup_service.py
 ================================================================================
-
 
 """Complete backup service for Phase 3/3.1.
 
@@ -8985,7 +9126,7 @@ def _desired_pasarguard_state(sqlite_data: dict[str, list[dict[str, Any]]], pg_d
     return output
 
 
-async def create_complete_backup(admin_id: int | None = None, output_dir: str | Path = "/tmp/howtoosee_backups", bot: Bot | None = None) -> tuple[Path, dict[str, Any]]:
+async def create_complete_backup(admin_id: int | None = None, output_dir: str | Path = "/tmp/howtosee_backups", bot: Bot | None = None) -> tuple[Path, dict[str, Any]]:
     base = Path(output_dir) / f"backup-work-{_stamp()}"
     base.mkdir(parents=True, exist_ok=True)
     sqlite_data = _sqlite_tables()
@@ -9068,7 +9209,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     checksums_dir.mkdir(parents=True, exist_ok=True)
     (checksums_dir / "sha256.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
 
-    zip_path = Path(output_dir) / f"backup-howtoosee-{_stamp()}.zip"
+    zip_path = Path(output_dir) / f"backup-howtosee-{_stamp()}.zip"
     zip_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in sorted(p for p in base.rglob("*") if p.is_file()):
@@ -9110,10 +9251,12 @@ def inspect_backup_file(zip_path: str | Path) -> dict[str, Any]:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/broadcast_service.py
 ================================================================================
-
 
 """Broadcast campaign service for Phase 2."""
 
@@ -9309,10 +9452,12 @@ async def send_campaign_message(bot: Bot, chat_id: int, campaign: BroadcastCampa
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/confirmation_service.py
 ================================================================================
-
 
 """Numeric second-confirmation service for dangerous admin operations."""
 
@@ -9409,10 +9554,12 @@ async def verify_confirmation(
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/export_service.py
 ================================================================================
-
 
 """CSV/XLSX report export service for Phase 3.
 
@@ -9765,7 +9912,7 @@ def _write_xlsx(path: Path, title: str, rows: list[dict[str, Any]]) -> None:
     wb.save(path)
 
 
-async def build_report_file(report_key: str, file_format: str, output_dir: str | Path = "/tmp/howtoosee_reports") -> tuple[Path, int, str]:
+async def build_report_file(report_key: str, file_format: str, output_dir: str | Path = "/tmp/howtosee_reports") -> tuple[Path, int, str]:
     spec, rows = await collect_report_rows(report_key)
     ext = "xlsx" if file_format == "xlsx" else "csv"
     path = Path(output_dir) / f"report-{report_key}-{_now_stamp()}.{ext}"
@@ -9776,7 +9923,7 @@ async def build_report_file(report_key: str, file_format: str, output_dir: str |
     return path, len(rows), spec.title
 
 
-async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtoosee_reports") -> Path:
+async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtosee_reports") -> Path:
     import zipfile
 
     base = Path(output_dir)
@@ -9796,10 +9943,12 @@ async def build_all_reports_zip(output_dir: str | Path = "/tmp/howtoosee_reports
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/pasarguard_admin_panel_service.py
 ================================================================================
-
 
 """Pasarguard admin panel utilities for Phase 4.9.
 
@@ -9962,7 +10111,7 @@ def is_managed_remote_user(remote: dict[str, Any]) -> bool:
     configured_prefix = (settings.pasarguard_username_prefix or "").lower()
     return (
         marker in note
-        or "[HOWTOOSEE_BOT_START]" in note
+        or "[HOWTOSEE_BOT_START]" in note
         or username.startswith(configured_prefix)
         or username.startswith("howtosee_")
     )
@@ -9984,7 +10133,7 @@ async def current_desired_state_zip() -> Path:
     pg_data = await _pg_tables()
     desired_templates = desired_templates_from_pg_data(pg_data)
     desired_users = desired_users_from_data(sqlite_data, pg_data)
-    tmp_dir = Path(tempfile.mkdtemp(prefix="howtoosee-pg-current-"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="howtosee-pg-current-"))
     write_jsonl(tmp_dir / "external" / "pasarguard_desired_templates.jsonl", desired_templates)
     write_jsonl(tmp_dir / "external" / "pasarguard_desired_state.jsonl", desired_users)
     manifest = {
@@ -10219,10 +10368,12 @@ __all__ = [
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/pasarguard_checkpoint_service.py
 ================================================================================
-
 
 """Pasarguard checkpoint backup/restore/reconcile service for Phase 4.8.
 
@@ -10691,7 +10842,7 @@ async def reconcile_backup_with_pasarguard(zip_path: str | Path, *, admin_id: in
                             created = await client.create_user_from_template({
                                 "user_template_id": _remote_id(template),
                                 "username": username,
-                                "note": desired.get("note") or "[HOWTOOSEE_BOT_RESTORE]",
+                                "note": desired.get("note") or "[HOWTOSEE_BOT_RESTORE]",
                             })
                             item.applied = True
                             users_by_username[str(created.get("username") or username)] = created
@@ -10761,10 +10912,12 @@ def render_reconcile_report(report: PasarguardReconcileReport) -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/pasarguard_client.py
 ================================================================================
-
 
 """Async Pasarguard API client for Phase 4.
 
@@ -11010,10 +11163,12 @@ class PasarguardClient:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/pasarguard_template_service.py
 ================================================================================
-
 
 """Template governance and plan-template sync for Pasarguard Phase 4."""
 
@@ -11404,10 +11559,12 @@ def render_sync_report(report: TemplateSyncReport) -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/pasarguard_user_service.py
 ================================================================================
-
 
 """Pasarguard user/service operations for Phase 4.5 and 4.6.
 
@@ -11542,15 +11699,15 @@ def sanitize_remote_username(value: str, telegram_id: int, service_id: int) -> s
 
 def build_managed_note(*, telegram_id: int, service_id: int, order_id: int | None, plan_key: str, action: str) -> str:
     return (
-        "[HOWTOOSEE_BOT_START]\n"
-        f"managed_by=howtoosee_bot\n"
+        "[HOWTOSEE_BOT_START]\n"
+        f"managed_by=howtosee_bot\n"
         f"marker={managed_marker()}\n"
         f"action={action}\n"
         f"plan_key={plan_key}\n"
         f"telegram_id={telegram_id}\n"
         f"service_id={service_id}\n"
         f"order_id={order_id or ''}\n"
-        "[HOWTOOSEE_BOT_END]"
+        "[HOWTOSEE_BOT_END]"
     )[:500]
 
 
@@ -12183,10 +12340,12 @@ def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/plan_service.py
 ================================================================================
-
 
 """Database-backed plan catalog service for Phase 2."""
 
@@ -12495,10 +12654,12 @@ async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/restore_service.py
 ================================================================================
-
 
 """Restore service for Phase 3 complete backup ZIPs."""
 
@@ -12640,10 +12801,12 @@ async def restore_complete_backup(zip_path: str | Path, admin_id: int | None = N
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/scheduled_backup_service.py
 ================================================================================
-
 
 """Timed automatic backup scheduler for Phase 3.1."""
 
@@ -12784,7 +12947,10 @@ async def auto_backup_loop(bot: Bot) -> None:
 
 
 def start_auto_backup_scheduler(bot: Bot) -> asyncio.Task:
-    return asyncio.create_task(auto_backup_loop(bot), name="howtoosee_auto_backup_loop")
+    return asyncio.create_task(auto_backup_loop(bot), name="howtosee_auto_backup_loop")
+
+
+
 
 
 
@@ -12797,7 +12963,6 @@ def start_auto_backup_scheduler(bot: Bot) -> asyncio.Task:
 ================================================================================
 # فایل: app/services/schema_patch_service.py
 ================================================================================
-
 
 """Small PostgreSQL schema patches for staged checkpoints.
 
@@ -12849,10 +13014,12 @@ async def apply_runtime_schema_patches() -> None:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/text_template_service.py
 ================================================================================
-
 
 """Editable text templates for Phase 2."""
 
@@ -12899,7 +13066,7 @@ DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
         "title": "راهنمای ثبت تیکت",
         "group": "ticket",
         "placeholders": "",
-        "body": "موضوع تیکت را کوتاه وارد کنید.\n\nدر مرحله بعد متن کامل مشکل را بفرستید. اگر می‌خواهید عکس، ویدیو، فایل، ویس یا توضیح بفرستید، تا حد امکان همه را در همان یک پیام و همراه کپشن ارسال کنید تا تیکت کامل ثبت شود.",
+        "body": "عنوان تیکت را کوتاه وارد کنید.\n\nدر مرحله بعد متن کامل مشکل را بفرستید. اگر می‌خواهید عکس، ویدیو، فایل، ویس یا توضیح بفرستید، تا حد امکان همه را در همان یک پیام و همراه کپشن ارسال کنید تا تیکت کامل ثبت شود.",
     },
     "bot.locked": {
         "title": "پیام قفل بودن بات",
@@ -13000,10 +13167,12 @@ async def reset_template(key: str, admin_id: int) -> tuple[bool, str]:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/services/ticket_service.py
 ================================================================================
-
 
 """Ticket service layer for users and admins."""
 
@@ -13030,13 +13199,16 @@ from app.models import (
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 TICKET_CATEGORY_LABELS: dict[str, str] = {
-    "service": "📦 مربوط به سرویس",
-    "order": "🧾 مربوط به سفارش",
-    "wallet": "💰 کیف پول",
+    # These are user-facing ticket title presets. Internally we still store
+    # category/related_type for backward compatibility, but the user flow no
+    # longer asks for a separate "related to" category.
+    "service": "📦 مشکل اتصال یا سرویس",
+    "order": "🧾 مشکل پرداخت یا سفارش",
+    "wallet": "💰 مشکل کیف پول",
     "technical": "🛠 مشکل فنی",
-    "account": "👤 حساب کاربری",
+    "account": "👤 مشکل حساب کاربری",
     "general": "❓ سوال عمومی",
-    "other": "موارد دیگر",
+    "other": "✍️ موارد دیگر",
 }
 
 TICKET_STATUS_LABELS: dict[str, str] = {
@@ -13060,6 +13232,7 @@ ADMIN_ROLE_LABELS: dict[str, str] = {
     "sales": "مدیریت فروش",
     "support": "پشتیبانی",
     "marketing": "مدیریت مارکتینگ",
+    "appearance": "مدیریت ظاهر",
 }
 
 
@@ -13104,12 +13277,35 @@ async def seed_bootstrap_admins(admin_ids: set[int]) -> None:
                 admin.is_active = True
 
 
+async def upsert_admin_role(telegram_id: int, role: str, added_by: int | None = None) -> None:
+    """Keep the PostgreSQL admin table in sync with the legacy admin panel."""
+    async with session_scope() as session:
+        result = await session.execute(select(Admin).where(Admin.telegram_id == telegram_id))
+        admin = result.scalar_one_or_none()
+        if admin is None:
+            session.add(Admin(telegram_id=telegram_id, role=role, added_by=added_by, is_active=True))
+        else:
+            admin.role = role
+            admin.added_by = added_by
+            admin.is_active = True
+
+
 async def is_admin(telegram_id: int) -> bool:
     async with session_scope() as session:
         result = await session.execute(
             select(Admin).where(Admin.telegram_id == telegram_id, Admin.is_active.is_(True))
         )
         return result.scalar_one_or_none() is not None
+
+
+async def has_appearance_access(telegram_id: int) -> bool:
+    """Allow only super admins and the dedicated appearance role to edit visual/text content."""
+    async with session_scope() as session:
+        result = await session.execute(
+            select(Admin.role).where(Admin.telegram_id == telegram_id, Admin.is_active.is_(True))
+        )
+        role = str(result.scalar_one_or_none() or "")
+    return role in {"super", "appearance"}
 
 
 async def active_admin_ids() -> list[int]:
@@ -13379,12 +13575,17 @@ async def ticket_stats() -> TicketStats:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/utils/__init__.py
 ================================================================================
 
-
 """Utility helpers package."""
+
+
+
 
 
 
@@ -13397,7 +13598,6 @@ async def ticket_stats() -> TicketStats:
 ================================================================================
 # فایل: app/utils/digits.py
 ================================================================================
-
 
 """Persian/Arabic digit normalization helpers."""
 
@@ -13421,10 +13621,12 @@ def normalize_digits(value: str) -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/utils/formatting.py
 ================================================================================
-
 
 """Shared formatting helpers for future extracted handlers."""
 
@@ -13455,10 +13657,12 @@ def fmt_number(value: int | float) -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/utils/line_parser.py
 ================================================================================
-
 
 r"""Small helpers for admin line parsing.
 
@@ -13516,10 +13720,12 @@ def pipe_escape_hint() -> str:
 
 
 
+
+
+
 ================================================================================
 # فایل: app/utils/security.py
 ================================================================================
-
 
 """Security helpers for future admin confirmation and permission flows."""
 
@@ -13532,6 +13738,9 @@ def make_numeric_code(length: int = 6) -> str:
     if length < 4:
         raise ValueError("confirmation code length must be at least 4")
     return "".join(secrets.choice("0123456789") for _ in range(length))
+
+
+
 
 
 
@@ -13560,10 +13769,68 @@ The handlers now parse with `split(":", 2)` and return a safe Telegram alert ins
 
 
 
+
+
+
+================================================================================
+# فایل: HOTFIX_VISUAL_TICKET_WALLET.md
+================================================================================
+
+# Visual / Ticket / Wallet Flow Fix
+
+این نسخه روی فایل `merged_codes(5).txt` ساخته شده و شامل تغییرات زیر است:
+
+## تغییرات ظاهری / ادمین ظاهر
+- دکمه «تغییر متن‌ها» به «تغییرات ظاهری ربات» تبدیل شد.
+- نقش جدید `appearance` اضافه شد.
+- دسترسی پنل تغییرات ظاهری فقط برای `super` و `appearance` فعال است.
+- هنگام اضافه کردن ادمین از پنل قدیمی، نقش ادمین با جدول PostgreSQL ادمین‌ها هم sync می‌شود تا پنل ظاهری درست کار کند.
+
+## برندینگ
+- تمام موارد `howtosee` / `HowToSee` / `HOWTOSEE` به `howtosee` / `HowToSee` / `HOWTOSEE` تبدیل شد.
+
+## متن سرویس‌ها
+- متن «هنوز سرویس فعالی ندارید...» اصلاح شد:
+  «از بخش خرید سرویس می‌توانید اولین سرویس خود را دریافت کنید»
+
+## تیکت‌ها
+- فلو از «نوع مشکل/مربوط به...» به «عنوان تیکت» تغییر کرد.
+- گزینه‌های آماده، مستقیماً عنوان تیکت می‌شوند.
+- گزینه «موارد دیگر» اجازه می‌دهد کاربر عنوان دلخواه وارد کند.
+- نمایش «دسته» و «ارتباط» از متن تیکت حذف شد.
+- در تیکت بسته‌شده، دکمه «بستن تیکت» دیگر نمایش داده نمی‌شود.
+
+## مدیریت کاربر
+- گزینه‌های قفل کاربر از پنل حذف شد.
+- کاربر فقط بلاک/رفع بلاک می‌شود.
+- بلاک با اطلاع و بی‌صدا وجود دارد.
+- رفع بلاک با اطلاع و بی‌صدا اضافه شد.
+- کلیک روی دکمه‌های قدیمی قفل، برای سازگاری به بلاک تبدیل می‌شود.
+
+## واژه‌ها
+- «نام کاربری» به «نام کاربری» تغییر کرد.
+
+## شارژ کیف پول / پرداخت
+- بعد از وارد کردن مبلغ شارژ، ابتدا صفحه بررسی پرداخت نمایش داده می‌شود:
+  مبلغ شارژ، تخفیف، قابل پرداخت.
+- دکمه کد تخفیف برای شارژ کیف پول فعال شد.
+- دکمه «پرداخت» اضافه شد.
+- بعد از پرداخت، صفحه انتخاب روش پرداخت نمایش داده می‌شود.
+- فعلاً فقط کارت‌به‌کارت فعال است.
+- پیام اشتباه قبلی شارژ کیف پول حذف شد.
+- اگر روی شارژ کیف پول کد تخفیف اعمال شود، کاربر مبلغ شارژ انتخابی را دریافت می‌کند ولی فقط مبلغ قابل پرداخت را کارت‌به‌کارت می‌پردازد.
+
+## بررسی فنی
+- تمام فایل‌های Python با `py_compile` و `compileall` بررسی شدند.
+
+## امنیت
+- فایل `.env.example` در خروجی با مقدارهای placeholder ذخیره شده تا توکن‌ها/پسوردهای واقعی داخل زیپ پخش نشوند. مقدارهای واقعی را فقط در `.env` سرور قرار دهید.
+
+
+
 ================================================================================
 # فایل: install_service.sh
 ================================================================================
-
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -13614,10 +13881,12 @@ echo "Logs: journalctl -u $SERVICE_NAME -f"
 
 
 
+
+
+
 ================================================================================
 # فایل: logs_service.sh
 ================================================================================
-
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -13633,10 +13902,12 @@ journalctl -u "$SERVICE_NAME" -f
 
 
 
+
+
+
 ================================================================================
 # فایل: main.py
 ================================================================================
-
 
 """Application entrypoint.
 
@@ -13664,10 +13935,12 @@ if __name__ == "__main__":
 
 
 
+
+
+
 ================================================================================
 # فایل: merge_folder.py
 ================================================================================
-
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -13832,10 +14105,12 @@ if __name__ == "__main__":
 
 
 
+
+
+
 ================================================================================
 # فایل: pasarguardtelegrambot.service
 ================================================================================
-
 
 [Unit]
 Description=Pasarguard Telegram Bot
@@ -13869,12 +14144,14 @@ WantedBy=multi-user.target
 
 
 
+
+
+
 ================================================================================
 # فایل: README.md
 ================================================================================
 
-
-# HowTooSee/Pasarguard Bot — Phase 4.10
+# HowToSee/Pasarguard Bot — Phase 4.10
 
 This checkpoint turns user-facing service flows into real Pasarguard-backed flows while keeping payment itself in demo/manual mode.
 
@@ -13960,10 +14237,12 @@ The old demo payment button is no longer displayed in the user payment page. The
 
 
 
+
+
+
 ================================================================================
 # فایل: requirements.txt
 ================================================================================
-
 
 aiogram==3.17.0
 python-dotenv==1.0.1
@@ -13981,10 +14260,12 @@ httpx>=0.27,<1.0
 
 
 
+
+
+
 ================================================================================
 # فایل: restart_service.sh
 ================================================================================
-
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -14008,10 +14289,12 @@ systemctl --no-pager --full status "$SERVICE_NAME" || true
 
 
 
+
+
+
 ================================================================================
 # فایل: status_service.sh
 ================================================================================
-
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -14027,10 +14310,12 @@ systemctl --no-pager --full status "$SERVICE_NAME" || true
 
 
 
+
+
+
 ================================================================================
 # فایل: uninstall_service.sh
 ================================================================================
-
 
 #!/usr/bin/env bash
 set -euo pipefail
@@ -14050,6 +14335,8 @@ systemctl daemon-reload
 systemctl reset-failed "$SERVICE_NAME" || true
 
 echo "Removed: $SERVICE_NAME"
+
+
 
 
 

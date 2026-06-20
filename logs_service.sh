@@ -12,3 +12,5 @@ journalctl -u "$SERVICE_NAME" -f
 
 
 
+
+

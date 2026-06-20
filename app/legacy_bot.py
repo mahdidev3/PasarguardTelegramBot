@@ -40,6 +40,7 @@ from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
 from app.services.ticket_service import upsert_admin_role
+from app.services.plan_service import upsert_plan_from_line
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
@@ -666,6 +667,63 @@ def ensure_admin_schema() -> None:
                 UNIQUE(code, order_id)
             );
 
+            CREATE TABLE IF NOT EXISTS package_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0,
+                description TEXT,
+                conditions TEXT,
+                max_subscriptions INTEGER NOT NULL DEFAULT 1,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS package_template_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                source_plan_key TEXT,
+                item_key TEXT NOT NULL,
+                title TEXT NOT NULL,
+                data_gb REAL NOT NULL,
+                days INTEGER NOT NULL,
+                price INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_telegram_id INTEGER NOT NULL,
+                package_id INTEGER NOT NULL,
+                code TEXT UNIQUE NOT NULL,
+                assigned_by INTEGER,
+                price INTEGER NOT NULL DEFAULT 0,
+                description TEXT,
+                conditions TEXT,
+                max_subscriptions INTEGER NOT NULL DEFAULT 1,
+                used_subscriptions INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'draft',
+                order_id INTEGER,
+                created_at TEXT NOT NULL,
+                offered_at TEXT,
+                purchased_at TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS package_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_package_id INTEGER NOT NULL,
+                package_item_id INTEGER NOT NULL,
+                service_id INTEGER NOT NULL,
+                user_telegram_id INTEGER NOT NULL,
+                order_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS payment_cards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 card_number TEXT NOT NULL,
@@ -730,6 +788,8 @@ def ensure_admin_schema() -> None:
             ("services", "pasarguard_last_state_json", "ALTER TABLE services ADD COLUMN pasarguard_last_state_json TEXT"),
             ("services", "pasarguard_sync_status", "ALTER TABLE services ADD COLUMN pasarguard_sync_status TEXT"),
             ("services", "pasarguard_sync_error", "ALTER TABLE services ADD COLUMN pasarguard_sync_error TEXT"),
+            ("services", "package_assignment_id", "ALTER TABLE services ADD COLUMN package_assignment_id INTEGER"),
+            ("services", "package_item_id", "ALTER TABLE services ADD COLUMN package_item_id INTEGER"),
             ("orders", "coupon_code", "ALTER TABLE orders ADD COLUMN coupon_code TEXT"),
             ("orders", "coupon_discount", "ALTER TABLE orders ADD COLUMN coupon_discount INTEGER NOT NULL DEFAULT 0"),
             ("orders", "admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT"),
@@ -804,9 +864,9 @@ def setting_set(key: str, value: str) -> None:
 ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
     "super": {"*"},
     # Sales may review payments/receipts and see order context only. It must not manage users, wallets, services, or broadcasts.
-    "sales": {"dashboard", "orders", "payment_receipts"},
-    "support": {"dashboard", "users", "services", "direct_message"},
-    "marketing": {"dashboard", "broadcast", "coupons", "reports"},
+    "sales": {"dashboard", "orders", "payment_receipts", "packages"},
+    "support": {"dashboard", "users", "services", "direct_message", "packages"},
+    "marketing": {"dashboard", "broadcast", "coupons", "reports", "packages"},
     "appearance": {"dashboard", "appearance"},
 }
 
@@ -943,6 +1003,12 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     service_id: Optional[int] = None
     if plan_key.startswith("wallet_topup:"):
         db.add_wallet(telegram_id, int(order["amount"]), "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
+    elif plan_key.startswith("pkg_assign:"):
+        try:
+            user_package_id = int(plan_key.split(":", 1)[1])
+            mark_user_package_active(user_package_id, order_id)
+        except Exception:
+            pass
     elif plan_key in PLANS:
         service_name = (order["service_name"] if row_has(order, "service_name") and order["service_name"] else make_service_name(telegram_id))
         service_id = db.create_service(telegram_id, service_name, PLANS[plan_key], payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
@@ -1571,6 +1637,16 @@ class AdminStates(StatesGroup):
     waiting_card_note = State()
     waiting_card_active = State()
     waiting_payment_review_note = State()
+    waiting_package_name = State()
+    waiting_package_price = State()
+    waiting_package_code = State()
+    waiting_package_description = State()
+    waiting_package_conditions = State()
+    waiting_package_max_subs = State()
+    waiting_package_manual_item = State()
+    waiting_package_sales_override = State()
+    waiting_package_assign_user = State()
+    waiting_package_assign_custom = State()
 
 
 # -----------------------------
@@ -1579,7 +1655,8 @@ class AdminStates(StatesGroup):
 def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="🛒 خرید سرویس")],
-        [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 سرویس رایگان")],
+        [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 پکیج‌های من")],
+        [KeyboardButton(text="🎁 سرویس رایگان")],
         [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
         [KeyboardButton(text="🎫 پشتیبانی / تیکت‌ها")],
@@ -1815,7 +1892,7 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [
         [("👥 مدیریت کاربران", "adm_users"), ("📦 مدیریت سرویس‌ها", "adm_services")],
         [("🧾 سفارش‌ها", "adm_orders"), ("💳 روش‌های پرداخت", "adm_payments")],
-        [("💰 کیف پول کاربران", "adm_wallet_start")],
+        [("💰 کیف پول کاربران", "adm_wallet_start"), ("🎁 کد پکیج‌ها", "adm_packages")],
         [("🎫 تیکت‌ها", "adm_tickets"), ("🎟 کدهای تخفیف", "adm_coupons")],
         [("📢 پیام همگانی", "adm_broadcast"), ("📦 مدیریت پلن‌ها", "adm_plans")],
         [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
@@ -1880,6 +1957,7 @@ def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
         status_row,
         [("🗑 حذف کاربر", f"adm_user_delete:{uid}"), ("🎁 ریست تست رایگان", f"adm_user_reset_free:{uid}")],
         [("📝 یادداشت ادمین", f"adm_user_note:{uid}"), ("➕ ساخت سرویس دستی", f"adm_manual_service:{uid}")],
+        [("🎁 اختصاص پکیج", f"adm_pkg_assign_user:{uid}")],
         [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -2211,6 +2289,31 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
         text += "اگر کد تخفیف دارید، ابتدا آن را اعمال کنید. سپس دکمه پرداخت را بزنید و در مرحله بعد روش پرداخت را انتخاب کنید."
         return text, "wallet", payable
 
+    if plan_key.startswith("pkg_assign:"):
+        user_package_id = int(plan_key.split(":", 1)[1])
+        user_package = user_package_by_id(user_package_id, int(user["telegram_id"]))
+        text = header("💳 پرداخت پکیج اختصاصی", f"سفارش #{order['id']}")
+        if user_package:
+            text += user_package_text(user_package) + "\n"
+        text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
+        text += f"💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\n"
+        text += "این سفارش کد تخفیف ندارد و فقط از کیف پول پرداخت می‌شود."
+        return text, f"pkg_view:{user_package_id}", payable
+
+    if plan_key.startswith("pkg_sub:"):
+        _tag, user_package_id_s, item_id_s = plan_key.split(":")
+        user_package_id = int(user_package_id_s)
+        item = package_item_by_id(int(item_id_s))
+        text = header("💳 ساخت ساب از پکیج", f"سفارش #{order['id']}")
+        if item:
+            text += f"📦 ساب انتخابی: <b>{h(item['title'])}</b>\n"
+            text += f"📊 حجم: <b>{fmt_number(float(item['data_gb']))} گیگابایت</b>\n"
+            text += f"⏳ اعتبار: <b>{fmt_number(int(item['days']))} روز</b>\n"
+        text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
+        text += f"💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\n"
+        text += "این سفارش کد تخفیف ندارد و فقط از کیف پول پرداخت می‌شود."
+        return text, f"pkg_view:{user_package_id}", payable
+
     if plan_key.startswith("addon:"):
         _, pkg_key, service_id_s = plan_key.split(":")
         service = db.get_service(int(service_id_s), int(user["telegram_id"]))
@@ -2334,6 +2437,384 @@ def wallet_amount_prompt(suggested_amount: int | None = None) -> str:
     text += "\nمبلغ دلخواه را به تومان وارد کنید. مثلاً: <code>100000</code>"
     return text
 
+
+# -----------------------------
+# Package-code / assigned packages
+# -----------------------------
+def package_plan_key(item_id: int) -> str:
+    return f"pkg_item_{int(item_id)}"
+
+
+def random_package_code(prefix: str = "PKG") -> str:
+    return f"{prefix}_{secrets.token_hex(3).upper()}"
+
+
+def validate_package_name(value: str) -> tuple[bool, str]:
+    value = (value or "").strip()
+    if len(value) < 3 or len(value) > 80:
+        return False, "نام پکیج باید بین ۳ تا ۸۰ کاراکتر باشد."
+    return True, value
+
+
+def validate_package_code(value: str) -> tuple[bool, str]:
+    code = normalize_digits(value or "").strip().upper()
+    code = re.sub(r"\s+", "", code)
+    if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
+        return False, "کد پکیج باید ۳ تا ۳۲ کاراکتر و فقط شامل حروف انگلیسی، عدد، خط تیره یا آندرلاین باشد."
+    with closing(db.connect()) as conn:
+        exists = conn.execute("SELECT id FROM package_templates WHERE code = ?", (code,)).fetchone()
+    if exists:
+        return False, "این کد قبلاً برای یک پکیج ثبت شده است."
+    return True, code
+
+
+def parse_positive_amount(value: str, *, allow_zero: bool = True) -> tuple[bool, int, str]:
+    amount = parse_amount(value or "")
+    if amount is None:
+        return False, 0, "مبلغ معتبر نیست. فقط عدد به تومان وارد کنید."
+    if amount < 0 or (amount == 0 and not allow_zero):
+        return False, 0, "مبلغ باید مثبت باشد."
+    return True, int(amount), ""
+
+
+def validate_long_text(value: str, field: str, *, max_len: int = 1200, allow_empty: bool = True) -> tuple[bool, str]:
+    value = (value or "").strip()
+    if value == "-" and allow_empty:
+        value = ""
+    if not value and not allow_empty:
+        return False, f"{field} نمی‌تواند خالی باشد."
+    if len(value) > max_len:
+        return False, f"{field} نباید بیشتر از {max_len} کاراکتر باشد."
+    return True, value
+
+
+def parse_max_subscriptions(value: str) -> tuple[bool, int, str]:
+    raw = normalize_digits(value or "").strip()
+    if not raw.isdigit():
+        return False, 0, "تعداد ساب باید عدد صحیح باشد."
+    count = int(raw)
+    if count < 1 or count > 100:
+        return False, 0, "تعداد ساب باید بین ۱ تا ۱۰۰ باشد."
+    return True, count, ""
+
+
+def parse_package_item_manual(line: str) -> tuple[bool, dict[str, Any], str]:
+    parts = [x.strip() for x in split_escaped_pipe(line or "")]
+    if len(parts) != 4:
+        return False, {}, "فرمت درست: عنوان|حجم گیگ|روز|قیمت ساب"
+    title, data_s, days_s, price_s = parts
+    if len(title) < 2 or len(title) > 80:
+        return False, {}, "عنوان آیتم باید بین ۲ تا ۸۰ کاراکتر باشد."
+    try:
+        data_gb = float(normalize_digits(data_s).replace(",", "."))
+        days = int(normalize_digits(days_s))
+    except Exception:
+        return False, {}, "حجم و روز باید عدد معتبر باشند."
+    ok, price, err = parse_positive_amount(price_s, allow_zero=True)
+    if not ok:
+        return False, {}, err
+    if data_gb <= 0 or data_gb > 10000:
+        return False, {}, "حجم باید بزرگ‌تر از صفر باشد."
+    if days <= 0 or days > 3650:
+        return False, {}, "روز اعتبار باید بین ۱ تا ۳۶۵۰ باشد."
+    return True, {"source_type": "manual", "source_plan_key": "", "title": title, "data_gb": data_gb, "days": days, "price": price}, ""
+
+
+def parse_package_sales_override(line: str, plan: Plan) -> tuple[bool, dict[str, Any], str]:
+    raw = (line or "").strip()
+    if not raw:
+        return False, {}, "قیمت ساب را وارد کنید یا برای قیمت صفر، ۰ بفرستید."
+    parts = [x.strip() for x in split_escaped_pipe(raw)]
+    if len(parts) == 1:
+        ok, price, err = parse_positive_amount(parts[0], allow_zero=True)
+        if not ok:
+            return False, {}, err
+        return True, {"source_type": "sales_plan", "source_plan_key": plan.key, "title": plan.title, "data_gb": plan.data_gb, "days": plan.days, "price": price}, ""
+    if len(parts) != 4:
+        return False, {}, "فرمت درست: قیمت ساب|عنوان یا -|حجم یا -|روز یا -"
+    price_s, title_s, data_s, days_s = parts
+    ok, price, err = parse_positive_amount(price_s, allow_zero=True)
+    if not ok:
+        return False, {}, err
+    title = plan.title if title_s == "-" or not title_s else title_s
+    try:
+        data_gb = plan.data_gb if data_s == "-" or not data_s else float(normalize_digits(data_s).replace(",", "."))
+        days = plan.days if days_s == "-" or not days_s else int(normalize_digits(days_s))
+    except Exception:
+        return False, {}, "حجم و روز باید عدد معتبر باشند."
+    if len(title) < 2 or len(title) > 80:
+        return False, {}, "عنوان آیتم باید بین ۲ تا ۸۰ کاراکتر باشد."
+    if data_gb <= 0 or days <= 0:
+        return False, {}, "حجم و روز باید بزرگ‌تر از صفر باشند."
+    return True, {"source_type": "sales_plan_override" if (title != plan.title or data_gb != plan.data_gb or days != plan.days) else "sales_plan", "source_plan_key": plan.key, "title": title, "data_gb": data_gb, "days": days, "price": price}, ""
+
+
+def package_by_id(package_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM package_templates WHERE id = ?", (package_id,)).fetchone()
+
+
+def package_item_by_id(item_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM package_template_items WHERE id = ?", (item_id,)).fetchone()
+
+
+def package_items(package_id: int) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return list(conn.execute("SELECT * FROM package_template_items WHERE package_id = ? ORDER BY sort_order, id", (package_id,)).fetchall())
+
+
+def list_package_templates(active_only: bool = False, limit: int = 50) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        where = "WHERE is_active = 1" if active_only else ""
+        return list(conn.execute(f"SELECT * FROM package_templates {where} ORDER BY id DESC LIMIT ?", (limit,)).fetchall())
+
+
+def user_package_by_id(user_package_id: int, telegram_id: int | None = None) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        if telegram_id is None:
+            return conn.execute("SELECT * FROM user_packages WHERE id = ?", (user_package_id,)).fetchone()
+        return conn.execute("SELECT * FROM user_packages WHERE id = ? AND user_telegram_id = ?", (user_package_id, telegram_id)).fetchone()
+
+
+def list_user_packages(telegram_id: int, include_old: bool = True) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        if include_old:
+            return list(conn.execute("SELECT * FROM user_packages WHERE user_telegram_id = ? ORDER BY id DESC", (telegram_id,)).fetchall())
+        return list(conn.execute("SELECT * FROM user_packages WHERE user_telegram_id = ? AND status IN ('offered','pending_payment','active') ORDER BY id DESC", (telegram_id,)).fetchall())
+
+
+def count_package_subscriptions(user_package_id: int) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM package_subscriptions WHERE user_package_id = ?", (user_package_id,)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def list_package_subscriptions(user_package_id: int) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return list(conn.execute("SELECT * FROM package_subscriptions WHERE user_package_id = ? ORDER BY id DESC", (user_package_id,)).fetchall())
+
+
+def create_package_template(data: dict[str, Any], items: list[dict[str, Any]], admin_id: int) -> int:
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO package_templates (code, name, price, description, conditions, max_subscriptions, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (data["code"], data["name"], int(data["price"]), data.get("description") or "", data.get("conditions") or "", int(data["max_subscriptions"]), admin_id, now_iso(), now_iso()),
+        )
+        package_id = int(cur.lastrowid)
+        for idx, item in enumerate(items, start=1):
+            conn.execute(
+                """
+                INSERT INTO package_template_items (package_id, source_type, source_plan_key, item_key, title, data_gb, days, price, sort_order, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (package_id, item.get("source_type") or "manual", item.get("source_plan_key") or "", f"pkg{package_id}_{idx}", item["title"], float(item["data_gb"]), int(item["days"]), int(item["price"]), idx * 10, now_iso()),
+            )
+        conn.commit()
+    return package_id
+
+
+def create_user_package_assignment(package_id: int, telegram_id: int, admin_id: int, *, price: int | None = None, description: str | None = None, conditions: str | None = None, max_subscriptions: int | None = None, code: str | None = None, status: str = "draft") -> int:
+    package = package_by_id(package_id)
+    if not package:
+        raise ValueError("package not found")
+    assignment_code = (code or f"{package['code']}-{telegram_id % 100000}-{secrets.token_hex(2).upper()}").upper()
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO user_packages (user_telegram_id, package_id, code, assigned_by, price, description, conditions, max_subscriptions, used_subscriptions, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                package_id,
+                assignment_code,
+                admin_id,
+                int(package["price"] if price is None else price),
+                package["description"] if description is None else description,
+                package["conditions"] if conditions is None else conditions,
+                int(package["max_subscriptions"] if max_subscriptions is None else max_subscriptions),
+                status,
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_user_package(user_package_id: int, **values: Any) -> None:
+    allowed = {"price", "description", "conditions", "max_subscriptions", "status", "order_id", "offered_at", "purchased_at", "used_subscriptions", "code"}
+    keys = [k for k in values.keys() if k in allowed]
+    if not keys:
+        return
+    assignments = ", ".join(f"{k} = ?" for k in keys) + ", updated_at = ?"
+    params = [values[k] for k in keys] + [now_iso(), user_package_id]
+    with closing(db.connect()) as conn:
+        conn.execute(f"UPDATE user_packages SET {assignments} WHERE id = ?", params)
+        conn.commit()
+
+
+def mark_user_package_active(user_package_id: int, order_id: int | None = None) -> None:
+    update_user_package(user_package_id, status="active", order_id=order_id, purchased_at=now_iso())
+
+
+def record_package_subscription(user_package_id: int, item_id: int, service_id: int, telegram_id: int, order_id: int | None) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "INSERT INTO package_subscriptions (user_package_id, package_item_id, service_id, user_telegram_id, order_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_package_id, item_id, service_id, telegram_id, order_id, now_iso()),
+        )
+        conn.execute("UPDATE user_packages SET used_subscriptions = used_subscriptions + 1, updated_at = ? WHERE id = ?", (now_iso(), user_package_id))
+        conn.execute("UPDATE services SET package_assignment_id = ?, package_item_id = ? WHERE id = ?", (user_package_id, item_id, service_id))
+        conn.commit()
+
+
+def package_text(package: sqlite3.Row, *, include_items: bool = True) -> str:
+    items = package_items(int(package["id"])) if include_items else []
+    text = header("🎁 پکیج", package["name"])
+    text += f"🧾 کد پکیج: <code>{h(package['code'])}</code>\n"
+    text += f"💰 قیمت پک: <b>{'رایگان' if int(package['price']) == 0 else fmt_money(int(package['price']))}</b>\n"
+    text += f"🔢 تعداد ساب قابل ساخت: <b>{fmt_number(int(package['max_subscriptions']))}</b>\n"
+    if package["description"]:
+        text += f"\n📝 توضیحات:\n{h(package['description'])}\n"
+    if package["conditions"]:
+        text += f"\n📌 شرایط:\n{h(package['conditions'])}\n"
+    if items:
+        text += "\n📦 پلن‌های داخل پک:\n"
+        for item in items:
+            text += f"• {h(item['title'])} — {fmt_number(float(item['data_gb']))}GB / {fmt_number(int(item['days']))} روز — ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n"
+    return text
+
+
+def user_package_text(user_package: sqlite3.Row, *, user_view: bool = True) -> str:
+    package = package_by_id(int(user_package["package_id"]))
+    items = package_items(int(user_package["package_id"])) if package else []
+    title = package["name"] if package else f"پکیج #{user_package['package_id']}"
+    status_map = {"draft": "پیش‌نویس", "offered": "در انتظار تأیید شما", "pending_payment": "در انتظار پرداخت", "active": "فعال", "declined": "رد شده", "cancelled": "لغوشده"}
+    text = header("🎁 پکیج اختصاصی شما" if user_view else "🎁 پکیج اختصاصی کاربر", title)
+    text += f"🧾 کد اختصاصی: <code>{h(user_package['code'])}</code>\n"
+    text += f"📌 وضعیت: <b>{h(status_map.get(str(user_package['status']), user_package['status']))}</b>\n"
+    text += f"💰 قیمت پک: <b>{'رایگان' if int(user_package['price']) == 0 else fmt_money(int(user_package['price']))}</b>\n"
+    text += f"🔢 تعداد ساب قابل ساخت: <b>{fmt_number(int(user_package['max_subscriptions']))}</b>\n"
+    text += f"✅ ساب‌های ساخته‌شده: <b>{fmt_number(count_package_subscriptions(int(user_package['id'])))}</b>\n"
+    if user_package["description"]:
+        text += f"\n📝 توضیحات:\n{h(user_package['description'])}\n"
+    if user_package["conditions"]:
+        text += f"\n📌 شرایط:\n{h(user_package['conditions'])}\n"
+    if items:
+        text += "\n📦 پلن‌هایی که بعد از خرید پک می‌توانید از آن‌ها ساب بسازید:\n"
+        for item in items:
+            text += f"• {h(item['title'])} — {fmt_number(float(item['data_gb']))}GB / {fmt_number(int(item['days']))} روز — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n"
+    return text
+
+
+def admin_packages_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("➕ ساخت پکیج جدید", "adm_pkg_new"), ("📋 لیست پکیج‌ها", "adm_pkg_list")],
+        [("🎯 اختصاص پکیج به کاربر", "adm_pkg_assign_start")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_package_list_kb(packages: list[sqlite3.Row], back: str = "adm_packages") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for pkg in packages[:30]:
+        active = "✅" if int(pkg["is_active"]) else "⛔"
+        rows.append([(f"{active} {pkg['name']} | {pkg['code']}", f"adm_pkg:{pkg['id']}")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_package_assign_select_kb(packages: list[sqlite3.Row], back: str = "adm_packages") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for pkg in packages[:30]:
+        rows.append([(f"🎁 {pkg['name']} | {pkg['code']}", f"adm_pkg_assign_pick:{pkg['id']}")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_package_kb(package_id: int) -> InlineKeyboardMarkup:
+    package = package_by_id(package_id)
+    toggle = "⛔ غیرفعال کردن" if package and int(package["is_active"]) else "✅ فعال کردن"
+    return inline([
+        [("🎯 اختصاص به کاربر", f"adm_pkg_assign:{package_id}"), (toggle, f"adm_pkg_toggle:{package_id}")],
+        [("👥 اختصاص‌های این پکیج", f"adm_pkg_assignments:{package_id}")],
+        [("⬅️ لیست پکیج‌ها", "adm_pkg_list"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def package_item_add_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("➕ انتخاب از پلن‌های فروش", "adm_pkg_item_sales")],
+        [("✍️ اضافه کردن دستی", "adm_pkg_item_manual")],
+        [("✅ پایان و ذخیره پکیج", "adm_pkg_item_finish")],
+        [("❌ لغو", "adm_packages"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def package_sales_plan_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for p in PLANS.values():
+        if not str(p.category).startswith("free:"):
+            rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_pkg_pick_sales:{p.key}")])
+    rows.append([("⬅️ بازگشت", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_package_assignment_preview_kb(user_package_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ ارسال پیشنهاد برای کاربر", f"adm_userpkg_send:{user_package_id}")],
+        [("✏️ کاستوم برای این کاربر", f"adm_userpkg_custom:{user_package_id}")],
+        [("❌ لغو اختصاص", f"adm_userpkg_cancel:{user_package_id}"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def user_packages_kb(packages: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for up in packages[:20]:
+        status_icon = {"offered": "🆕", "pending_payment": "💳", "active": "✅", "declined": "❌"}.get(str(up["status"]), "🎁")
+        pkg = package_by_id(int(up["package_id"]))
+        title = pkg["name"] if pkg else f"پکیج #{up['package_id']}"
+        rows.append([(f"{status_icon} {title} | {up['code']}", f"pkg_view:{up['id']}")])
+    rows.append([("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def user_package_view_kb(user_package: sqlite3.Row) -> InlineKeyboardMarkup:
+    status = str(user_package["status"])
+    upid = int(user_package["id"])
+    rows: list[list[tuple[str, str]]] = []
+    if status == "offered":
+        rows.append([("✅ تأیید و رفتن به پرداخت", f"pkg_accept:{upid}"), ("❌ رد کردن", f"pkg_decline:{upid}")])
+    elif status == "pending_payment" and user_package["order_id"]:
+        rows.append([("💳 ادامه پرداخت", f"pay_page:{user_package['order_id']}")])
+    elif status == "active":
+        rows.append([("➕ ساخت ساب از این پک", f"pkg_subs:{upid}")])
+    rows.append([("⬅️ پکیج‌های من", "my_packages"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def package_sub_items_kb(user_package_id: int) -> InlineKeyboardMarkup:
+    up = user_package_by_id(user_package_id)
+    rows: list[list[tuple[str, str]]] = []
+    if up:
+        for item in package_items(int(up["package_id"])):
+            rows.append([(f"➕ {item['title']} — {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}", f"pkg_make_sub:{user_package_id}:{item['id']}")])
+    rows.append([("⬅️ برگشت به پکیج", f"pkg_view:{user_package_id}"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+async def ensure_package_item_catalog_plan(item: sqlite3.Row, admin_id: int = 0) -> tuple[bool, str]:
+    key = package_plan_key(int(item["id"]))
+    # Use the package item price as CatalogPlan price too; the actual order amount is also stored in orders.
+    line = f"{key}|{item['title']}|{float(item['data_gb'])}|{int(item['days'])}|{int(item['price'])}|package|🎁 پکیج"
+    ok, msg = await upsert_plan_from_line(line, admin_id)
+    return ok, msg
+
 def referral_invite_link(user: sqlite3.Row) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=ref_{user['referral_code']}"
 
@@ -2441,13 +2922,34 @@ async def edit_or_answer(callback: CallbackQuery, text: str, reply_markup: Optio
 
 
 async def order_activation_preflight(order: sqlite3.Row, telegram_id: int) -> tuple[bool, str]:
-    """Prevent taking even demo payments when real Pasarguard activation is known to fail."""
+    """Prevent taking payments when real activation is known to fail."""
+    plan_key = str(order["plan_key"])
+    # Wallet topups and buying the package shell itself do not create a remote Pasarguard user.
+    if plan_key.startswith("wallet_topup:") or plan_key.startswith("pkg_assign:"):
+        return True, ""
     if not settings.pasarguard_enabled:
         return True, ""
     if settings.pasarguard_dry_run:
         return False, "فعال‌سازی خودکار سرویس موقتاً آماده نیست. لطفاً کمی بعد دوباره تلاش کنید یا با پشتیبانی تماس بگیرید."
-    plan_key = str(order["plan_key"])
-    if plan_key.startswith("wallet_topup:"):
+    if plan_key.startswith("pkg_sub:"):
+        try:
+            _tag, user_package_id_s, item_id_s = plan_key.split(":")
+            user_package = user_package_by_id(int(user_package_id_s), telegram_id)
+            item = package_item_by_id(int(item_id_s))
+        except Exception:
+            return False, "اطلاعات ساب داخل پکیج معتبر نیست."
+        if not user_package or str(user_package["status"]) != "active":
+            return False, "این پکیج هنوز فعال نیست یا متعلق به این حساب نیست."
+        if count_package_subscriptions(int(user_package["id"])) >= int(user_package["max_subscriptions"]):
+            return False, "ظرفیت ساخت ساب برای این پکیج تکمیل شده است."
+        if not item or int(item["package_id"]) != int(user_package["package_id"]):
+            return False, "پلن انتخاب‌شده داخل این پکیج پیدا نشد."
+        ok, msg = await ensure_package_item_catalog_plan(item)
+        if not ok:
+            return False, msg
+        template_id, _plan, error = await ensure_template_for_plan(package_plan_key(int(item["id"])))
+        if error or not template_id:
+            return False, error or "template مرتبط با ساب پکیج هنوز آماده نیست."
         return True, ""
     if plan_key.startswith("addon:") or plan_key.startswith("renew:"):
         try:
@@ -2513,7 +3015,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
             back_callback,
             "⬅️ بازگشت",
             allow_wallet=not is_wallet_topup,
-            allow_coupon=True,
+            allow_coupon=not plan_key.startswith("pkg_"),
             is_wallet_topup=is_wallet_topup,
         )
     if isinstance(target, CallbackQuery):
@@ -2920,6 +3422,107 @@ async def receipt_submit(callback: CallbackQuery, state: FSMContext) -> None:
     await notify_sales_admins_about_receipt(callback.bot, receipt_id)
 
 
+
+async def complete_package_assignment_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
+    try:
+        user_package_id = int(str(order["plan_key"]).split(":", 1)[1])
+    except Exception:
+        await callback.answer("شناسه پکیج معتبر نیست.", show_alert=True)
+        return
+    user_package = user_package_by_id(user_package_id, telegram_id)
+    if not user_package or str(user_package["status"]) not in {"offered", "pending_payment"}:
+        await callback.answer("این پکیج قابل پرداخت نیست.", show_alert=True)
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    user = db.get_user(telegram_id)
+    if not user:
+        await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
+        return
+    wallet_used = 0
+    if use_wallet:
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
+            return
+        if payable > 0:
+            db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت پکیج اختصاصی سفارش #{order['id']}")
+        wallet_used = payable
+    mark_user_package_active(user_package_id, int(order["id"]))
+    mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used)
+    user_package = user_package_by_id(user_package_id, telegram_id) or user_package
+    await edit_or_answer(
+        callback,
+        header("✅ پکیج فعال شد") + "پکیج اختصاصی شما فعال شد. حالا می‌توانید از پلن‌های داخل آن ساب بسازید.\n\n" + user_package_text(user_package),
+        user_package_view_kb(user_package),
+    )
+
+
+async def complete_package_sub_order(callback: CallbackQuery, telegram_id: int, order: sqlite3.Row, method: str, use_wallet: bool) -> None:
+    try:
+        _tag, user_package_id_s, item_id_s = str(order["plan_key"]).split(":")
+        user_package_id = int(user_package_id_s)
+        item_id = int(item_id_s)
+    except Exception:
+        await callback.answer("اطلاعات ساب معتبر نیست.", show_alert=True)
+        return
+    user_package = user_package_by_id(user_package_id, telegram_id)
+    item = package_item_by_id(item_id)
+    if not user_package or str(user_package["status"]) != "active":
+        await callback.answer("این پکیج فعال نیست.", show_alert=True)
+        return
+    if not item or int(item["package_id"]) != int(user_package["package_id"]):
+        await callback.answer("این پلن داخل پکیج شما وجود ندارد.", show_alert=True)
+        return
+    if count_package_subscriptions(user_package_id) >= int(user_package["max_subscriptions"]):
+        await callback.answer("ظرفیت ساخت ساب برای این پکیج تکمیل شده است.", show_alert=True)
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    user = db.get_user(telegram_id)
+    if not user:
+        await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
+        return
+    wallet_used = 0
+    if use_wallet:
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
+            return
+        if payable > 0:
+            db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت ساب پکیج سفارش #{order['id']}")
+        wallet_used = payable
+    ok, msg = await ensure_package_item_catalog_plan(item, callback.from_user.id)
+    if not ok:
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), msg)
+        await edit_or_answer(callback, header("⚠️ ساخت ساب ناموفق بود") + h(msg), user_package_view_kb(user_package))
+        return
+    plan = Plan(
+        key=package_plan_key(item_id),
+        title=str(item["title"]),
+        data_gb=float(item["data_gb"]),
+        days=int(item["days"]),
+        price=int(item["price"]),
+        category="package",
+        badge="🎁 پکیج",
+    )
+    service_name = make_service_name(telegram_id)
+    service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
+    db.update_order_service(int(order["id"]), service_id)
+    ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=int(order["id"]), is_test=False, paid_amount=payable)
+    if not ok:
+        error = _remote_failure_text(remote_result)
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(
+            callback,
+            header("⚠️ ساخت ساب ناموفق بود", service_name)
+            + "فعال‌سازی ساب کامل نشد. اگر مبلغی از کیف پول کم شده باشد، برگشت داده شد.\n\n"
+            + "جزئیات خطا در پنل ادمین قابل بررسی است.",
+            inline([[('🎫 پشتیبانی', 'ticket_new')], [("🎁 پکیج‌های من", "my_packages"), ("🏠 منوی اصلی", "home")]]),
+        )
+        return
+    record_package_subscription(user_package_id, item_id, service_id, telegram_id, int(order["id"]))
+    mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used, service_id=service_id)
+    service = db.get_service(service_id, telegram_id)
+    await edit_or_answer(callback, header("✅ ساب پکیج ساخته شد", service_name) + service_text(service), service_details_kb(service))
+
 async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: int, method: str, use_wallet: bool) -> None:
     order = db.get_order(order_id, telegram_id)
     if not order or order["status"] != "pending":
@@ -2928,6 +3531,12 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
     plan_key = str(order["plan_key"])
     if plan_key.startswith("wallet_topup:"):
         await callback.answer("شارژ کیف پول فقط از طریق کارت‌به‌کارت و تأیید رسید انجام می‌شود.", show_alert=True)
+        return
+    if plan_key.startswith("pkg_assign:"):
+        await complete_package_assignment_order(callback, telegram_id, order, method, use_wallet)
+        return
+    if plan_key.startswith("pkg_sub:"):
+        await complete_package_sub_order(callback, telegram_id, order, method, use_wallet)
         return
     if plan_key.startswith("addon:"):
         await complete_addon_order(callback, telegram_id, order, method, use_wallet)
@@ -4951,6 +5560,609 @@ async def admin_logs(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, text, admin_back_kb("adm_home"))
 
 
+
+# -----------------------------
+# Package-code admin/user handlers
+# -----------------------------
+@router.callback_query(F.data == "adm_packages")
+async def admin_packages(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    text = header("🎁 مدیریت کد پکیج‌ها")
+    text += "اینجا می‌توانید پکیج مستقل از پلن‌های فروش بسازید، برای کاربر خاص اختصاص دهید، و بعد از خرید، ساخت ساب‌های داخل پک را مدیریت کنید."
+    await edit_or_answer(callback, text, admin_packages_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_list")
+async def admin_package_list(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    packages = list_package_templates(False)
+    await edit_or_answer(callback, header("📋 لیست پکیج‌ها") + ("پکیجی ثبت نشده است." if not packages else "یکی را انتخاب کنید."), admin_package_list_kb(packages))
+
+
+@router.callback_query(F.data.startswith("adm_pkg:") )
+async def admin_package_details(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, package_text(package), admin_package_kb(package_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_toggle:"))
+async def admin_package_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    new_active = 0 if int(package["is_active"]) else 1
+    with closing(db.connect()) as conn:
+        conn.execute("UPDATE package_templates SET is_active = ?, updated_at = ? WHERE id = ?", (new_active, now_iso(), package_id))
+        conn.commit()
+    admin_log(callback.from_user.id, "PACKAGE_TOGGLE", "package", package_id, f"active={new_active}")
+    package = package_by_id(package_id)
+    await edit_or_answer(callback, header("✅ وضعیت پکیج تغییر کرد") + package_text(package), admin_package_kb(package_id))
+
+
+@router.callback_query(F.data == "adm_pkg_new")
+async def admin_package_new_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.waiting_package_name)
+    await state.update_data(pkg_items=[])
+    await edit_or_answer(callback, header("➕ ساخت پکیج", "مرحله ۱") + "نام پکیج را وارد کنید. مثال: <code>پکیج ویژه دانشجو</code>", admin_back_kb("adm_packages"))
+
+
+@router.message(AdminStates.waiting_package_name)
+async def admin_package_name_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, value = validate_package_name(message.text or "")
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    await state.update_data(pkg_name=value)
+    await state.set_state(AdminStates.waiting_package_price)
+    await message.answer(header("💰 قیمت پکیج", "مرحله ۲") + "قیمت خود پک را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", reply_markup=admin_back_kb("adm_packages"))
+
+
+@router.message(AdminStates.waiting_package_price)
+async def admin_package_price_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, amount, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    await state.update_data(pkg_price=amount)
+    await state.set_state(AdminStates.waiting_package_code)
+    await message.answer(
+        header("🧾 کد پکیج", "مرحله ۳")
+        + "کد پکیج را وارد کنید یا از دکمه ساخت خودکار استفاده کنید. مثال: <code>STUDENT_01</code>",
+        reply_markup=inline([[('🎲 ساخت کد خودکار', 'adm_pkg_code_random')], [('⬅️ بازگشت', 'adm_packages'), ('👑 منوی ادمین', 'adm_home')]]),
+    )
+
+
+@router.callback_query(F.data == "adm_pkg_code_random")
+async def admin_package_code_random(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    for _ in range(20):
+        code = random_package_code()
+        ok, _value = validate_package_code(code)
+        if ok:
+            await state.update_data(pkg_code=code)
+            await state.set_state(AdminStates.waiting_package_description)
+            await edit_or_answer(callback, header("📝 توضیحات پکیج", "مرحله ۴") + f"کد ساخته شد: <code>{h(code)}</code>\n\nتوضیحات پکیج را وارد کنید. برای خالی گذاشتن <code>-</code> بفرستید.", admin_back_kb("adm_packages"))
+            return
+    await callback.answer("ساخت کد خودکار ناموفق بود؛ دستی وارد کنید.", show_alert=True)
+
+
+@router.message(AdminStates.waiting_package_code)
+async def admin_package_code_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, value = validate_package_code(message.text or "")
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    await state.update_data(pkg_code=value)
+    await state.set_state(AdminStates.waiting_package_description)
+    await message.answer(header("📝 توضیحات پکیج", "مرحله ۴") + "توضیحات پکیج را وارد کنید. برای خالی گذاشتن <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_packages"))
+
+
+@router.message(AdminStates.waiting_package_description)
+async def admin_package_description_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, value = validate_long_text(message.text or "", "توضیحات", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    await state.update_data(pkg_description=value)
+    await state.set_state(AdminStates.waiting_package_conditions)
+    await message.answer(header("📌 شرایط پکیج", "مرحله ۵") + "شرایط و قوانین این پکیج را وارد کنید. برای خالی گذاشتن <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_packages"))
+
+
+@router.message(AdminStates.waiting_package_conditions)
+async def admin_package_conditions_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, value = validate_long_text(message.text or "", "شرایط", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    await state.update_data(pkg_conditions=value)
+    await state.set_state(AdminStates.waiting_package_max_subs)
+    await message.answer(header("🔢 تعداد ساب", "مرحله ۶") + "حداکثر تعداد ساب‌هایی که از این پک می‌شود ساخت را وارد کنید. مثال: <code>3</code>", reply_markup=admin_back_kb("adm_packages"))
+
+
+@router.message(AdminStates.waiting_package_max_subs)
+async def admin_package_max_subs_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, count, err = parse_max_subscriptions(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    await state.update_data(pkg_max_subscriptions=count)
+    await state.set_state(None)
+    await message.answer(header("📦 پلن‌های داخل پکیج", "مرحله ۷") + "حالا پلن‌های داخل پک را یکی‌یکی اضافه کنید. می‌توانید از پلن‌های فروش انتخاب کنید یا پلن دستی بسازید.", reply_markup=package_item_add_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_add_items")
+async def admin_package_add_items_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    items = data.get("pkg_items") or []
+    await edit_or_answer(callback, header("📦 پلن‌های داخل پکیج") + f"تعداد آیتم‌های اضافه‌شده: <b>{fmt_number(len(items))}</b>", package_item_add_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_item_sales")
+async def admin_package_item_sales(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("➕ انتخاب از پلن‌های فروش") + "پلن پایه را انتخاب کنید؛ در مرحله بعد قیمت ساب و تغییرات احتمالی را می‌دهید.", package_sales_plan_kb())
+
+
+@router.callback_query(F.data.startswith("adm_pkg_pick_sales:"))
+async def admin_package_pick_sales(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    plan_key = callback.data.split(":", 1)[1]
+    plan = PLANS.get(plan_key)
+    if not plan:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    await state.update_data(pkg_sales_plan_key=plan_key)
+    await state.set_state(AdminStates.waiting_package_sales_override)
+    text = header("✏️ قیمت و اورراید آیتم")
+    text += f"پلن پایه: <b>{h(plan.title)}</b> — {fmt_number(plan.data_gb)}GB / {fmt_number(plan.days)} روز\n\n"
+    text += "یکی از این دو حالت را بفرستید:\n"
+    text += "• فقط قیمت ساب: <code>50000</code>\n"
+    text += "• قیمت|عنوان یا -|حجم یا -|روز یا -\n"
+    text += "مثال: <code>50000|پلن ویژه|20|30</code>"
+    await edit_or_answer(callback, text, admin_back_kb("adm_pkg_add_items"))
+
+
+@router.message(AdminStates.waiting_package_sales_override)
+async def admin_package_sales_override_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    plan = PLANS.get(str(data.get("pkg_sales_plan_key") or ""))
+    if not plan:
+        await state.set_state(None)
+        await message.answer("پلن پایه پیدا نشد؛ دوباره انتخاب کنید.", reply_markup=package_item_add_kb())
+        return
+    ok, item, err = parse_package_sales_override(message.text or "", plan)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    items = list(data.get("pkg_items") or [])
+    items.append(item)
+    await state.update_data(pkg_items=items, pkg_sales_plan_key=None)
+    await state.set_state(None)
+    await message.answer(header("✅ آیتم اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", reply_markup=package_item_add_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_item_manual")
+async def admin_package_item_manual(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_package_manual_item)
+    text = header("✍️ آیتم دستی پکیج")
+    text += "فرمت را دقیقاً این‌طور بفرستید:\n<code>عنوان|حجم گیگ|روز|قیمت ساب</code>\n\n"
+    text += "مثال: <code>ساب دانشجویی|30|30|50000</code>"
+    await edit_or_answer(callback, text, admin_back_kb("adm_pkg_add_items"))
+
+
+@router.message(AdminStates.waiting_package_manual_item)
+async def admin_package_manual_item_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, item, err = parse_package_item_manual(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    items = list(data.get("pkg_items") or [])
+    items.append(item)
+    await state.update_data(pkg_items=items)
+    await state.set_state(None)
+    await message.answer(header("✅ آیتم دستی اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", reply_markup=package_item_add_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_item_finish")
+async def admin_package_finish(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    items = list(data.get("pkg_items") or [])
+    if not items:
+        await callback.answer("حداقل یک پلن/ساب باید داخل پکیج اضافه شود.", show_alert=True)
+        return
+    required = ["pkg_name", "pkg_price", "pkg_code", "pkg_max_subscriptions"]
+    if any(k not in data for k in required):
+        await callback.answer("اطلاعات پکیج ناقص است؛ دوباره بسازید.", show_alert=True)
+        await state.clear()
+        return
+    pkg_data = {
+        "name": data["pkg_name"],
+        "price": int(data["pkg_price"]),
+        "code": data["pkg_code"],
+        "description": data.get("pkg_description") or "",
+        "conditions": data.get("pkg_conditions") or "",
+        "max_subscriptions": int(data["pkg_max_subscriptions"]),
+    }
+    package_id = create_package_template(pkg_data, items, callback.from_user.id)
+    admin_log(callback.from_user.id, "PACKAGE_CREATE", "package", package_id, f"code={pkg_data['code']}; items={len(items)}")
+    await state.clear()
+    package = package_by_id(package_id)
+    await edit_or_answer(callback, header("✅ پکیج ساخته شد") + package_text(package), admin_package_kb(package_id))
+
+
+@router.callback_query(F.data == "adm_pkg_assign_start")
+async def admin_package_assign_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_package_assign_user)
+    await state.update_data(assign_package_id=None)
+    await edit_or_answer(callback, header("🎯 اختصاص پکیج") + "چت‌آیدی کاربر را وارد کنید.", admin_back_kb("adm_packages"))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_assign_pick:"))
+async def admin_package_assign_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    uid = int(data.get("assign_user_id", 0))
+    package_id = int(callback.data.split(":", 1)[1])
+    if not uid or not db.get_user(uid):
+        await callback.answer("کاربر مقصد مشخص نیست؛ دوباره شروع کنید.", show_alert=True)
+        return
+    assignment_id = create_user_package_assignment(package_id, uid, callback.from_user.id, status="draft")
+    up = user_package_by_id(assignment_id)
+    await edit_or_answer(callback, header("👀 پیش‌نمایش اختصاص پکیج") + user_package_text(up, user_view=False), admin_package_assignment_preview_kb(assignment_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_assign_user:"))
+async def admin_package_assign_from_user(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    packages = list_package_templates(True)
+    await state.set_state(None)
+    await state.update_data(assign_user_id=uid)
+    await edit_or_answer(callback, header("🎯 انتخاب پکیج", str(uid)) + "پکیجی که می‌خواهید به این کاربر اختصاص دهید را انتخاب کنید.", admin_package_assign_select_kb(packages, f"adm_user:{uid}"))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_assign:"))
+async def admin_package_assign_specific(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    await state.set_state(AdminStates.waiting_package_assign_user)
+    await state.update_data(assign_package_id=package_id)
+    await edit_or_answer(callback, header("🎯 اختصاص پکیج") + "چت‌آیدی کاربر را وارد کنید.", admin_back_kb(f"adm_pkg:{package_id}"))
+
+
+@router.message(AdminStates.waiting_package_assign_user)
+async def admin_package_assign_user_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = normalize_digits(message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("❌ چت‌آیدی معتبر نیست.")
+        return
+    uid = int(raw)
+    user = db.get_user(uid)
+    if not user:
+        await message.answer("❌ این کاربر هنوز در دیتابیس ربات ثبت نشده است. اول باید ربات را start کرده باشد.")
+        return
+    data = await state.get_data()
+    package_id = data.get("assign_package_id")
+    packages = list_package_templates(True)
+    await state.set_state(None)
+    await state.update_data(assign_user_id=uid)
+    if package_id:
+        assignment_id = create_user_package_assignment(int(package_id), uid, message.from_user.id, status="draft")
+        up = user_package_by_id(assignment_id)
+        await message.answer(header("👀 پیش‌نمایش اختصاص پکیج") + user_package_text(up, user_view=False), reply_markup=admin_package_assignment_preview_kb(assignment_id))
+    else:
+        await message.answer(header("🎯 انتخاب پکیج", str(uid)) + "پکیجی که می‌خواهید به این کاربر اختصاص دهید را انتخاب کنید.", reply_markup=admin_package_assign_select_kb(packages, "adm_packages"))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_custom:"))
+async def admin_userpkg_custom(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    user_package_id = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(user_package_id)
+    if not up or str(up["status"]) != "draft":
+        await callback.answer("این اختصاص قابل ویرایش نیست.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_package_assign_custom)
+    await state.update_data(custom_user_package_id=user_package_id)
+    text = header("✏️ کاستوم پکیج برای همین کاربر")
+    text += "فرمت:\n<code>قیمت پک|تعداد ساب|توضیح|شرایط|کد اختصاصی</code>\n\n"
+    text += "مثال: <code>0|5|توضیح اختصاصی|شرایط اختصاصی|VIPUSER01</code>\n"
+    text += "برای هر فیلد که نمی‌خواهید تغییر کند <code>-</code> بگذارید."
+    await edit_or_answer(callback, text, admin_back_kb(f"adm_userpkg_preview:{user_package_id}"))
+
+
+@router.message(AdminStates.waiting_package_assign_custom)
+async def admin_userpkg_custom_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    user_package_id = int(data.get("custom_user_package_id", 0))
+    up = user_package_by_id(user_package_id)
+    if not up or str(up["status"]) != "draft":
+        await state.clear()
+        await message.answer("این اختصاص قابل ویرایش نیست.", reply_markup=admin_packages_kb())
+        return
+    parts = [x.strip() for x in split_escaped_pipe(message.text or "")]
+    if len(parts) != 5:
+        await message.answer("❌ فرمت درست: قیمت|تعداد ساب|توضیح|شرایط|کد اختصاصی  یعنی دقیقاً ۵ بخش با | جدا شود.")
+        return
+    updates: dict[str, Any] = {}
+    if parts[0] != "-":
+        ok, amount, err = parse_positive_amount(parts[0], allow_zero=True)
+        if not ok:
+            await message.answer("❌ " + err)
+            return
+        updates["price"] = amount
+    if parts[1] != "-":
+        ok, count, err = parse_max_subscriptions(parts[1])
+        if not ok:
+            await message.answer("❌ " + err)
+            return
+        updates["max_subscriptions"] = count
+    if parts[2] != "-":
+        ok, value = validate_long_text(parts[2], "توضیح", allow_empty=True)
+        if not ok:
+            await message.answer("❌ " + value)
+            return
+        updates["description"] = value
+    if parts[3] != "-":
+        ok, value = validate_long_text(parts[3], "شرایط", allow_empty=True)
+        if not ok:
+            await message.answer("❌ " + value)
+            return
+        updates["conditions"] = value
+    if parts[4] != "-":
+        code = re.sub(r"\s+", "", normalize_digits(parts[4]).strip().upper())
+        if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
+            await message.answer("❌ کد اختصاصی باید ۳ تا ۴۰ کاراکتر و فقط شامل حروف انگلیسی، عدد، خط تیره یا آندرلاین باشد.")
+            return
+        with closing(db.connect()) as conn:
+            exists = conn.execute("SELECT id FROM user_packages WHERE code = ? AND id != ?", (code, user_package_id)).fetchone()
+        if exists:
+            await message.answer("❌ این کد اختصاصی قبلاً برای کاربر دیگری ثبت شده است.")
+            return
+        updates["code"] = code
+    update_user_package(user_package_id, **updates)
+    await state.clear()
+    up = user_package_by_id(user_package_id)
+    await message.answer(header("✅ کاستوم ذخیره شد") + user_package_text(up, user_view=False), reply_markup=admin_package_assignment_preview_kb(user_package_id))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_preview:"))
+async def admin_userpkg_preview(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid)
+    if not up:
+        await callback.answer("اختصاص پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("👀 پیش‌نمایش اختصاص پکیج") + user_package_text(up, user_view=False), admin_package_assignment_preview_kb(upid))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_cancel:"))
+async def admin_userpkg_cancel(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    upid = int(callback.data.split(":", 1)[1])
+    update_user_package(upid, status="cancelled")
+    await edit_or_answer(callback, header("❌ اختصاص لغو شد"), admin_packages_kb())
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_send:"))
+async def admin_userpkg_send(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid)
+    if not up or str(up["status"]) != "draft":
+        await callback.answer("این پکیج قابل ارسال نیست.", show_alert=True)
+        return
+    update_user_package(upid, status="offered", offered_at=now_iso())
+    up = user_package_by_id(upid)
+    try:
+        await callback.bot.send_message(int(up["user_telegram_id"]), header("🎁 یک پکیج اختصاصی برای شما درنظر گرفته شد") + user_package_text(up), reply_markup=user_package_view_kb(up))
+    except Exception as exc:
+        logger.warning("Failed to send package offer %s: %s", upid, exc)
+        await callback.answer("ارسال پیام به کاربر ناموفق بود؛ شاید ربات را بلاک کرده باشد.", show_alert=True)
+        return
+    admin_log(callback.from_user.id, "PACKAGE_ASSIGN_SEND", "user_package", upid, f"user={up['user_telegram_id']}")
+    await edit_or_answer(callback, header("✅ پیشنهاد پکیج ارسال شد") + user_package_text(up, user_view=False), admin_back_kb("adm_packages"))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_assignments:"))
+async def admin_package_assignments(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    with closing(db.connect()) as conn:
+        rows = list(conn.execute("SELECT * FROM user_packages WHERE package_id = ? ORDER BY id DESC LIMIT 30", (package_id,)).fetchall())
+    text = header("👥 اختصاص‌های پکیج")
+    if not rows:
+        text += "هنوز برای این پکیج اختصاصی ثبت نشده است."
+    else:
+        for up in rows:
+            subs = list_package_subscriptions(int(up["id"]))
+            sub_text = "، ".join(f"سرویس #{s['service_id']}" for s in subs[:5]) if subs else "بدون ساب"
+            text += f"#{up['id']} | کاربر <code>{up['user_telegram_id']}</code> | <b>{h(up['status'])}</b> | {h(up['code'])} | {fmt_money(int(up['price']))} | {h(sub_text)}\n"
+    await edit_or_answer(callback, text, admin_package_kb(package_id))
+
+
+@router.message(F.text == "🎁 پکیج‌های من")
+async def my_packages_msg(message: Message) -> None:
+    user = ensure_from_message(message)
+    packages = list_user_packages(int(user["telegram_id"]), include_old=True)
+    await message.answer(header("🎁 پکیج‌های من") + ("هنوز پکیجی برای شما ثبت نشده است." if not packages else "یکی از پکیج‌ها را انتخاب کنید."), reply_markup=user_packages_kb(packages))
+
+
+@router.callback_query(F.data == "my_packages")
+async def my_packages_cb(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    packages = list_user_packages(int(user["telegram_id"]), include_old=True)
+    await edit_or_answer(callback, header("🎁 پکیج‌های من") + ("هنوز پکیجی برای شما ثبت نشده است." if not packages else "یکی از پکیج‌ها را انتخاب کنید."), user_packages_kb(packages))
+
+
+@router.callback_query(F.data.startswith("pkg_view:"))
+async def user_package_view(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid, int(user["telegram_id"]))
+    if not up:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, user_package_text(up), user_package_view_kb(up))
+
+
+@router.callback_query(F.data.startswith("pkg_decline:"))
+async def user_package_decline(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid, int(user["telegram_id"]))
+    if not up or str(up["status"]) != "offered":
+        await callback.answer("این پیشنهاد قابل رد کردن نیست.", show_alert=True)
+        return
+    update_user_package(upid, status="declined")
+    up = user_package_by_id(upid, int(user["telegram_id"]))
+    await edit_or_answer(callback, header("❌ پکیج رد شد") + "این پیشنهاد برای شما رد شد.", user_package_view_kb(up))
+
+
+@router.callback_query(F.data.startswith("pkg_accept:"))
+async def user_package_accept(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid, telegram_id)
+    if not up or str(up["status"]) not in {"offered", "pending_payment"}:
+        await callback.answer("این پکیج قابل تأیید نیست.", show_alert=True)
+        return
+    if up["order_id"]:
+        await show_order_payment(callback, telegram_id, int(up["order_id"]))
+        return
+    order_id = db.create_order(telegram_id, f"pkg_assign:{upid}", int(up["price"]), 0, 0, "pending", "none")
+    update_user_package(upid, status="pending_payment", order_id=order_id)
+    await show_order_payment(callback, telegram_id, order_id)
+
+
+@router.callback_query(F.data.startswith("pkg_subs:"))
+async def user_package_subs(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid, int(user["telegram_id"]))
+    if not up or str(up["status"]) != "active":
+        await callback.answer("این پکیج فعال نیست.", show_alert=True)
+        return
+    used = count_package_subscriptions(upid)
+    if used >= int(up["max_subscriptions"]):
+        await callback.answer("ظرفیت ساخت ساب برای این پکیج تکمیل شده است.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("➕ ساخت ساب از پکیج") + f"استفاده‌شده: <b>{fmt_number(used)}</b> از <b>{fmt_number(int(up['max_subscriptions']))}</b>\n\nیکی از پلن‌های داخل پک را انتخاب کنید.", package_sub_items_kb(upid))
+
+
+@router.callback_query(F.data.startswith("pkg_make_sub:"))
+async def user_package_make_sub(callback: CallbackQuery) -> None:
+    user = ensure_from_callback(callback)
+    telegram_id = int(user["telegram_id"])
+    try:
+        _tag, upid_s, item_id_s = callback.data.split(":")
+        upid = int(upid_s)
+        item_id = int(item_id_s)
+    except Exception:
+        await callback.answer("اطلاعات معتبر نیست.", show_alert=True)
+        return
+    up = user_package_by_id(upid, telegram_id)
+    item = package_item_by_id(item_id)
+    if not up or str(up["status"]) != "active":
+        await callback.answer("این پکیج فعال نیست.", show_alert=True)
+        return
+    if not item or int(item["package_id"]) != int(up["package_id"]):
+        await callback.answer("این پلن داخل پکیج شما نیست.", show_alert=True)
+        return
+    if count_package_subscriptions(upid) >= int(up["max_subscriptions"]):
+        await callback.answer("ظرفیت ساخت ساب برای این پکیج تکمیل شده است.", show_alert=True)
+        return
+    order_id = db.create_order(telegram_id, f"pkg_sub:{upid}:{item_id}", int(item["price"]), 0, 0, "pending", "none")
+    await show_order_payment(callback, telegram_id, order_id)
+
 @router.message()
 async def unknown(message: Message, state: FSMContext) -> None:
     ensure_from_message(message)
@@ -4982,6 +6194,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 
