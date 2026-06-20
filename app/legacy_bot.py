@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import logging
 import os
 import random
@@ -638,6 +639,17 @@ def ensure_admin_schema() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS required_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                invite_link TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS coupons (
                 code TEXT PRIMARY KEY,
                 percent INTEGER NOT NULL,
@@ -797,6 +809,8 @@ def ensure_admin_schema() -> None:
             ("orders", "receipt_id", "ALTER TABLE orders ADD COLUMN receipt_id INTEGER"),
             ("coupons", "max_discount_amount", "ALTER TABLE coupons ADD COLUMN max_discount_amount INTEGER"),
             ("coupons", "min_order_amount", "ALTER TABLE coupons ADD COLUMN min_order_amount INTEGER NOT NULL DEFAULT 0"),
+            ("coupons", "condition_json", "ALTER TABLE coupons ADD COLUMN condition_json TEXT"),
+            ("coupons", "condition_label", "ALTER TABLE coupons ADD COLUMN condition_label TEXT"),
             ("payment_cards", "note", "ALTER TABLE payment_cards ADD COLUMN note TEXT"),
             ("payment_receipts", "admin_note", "ALTER TABLE payment_receipts ADD COLUMN admin_note TEXT"),
             ("payment_receipts", "expires_at", "ALTER TABLE payment_receipts ADD COLUMN expires_at TEXT"),
@@ -867,6 +881,7 @@ ADMIN_ROLE_PERMISSIONS: dict[str, set[str]] = {
     "sales": {"dashboard", "orders", "payment_receipts", "packages"},
     "support": {"dashboard", "users", "services", "direct_message", "packages"},
     "marketing": {"dashboard", "broadcast", "coupons", "reports", "packages"},
+    "channels": {"dashboard", "channels"},
     "appearance": {"dashboard", "appearance"},
 }
 
@@ -876,6 +891,7 @@ ADMIN_ROLE_DESCRIPTIONS: dict[str, str] = {
     "support": "پشتیبانی کاربران، مشاهده/مدیریت سرویس‌ها و ارسال پیام مستقیم؛ بدون دسترسی مالی حساس.",
     "marketing": "کمپین، پیام همگانی، کد تخفیف و گزارش‌ها؛ بدون دسترسی عملیاتی به کاربران/پرداخت.",
     "appearance": "فقط تغییرات ظاهری ربات، متن‌ها، پیام‌ها، ایموجی‌ها و قالب‌های نمایشی.",
+    "channels": "فقط مدیریت کانال‌های عضویت اجباری و لینک‌های بررسی عضویت.",
 }
 
 
@@ -1082,37 +1098,360 @@ def coupon_usage_count(code: str, telegram_id: Optional[int] = None) -> int:
         return int(row["c"] if row else 0)
 
 
-def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row) -> tuple[Optional[sqlite3.Row], str]:
+def normalize_chat_ref(value: str) -> str:
+    raw = normalize_digits(value or "").strip()
+    raw = raw.replace("https://t.me/", "@").replace("http://t.me/", "@").replace("t.me/", "@")
+    raw = raw.split("?", 1)[0].strip().rstrip("/")
+    if raw.startswith("@"):
+        return "@" + raw.lstrip("@").strip()
+    return raw
+
+
+def chat_ref_for_api(chat_id: str) -> int | str:
+    value = normalize_chat_ref(chat_id)
+    return int(value) if re.fullmatch(r"-?\d+", value) else value
+
+
+def validate_required_channel_ref(value: str) -> tuple[bool, str, str]:
+    ref = normalize_chat_ref(value)
+    if not ref:
+        return False, "", "شناسه کانال نمی‌تواند خالی باشد."
+    if ref.startswith("@"):
+        if not re.fullmatch(r"@[A-Za-z0-9_]{5,64}", ref):
+            return False, "", "یوزرنیم کانال معتبر نیست. مثال: @HowToSeeWorld"
+        return True, ref, ""
+    if not re.fullmatch(r"-?\d{5,30}", ref):
+        return False, "", "برای کانال خصوصی، آیدی عددی مثل -1001234567890 وارد کنید؛ برای کانال عمومی @username وارد کنید."
+    return True, ref, ""
+
+
+def list_required_channels(active_only: bool = False) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        where = "WHERE is_active = 1" if active_only else ""
+        return list(conn.execute(f"SELECT * FROM required_channels {where} ORDER BY id DESC").fetchall())
+
+
+def required_channel_by_id(channel_id: int) -> Optional[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM required_channels WHERE id = ?", (channel_id,)).fetchone()
+
+
+def required_channel_by_ref(chat_id: str) -> Optional[sqlite3.Row]:
+    ref = normalize_chat_ref(chat_id)
+    with closing(db.connect()) as conn:
+        return conn.execute("SELECT * FROM required_channels WHERE chat_id = ?", (ref,)).fetchone()
+
+
+def upsert_required_channel(chat_id: str, title: str, invite_link: str, admin_id: int) -> None:
+    ref = normalize_chat_ref(chat_id)
+    title = (title or ref).strip()[:80]
+    invite = (invite_link or "").strip() or None
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            INSERT INTO required_channels (chat_id, title, invite_link, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                title = excluded.title,
+                invite_link = excluded.invite_link,
+                is_active = 1,
+                updated_at = excluded.updated_at
+            """,
+            (ref, title, invite, admin_id, now_iso(), now_iso()),
+        )
+        conn.commit()
+    admin_log(admin_id, "REQUIRED_CHANNEL_UPSERT", "channel", ref, title)
+
+
+def set_required_channel_active(channel_id: int, active: bool, admin_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        cur = conn.execute("UPDATE required_channels SET is_active = ?, updated_at = ? WHERE id = ?", (1 if active else 0, now_iso(), channel_id))
+        conn.commit()
+    if cur.rowcount:
+        admin_log(admin_id, "REQUIRED_CHANNEL_ACTIVE", "channel", channel_id, f"active={active}")
+        return True
+    return False
+
+
+def delete_required_channel(channel_id: int, admin_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        cur = conn.execute("DELETE FROM required_channels WHERE id = ?", (channel_id,))
+        conn.commit()
+    if cur.rowcount:
+        admin_log(admin_id, "REQUIRED_CHANNEL_DELETE", "channel", channel_id, "")
+        return True
+    return False
+
+
+def required_channel_label(row: sqlite3.Row | dict[str, Any] | None, fallback: str = "") -> str:
+    if not row:
+        return fallback or "کانال"
+    try:
+        title = str(row["title"] or "").strip()
+        chat_id = str(row["chat_id"] or "").strip()
+    except Exception:
+        title = str(row.get("title") or "").strip()  # type: ignore[attr-defined]
+        chat_id = str(row.get("chat_id") or "").strip()  # type: ignore[attr-defined]
+    return title or chat_id or fallback or "کانال"
+
+
+def chat_member_status_name(member: Any) -> str:
+    status = getattr(member, "status", "")
+    value = getattr(status, "value", status)
+    return str(value).split(".")[-1].lower()
+
+
+async def is_member_of_channel(bot: Bot, telegram_id: int, chat_id: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_ref_for_api(chat_id), telegram_id)
+        status = chat_member_status_name(member)
+        if status in {"creator", "administrator", "member"}:
+            return True
+        if status == "restricted" and bool(getattr(member, "is_member", False)):
+            return True
+        return False
+    except Exception as exc:
+        logger.warning("required channel membership check failed: chat=%s user=%s err=%r", chat_id, telegram_id, exc)
+        return False
+
+
+async def missing_required_channels(bot: Bot, telegram_id: int) -> list[sqlite3.Row]:
+    missing: list[sqlite3.Row] = []
+    for channel in list_required_channels(active_only=True):
+        if not await is_member_of_channel(bot, telegram_id, str(channel["chat_id"])):
+            missing.append(channel)
+    return missing
+
+
+def required_channels_prompt_text(missing: list[sqlite3.Row] | None = None) -> str:
+    channels = missing if missing is not None else list_required_channels(active_only=True)
+    text = header("📣 عضویت در کانال‌های الزامی")
+    text += "برای استفاده از ربات، ابتدا باید عضو کانال‌های مشخص‌شده شوید و بعد دکمه بررسی عضویت را بزنید.\n\n"
+    if channels:
+        text += "کانال‌های لازم:\n"
+        for ch in channels:
+            text += f"• <b>{h(required_channel_label(ch))}</b> <code>{h(ch['chat_id'])}</code>\n"
+    else:
+        text += "فعلاً کانال الزامی فعال نیست."
+    return text
+
+
+def required_channels_user_kb(channels: list[sqlite3.Row] | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for ch in (channels if channels is not None else list_required_channels(active_only=True)):
+        link = str(ch["invite_link"] or "").strip()
+        label = f"📣 عضویت در {required_channel_label(ch)}"
+        if link.startswith(("http://", "https://", "tg://")):
+            rows.append([InlineKeyboardButton(text=label, url=link)])
+    rows.append([InlineKeyboardButton(text="✅ بررسی دوباره عضویت", callback_data="check_required_channels")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def required_channels_admin_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("➕ افزودن کانال", "adm_reqch_add")]]
+    for ch in list_required_channels(active_only=False)[:30]:
+        active = int(ch["is_active"] or 0) == 1
+        icon = "✅" if active else "⛔"
+        rows.append([(f"{icon} {required_channel_label(ch)[:28]}", f"adm_reqch_view:{ch['id']}")])
+    rows.append([("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def required_channel_admin_view_kb(channel_id: int) -> InlineKeyboardMarkup:
+    ch = required_channel_by_id(channel_id)
+    active = bool(ch and int(ch["is_active"] or 0))
+    toggle = ("⛔ غیرفعال کردن", f"adm_reqch_toggle:{channel_id}:0") if active else ("✅ فعال کردن", f"adm_reqch_toggle:{channel_id}:1")
+    return inline([
+        [toggle, ("🗑 حذف", f"adm_reqch_delete:{channel_id}")],
+        [("⬅️ کانال‌های الزامی", "adm_required_channels"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def coupon_usage_generic_error() -> str:
+    return "این کد منقضی شده، برای شما نیست یا قابل استفاده نیست."
+
+
+def safe_json_loads(value: Any, default: Any) -> Any:
+    try:
+        if not value:
+            return default
+        return json.loads(str(value))
+    except Exception:
+        return default
+
+
+def empty_coupon_condition() -> dict[str, Any]:
+    return {"version": 1, "groups": []}
+
+
+def coupon_condition_groups(condition: dict[str, Any] | None) -> list[list[dict[str, Any]]]:
+    if not condition:
+        return []
+    groups = condition.get("groups") or []
+    clean: list[list[dict[str, Any]]] = []
+    for group in groups:
+        if isinstance(group, list):
+            clauses = [c for c in group if isinstance(c, dict) and c.get("type")]
+            if clauses:
+                clean.append(clauses)
+    return clean
+
+
+def coupon_clause_label(clause: dict[str, Any]) -> str:
+    ctype = str(clause.get("type") or "")
+    if ctype == "first_purchase":
+        label = "خرید اول کاربر"
+    elif ctype == "channel_member":
+        label = f"عضویت در کانال «{clause.get('title') or clause.get('chat_id') or 'کانال'}»"
+    elif ctype == "user_ids":
+        ids = clause.get("ids") or []
+        label = f"چت‌آیدی داخل لیست {len(ids)} نفره"
+    elif ctype == "admin_roles":
+        roles = ", ".join(clause.get("roles") or [])
+        label = f"ادمین با نقش‌های: {roles or 'نامشخص'}"
+    else:
+        label = "شرط ناشناخته"
+    return f"نه ({label})" if clause.get("negate") else label
+
+
+def render_coupon_condition_label(condition: dict[str, Any] | None) -> str:
+    groups = coupon_condition_groups(condition)
+    if not groups:
+        return "بدون شرط خاص؛ همه کاربران مجاز هستند."
+    parts: list[str] = []
+    for group in groups:
+        parts.append("(" + " و ".join(coupon_clause_label(c) for c in group) + ")")
+    return " یا ".join(parts)
+
+
+def add_coupon_clause(condition: dict[str, Any], clause: dict[str, Any], mode: str = "and") -> dict[str, Any]:
+    groups = coupon_condition_groups(condition)
+    if mode == "or" or not groups:
+        groups.append([clause])
+    else:
+        groups[-1].append(clause)
+    return {"version": 1, "groups": groups}
+
+
+def negate_last_coupon_clause(condition: dict[str, Any]) -> dict[str, Any]:
+    groups = coupon_condition_groups(condition)
+    if groups and groups[-1]:
+        groups[-1][-1]["negate"] = not bool(groups[-1][-1].get("negate"))
+    return {"version": 1, "groups": groups}
+
+
+def coupon_condition_preview_text(condition: dict[str, Any] | None) -> str:
+    return header("🧩 شرایط استفاده از کد تخفیف") + "نمایش منطقی شرط‌ها:\n\n" + f"<b>{h(render_coupon_condition_label(condition))}</b>"
+
+
+def coupon_condition_builder_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("➕ افزودن شرط AND", "adm_coupon_cond_add:and"), ("➕ افزودن گروه OR", "adm_coupon_cond_add:or")],
+        [("🔁 NOT برای آخرین شرط", "adm_coupon_cond_negate"), ("🧹 پاک کردن شروط", "adm_coupon_cond_clear")],
+        [("✅ ادامه ساخت کد", "adm_coupon_cond_done")],
+        [("⬅️ بازگشت", "adm_coupons"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def coupon_condition_type_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("🆕 خرید اول", "adm_coupon_cond_type:first_purchase")],
+        [("📣 عضو یک کانال خاص", "adm_coupon_cond_type:channel_member")],
+        [("👥 داخل لیست چت‌آیدی", "adm_coupon_cond_type:user_ids")],
+        [("👮 نوع ادمین", "adm_coupon_cond_type:admin_roles")],
+        [("⬅️ شرایط کد", "adm_coupon_condition_builder"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def coupon_condition_channel_select_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for ch in list_required_channels(active_only=True)[:30]:
+        rows.append([(required_channel_label(ch)[:45], f"adm_coupon_cond_channel:{ch['id']}")])
+    rows.append([("⬅️ انتخاب نوع شرط", "adm_coupon_cond_type_back"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def coupon_condition_admin_roles_kb(selected: list[str] | None = None) -> InlineKeyboardMarkup:
+    selected_set = set(selected or [])
+    rows: list[list[tuple[str, str]]] = []
+    for role in ADMIN_ROLE_PERMISSIONS.keys():
+        icon = "✅" if role in selected_set else "☐"
+        rows.append([(f"{icon} {role}", f"adm_coupon_cond_role_toggle:{role}")])
+    rows.append([("✅ ثبت نقش‌ها", "adm_coupon_cond_role_done")])
+    rows.append([("⬅️ انتخاب نوع شرط", "adm_coupon_cond_type_back"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+async def coupon_clause_matches(clause: dict[str, Any], telegram_id: int, bot: Bot | None) -> bool:
+    ctype = str(clause.get("type") or "")
+    result = False
+    if ctype == "first_purchase":
+        user = db.get_user(telegram_id)
+        result = bool(user and int(user["first_purchase_done"] or 0) == 0)
+    elif ctype == "channel_member":
+        result = bool(bot and await is_member_of_channel(bot, telegram_id, str(clause.get("chat_id") or "")))
+    elif ctype == "user_ids":
+        result = str(telegram_id) in {str(x) for x in (clause.get("ids") or [])}
+    elif ctype == "admin_roles":
+        role = admin_role(telegram_id)
+        result = bool(role and role in set(clause.get("roles") or []))
+    if clause.get("negate"):
+        return not result
+    return result
+
+
+async def coupon_conditions_match(condition: dict[str, Any] | None, telegram_id: int, bot: Bot | None) -> bool:
+    groups = coupon_condition_groups(condition)
+    if not groups:
+        return True
+    for group in groups:
+        ok = True
+        for clause in group:
+            if not await coupon_clause_matches(clause, telegram_id, bot):
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row, bot: Bot | None = None) -> tuple[Optional[sqlite3.Row], str]:
     if setting_get("coupon_enabled", "1") != "1":
-        return None, "سیستم کد تخفیف فعلاً غیرفعال است."
+        return None, coupon_usage_generic_error()
     code = (code or "").strip().upper()
     row = coupon_row(code)
     if not row or not int(row["active"]):
-        return None, "این کد تخفیف معتبر نیست یا غیرفعال شده است."
+        return None, coupon_usage_generic_error()
     if row["expires_at"]:
         try:
             if datetime.fromisoformat(str(row["expires_at"])) < datetime.now(TEHRAN_TZ):
-                return None, "مهلت استفاده از این کد تخفیف تمام شده است."
+                return None, coupon_usage_generic_error()
         except ValueError:
             pass
     usage_limit = row["usage_limit"]
     if usage_limit is not None and int(row["used_count"]) >= int(usage_limit):
-        return None, "ظرفیت استفاده از این کد تخفیف تکمیل شده است."
+        return None, coupon_usage_generic_error()
     if int(row["per_user_limit"] or 1) <= coupon_usage_count(code, telegram_id):
-        return None, "سقف استفاده شما از این کد تخفیف تکمیل شده است."
+        return None, coupon_usage_generic_error()
     min_order_amount = int(row["min_order_amount"] if row_has(row, "min_order_amount") and row["min_order_amount"] is not None else 0)
     if min_order_amount and int(order["amount"]) < min_order_amount:
-        return None, f"این کد فقط برای خریدهای حداقل {fmt_money(min_order_amount)} قابل استفاده است."
-    scope = str(row["scope"] or "all")
-    targets = [x.strip() for x in str(row["target_user_ids"] or "").split(",") if x.strip()]
-    if scope in {"user", "users"} and str(telegram_id) not in targets:
-        return None, "این کد تخفیف مخصوص حساب شما نیست."
-    if scope == "first_purchase":
-        user = db.get_user(telegram_id)
-        if user and int(user["first_purchase_done"]):
-            return None, "این کد فقط برای خرید اول قابل استفاده است."
-    return row, ""
+        return None, coupon_usage_generic_error()
 
+    condition = safe_json_loads(row["condition_json"] if row_has(row, "condition_json") else None, None)
+    if condition:
+        if not await coupon_conditions_match(condition, telegram_id, bot):
+            return None, coupon_usage_generic_error()
+    else:
+        # Backward compatibility for old coupons created before this hotfix.
+        scope = str(row["scope"] or "all")
+        targets = [x.strip() for x in str(row["target_user_ids"] or "").split(",") if x.strip()]
+        if scope in {"user", "users"} and str(telegram_id) not in targets:
+            return None, coupon_usage_generic_error()
+        if scope == "first_purchase":
+            user = db.get_user(telegram_id)
+            if user and int(user["first_purchase_done"]):
+                return None, coupon_usage_generic_error()
+    return row, ""
 
 def save_order_coupon(order_id: int, telegram_id: int, code: str, coupon_discount: int, total_discount: int) -> None:
     with closing(db.connect()) as conn:
@@ -1202,6 +1541,8 @@ def create_coupon_admin(
     max_discount_amount: Optional[int] = None,
     min_order_amount: int = 0,
     stack_with_referral: int = 1,
+    condition_json: str | None = None,
+    condition_label: str | None = None,
 ) -> None:
     expires_at = None
     if expires_days and expires_days > 0:
@@ -1211,8 +1552,8 @@ def create_coupon_admin(
             """
             INSERT INTO coupons
             (code, percent, title, scope, target_user_ids, usage_limit, per_user_limit, used_count,
-             stack_with_referral, max_discount_percent, max_discount_amount, min_order_amount, active, expires_at, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, 1, ?, ?, ?)
+             stack_with_referral, max_discount_percent, max_discount_amount, min_order_amount, condition_json, condition_label, active, expires_at, created_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 percent = excluded.percent,
                 title = excluded.title,
@@ -1224,6 +1565,8 @@ def create_coupon_admin(
                 max_discount_percent = excluded.max_discount_percent,
                 max_discount_amount = excluded.max_discount_amount,
                 min_order_amount = excluded.min_order_amount,
+                condition_json = excluded.condition_json,
+                condition_label = excluded.condition_label,
                 active = 1,
                 expires_at = excluded.expires_at
             """,
@@ -1231,7 +1574,7 @@ def create_coupon_admin(
                 code.upper(), percent, title, scope, target_user_ids or None, usage_limit,
                 max(int(per_user_limit), 1), 1 if stack_with_referral else 0,
                 min(max(int(max_discount_percent), 0), 100), max_discount_amount, max(int(min_order_amount), 0),
-                expires_at, admin_id, now_iso(),
+                condition_json, condition_label, expires_at, admin_id, now_iso(),
             ),
         )
         conn.commit()
@@ -1244,6 +1587,20 @@ def disable_coupon_admin(code: str, admin_id: int) -> bool:
         conn.commit()
     if cur.rowcount:
         admin_log(admin_id, "COUPON_DISABLE", "coupon", code.upper(), "")
+        return True
+    return False
+
+
+def update_coupon_condition_admin(code: str, condition: dict[str, Any], admin_id: int) -> bool:
+    condition_label = render_coupon_condition_label(condition)
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            "UPDATE coupons SET condition_json = ?, condition_label = ? WHERE code = ?",
+            (json.dumps(condition, ensure_ascii=False), condition_label, code.upper()),
+        )
+        conn.commit()
+    if cur.rowcount:
+        admin_log(admin_id, "COUPON_CONDITION_UPDATE", "coupon", code.upper(), condition_label[:500])
         return True
     return False
 
@@ -1624,6 +1981,11 @@ class AdminStates(StatesGroup):
     waiting_coupon_min_order = State()
     waiting_coupon_max_amount = State()
     waiting_coupon_expires = State()
+    waiting_coupon_condition_users = State()
+    waiting_coupon_edit_condition_code = State()
+    waiting_required_channel_id = State()
+    waiting_required_channel_title = State()
+    waiting_required_channel_link = State()
     waiting_disable_coupon = State()
     waiting_add_admin_line = State()  # legacy fallback only
     waiting_add_admin_chat_id = State()
@@ -1911,6 +2273,8 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
         [("📊 گزارش‌ها", "adm_reports"), ("🗄 بک‌آپ/ریستور", "adm_backup")],
         [("🔌 Pasarguard", "adm_pasarguard")],
     ]
+    if admin_has(admin_id, "channels"):
+        rows.append([("📣 عضویت اجباری", "adm_required_channels")])
     appearance_row: list[tuple[str, str]] = []
     if admin_has(admin_id, "appearance"):
         appearance_row.append(("🎨 تغییرات ظاهری ربات", "adm_texts"))
@@ -2032,8 +2396,8 @@ def admin_order_kb(order: sqlite3.Row) -> InlineKeyboardMarkup:
 
 def admin_coupon_kb() -> InlineKeyboardMarkup:
     return inline([
-        [("➕ ساخت/ویرایش کد", "adm_coupon_add"), ("⛔ غیرفعال کردن کد", "adm_coupon_disable")],
-        [("📋 کدهای فعال", "adm_coupon_list")],
+        [("➕ ساخت/ویرایش کد", "adm_coupon_add"), ("🧩 ویرایش شرایط کد", "adm_coupon_edit_conditions")],
+        [("⛔ غیرفعال کردن کد", "adm_coupon_disable"), ("📋 کدهای فعال", "adm_coupon_list")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -3109,6 +3473,29 @@ class AccessGuardMiddleware(BaseMiddleware):
                 elif isinstance(event, Message):
                     await event.answer(block_msg)
                 return None
+
+        # Required-channel gate: every non-admin use of the bot is checked.
+        # The retry button itself is allowed to reach its handler so it can re-check and refresh the message.
+        callback_data = str(getattr(event, "data", "") or "") if isinstance(event, CallbackQuery) else ""
+        if callback_data != "check_required_channels":
+            active_channels = list_required_channels(active_only=True)
+            if active_channels:
+                bot = data.get("bot") or getattr(event, "bot", None)
+                if bot is not None:
+                    missing = await missing_required_channels(bot, telegram_id)
+                    if missing:
+                        text = required_channels_prompt_text(missing)
+                        markup = required_channels_user_kb(missing)
+                        if isinstance(event, CallbackQuery):
+                            if event.message:
+                                try:
+                                    await event.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+                                except Exception:
+                                    await event.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+                            await event.answer("برای استفاده از ربات، اول عضویت کانال‌ها را کامل کنید.", show_alert=True)
+                        elif isinstance(event, Message):
+                            await event.answer(text, reply_markup=markup, disable_web_page_preview=True)
+                        return None
         return await handler(event, data)
 
 
@@ -3265,7 +3652,7 @@ async def coupon_finish(message: Message, state: FSMContext) -> None:
         await message.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", reply_markup=back_home_kb())
         return
     code = (message.text or "").strip().upper()
-    coupon_row_obj, error = validate_coupon_for_order(code, int(user["telegram_id"]), order)
+    coupon_row_obj, error = await validate_coupon_for_order(code, int(user["telegram_id"]), order, getattr(message, "bot", None))
     if not coupon_row_obj:
         await message.answer(f"❌ {h(error or 'این کد تخفیف معتبر نیست.')}\nلطفاً دوباره وارد کنید یا انصراف را بزنید.", reply_markup=coupon_cancel_kb(order_id))
         return
@@ -5258,12 +5645,196 @@ async def admin_bot_lock_msg_finish(message: Message, state: FSMContext) -> None
     await message.answer(header("✅ پیام قفل ذخیره شد") + f"<code>{h(text)}</code>", reply_markup=admin_bot_lock_kb())
 
 
+@router.callback_query(F.data == "adm_required_channels")
+async def admin_required_channels(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "channels"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    text = header("📣 عضویت اجباری")
+    text += "اینجا کانال‌هایی را تعیین می‌کنید که همه کاربران غیرادمین برای استفاده از ربات باید عضو آن‌ها باشند.\n\n"
+    text += "نکته: برای چک با آیدی عددی کانال خصوصی، بات باید داخل کانال باشد و دسترسی لازم داشته باشد. برای دکمه عضویت، لینک دعوت را هم ثبت کنید."
+    await edit_or_answer(callback, text, required_channels_admin_kb())
+
+
+@router.callback_query(F.data == "adm_reqch_add")
+async def admin_required_channel_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "channels"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_required_channel_id)
+    await state.update_data(required_channel={})
+    await edit_or_answer(
+        callback,
+        header("➕ افزودن کانال الزامی", "مرحله ۱")
+        + "شناسه کانال را وارد کنید.\n\n"
+        + "برای کانال عمومی: <code>@ChannelUsername</code>\n"
+        + "برای کانال خصوصی: آیدی عددی مثل <code>-1001234567890</code>\n\n"
+        + "بله، فقط با همین آیدی عددی هم می‌شود عضویت را چک کرد، به شرطی که بات داخل کانال باشد و دسترسی لازم داشته باشد.",
+        admin_back_kb("adm_required_channels"),
+    )
+
+
+@router.message(AdminStates.waiting_required_channel_id)
+async def admin_required_channel_id_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "channels"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, ref, err = validate_required_channel_ref(message.text or "")
+    if not ok:
+        await message.answer(f"❌ {h(err)}")
+        return
+    await state.update_data(required_channel={"chat_id": ref})
+    await state.set_state(AdminStates.waiting_required_channel_title)
+    await message.answer(header("عنوان نمایشی کانال", "مرحله ۲") + "عنوانی که کاربر در پیام عضویت می‌بیند را وارد کنید. مثال: <code>کانال رسمی HowToSee</code>", reply_markup=admin_back_kb("adm_required_channels"))
+
+
+@router.message(AdminStates.waiting_required_channel_title)
+async def admin_required_channel_title_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "channels"):
+        await message.answer("دسترسی ندارید.")
+        return
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("❌ عنوان باید بین ۲ تا ۸۰ کاراکتر باشد.")
+        return
+    data = await state.get_data()
+    ch = dict(data.get("required_channel") or {})
+    ch["title"] = title
+    await state.update_data(required_channel=ch)
+    await state.set_state(AdminStates.waiting_required_channel_link)
+    await message.answer(
+        header("لینک عضویت", "مرحله ۳")
+        + "لینک عمومی یا لینک دعوت کانال را وارد کنید. اگر فعلاً لینک نمی‌خواهید، <code>-</code> بفرستید.\n\n"
+        + "برای کانال خصوصی، بدون لینک دعوت کاربر دکمه عضویت نمی‌بیند، ولی چک عضویت با آیدی همچنان ممکن است.",
+        reply_markup=admin_back_kb("adm_required_channels"),
+    )
+
+
+@router.message(AdminStates.waiting_required_channel_link)
+async def admin_required_channel_link_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "channels"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.text or "").strip()
+    link = "" if raw == "-" else raw
+    if link and not link.startswith(("http://", "https://", "tg://")):
+        await message.answer("❌ لینک باید با http:// یا https:// یا tg:// شروع شود. برای بدون لینک <code>-</code> بفرستید.")
+        return
+    data = await state.get_data()
+    ch = dict(data.get("required_channel") or {})
+    if not ch.get("chat_id") or not ch.get("title"):
+        await state.clear()
+        await message.answer("اطلاعات کانال ناقص بود. دوباره شروع کنید.", reply_markup=required_channels_admin_kb())
+        return
+    upsert_required_channel(str(ch["chat_id"]), str(ch["title"]), link, message.from_user.id if message.from_user else 0)
+    await state.clear()
+    await message.answer(header("✅ کانال الزامی ذخیره شد") + f"کانال <b>{h(ch['title'])}</b> ثبت و فعال شد.", reply_markup=required_channels_admin_kb())
+
+
+@router.callback_query(F.data.startswith("adm_reqch_view:"))
+async def admin_required_channel_view(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "channels"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    channel_id = int(callback.data.split(":", 1)[1])
+    ch = required_channel_by_id(channel_id)
+    if not ch:
+        await callback.answer("کانال پیدا نشد.", show_alert=True)
+        return
+    active = "فعال ✅" if int(ch["is_active"] or 0) else "غیرفعال ⛔"
+    text = header("📣 کانال الزامی", required_channel_label(ch))
+    text += f"شناسه: <code>{h(ch['chat_id'])}</code>\n"
+    text += f"وضعیت: <b>{active}</b>\n"
+    text += f"لینک عضویت: <code>{h(ch['invite_link'] or 'ثبت نشده')}</code>\n"
+    await edit_or_answer(callback, text, required_channel_admin_view_kb(channel_id))
+
+
+@router.callback_query(F.data.startswith("adm_reqch_toggle:"))
+async def admin_required_channel_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "channels"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _tag, channel_id_s, active_s = callback.data.split(":")
+        channel_id = int(channel_id_s)
+        active = active_s == "1"
+    except Exception:
+        await callback.answer("اطلاعات معتبر نیست.", show_alert=True)
+        return
+    set_required_channel_active(channel_id, active, callback.from_user.id)
+    ch = required_channel_by_id(channel_id)
+    if not ch:
+        await callback.answer("کانال پیدا نشد.", show_alert=True)
+        return
+    status_text = "فعال ✅" if int(ch["is_active"] or 0) else "غیرفعال ⛔"
+    text = header("📣 کانال الزامی", required_channel_label(ch))
+    text += f"شناسه: <code>{h(ch['chat_id'])}</code>\n"
+    text += f"وضعیت: <b>{status_text}</b>\n"
+    text += f"لینک عضویت: <code>{h(ch['invite_link'] or 'ثبت نشده')}</code>\n"
+    await edit_or_answer(callback, text, required_channel_admin_view_kb(channel_id))
+
+
+@router.callback_query(F.data.startswith("adm_reqch_delete:"))
+async def admin_required_channel_delete(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "channels"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        channel_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("اطلاعات معتبر نیست.", show_alert=True)
+        return
+    delete_required_channel(channel_id, callback.from_user.id)
+    await edit_or_answer(callback, header("🗑 کانال حذف شد"), required_channels_admin_kb())
+
+
+@router.callback_query(F.data == "check_required_channels")
+async def check_required_channels_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    if is_admin_id(callback.from_user.id):
+        await callback.answer("ادمین‌ها از این چک مستثنی هستند.", show_alert=True)
+        return
+    missing = await missing_required_channels(callback.bot, int(callback.from_user.id))
+    if missing:
+        await edit_or_answer(callback, required_channels_prompt_text(missing), required_channels_user_kb(missing))
+        return
+    await edit_or_answer(callback, header("✅ عضویت تأیید شد") + "اکنون می‌توانید از ربات استفاده کنید.", None)
+
+
 @router.callback_query(F.data == "adm_coupons")
 async def admin_coupons(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "coupons"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await edit_or_answer(callback, header("🎟 مدیریت کد تخفیف") + "کد عمومی، اختصاصی یا خرید اول بسازید و مصرف آن را کنترل کنید.", admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_edit_conditions")
+async def admin_coupon_edit_conditions_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_coupon_edit_condition_code)
+    await edit_or_answer(callback, header("🧩 ویرایش شرایط کد") + "کد تخفیفی که می‌خواهید شرایطش را تغییر دهید وارد کنید.", admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_edit_condition_code)
+async def admin_coupon_edit_conditions_code(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
+        await message.answer("دسترسی ندارید.")
+        return
+    code = (message.text or "").strip().upper()
+    row = coupon_row(code)
+    if not row:
+        await message.answer("❌ این کد تخفیف پیدا نشد.")
+        return
+    condition = safe_json_loads(row["condition_json"] if row_has(row, "condition_json") else None, empty_coupon_condition())
+    if not condition:
+        condition = empty_coupon_condition()
+    await state.set_state(None)
+    await state.update_data(coupon={"code": code, "conditions": condition}, coupon_edit_existing_code=code, coupon_cond_add_mode="and")
+    await message.answer(coupon_condition_preview_text(condition), reply_markup=coupon_condition_builder_kb())
 
 
 @router.callback_query(F.data == "adm_coupon_add")
@@ -5302,44 +5873,213 @@ async def admin_coupon_percent_step(message: Message, state: FSMContext) -> None
     data = await state.get_data()
     coupon = dict(data.get("coupon") or {})
     coupon["percent"] = int(percent)
-    await state.update_data(coupon=coupon)
-    await message.answer(header("محدوده استفاده", "مرحله ۳") + "مشخص کنید کد برای چه کسانی قابل استفاده باشد.", reply_markup=coupon_scope_select_kb())
+    coupon["conditions"] = empty_coupon_condition()
+    await state.update_data(coupon=coupon, coupon_cond_add_mode="and")
+    await message.answer(coupon_condition_preview_text(coupon["conditions"]), reply_markup=coupon_condition_builder_kb())
 
 
-@router.callback_query(F.data.startswith("adm_coupon_scope:"))
-async def admin_coupon_scope_step(callback: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data == "adm_coupon_condition_builder")
+async def admin_coupon_condition_builder(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "coupons"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    scope = callback.data.split(":", 1)[1]
     data = await state.get_data()
     coupon = dict(data.get("coupon") or {})
-    coupon["scope"] = scope
-    coupon["targets"] = ""
-    await state.update_data(coupon=coupon)
-    if scope == "users":
-        await state.set_state(AdminStates.waiting_coupon_users)
-        await edit_or_answer(callback, header("کاربران مجاز", "مرحله ۴") + "چت‌آیدی کاربران مجاز را با کاما یا فاصله وارد کنید. مثال: <code>123456 987654</code>", admin_back_kb("adm_coupons"))
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_cond_add:"))
+async def admin_coupon_condition_add(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_coupon_usage_limit)
-    await edit_or_answer(callback, header("سقف مصرف کل", "مرحله ۴") + "حداکثر تعداد مصرف کل را وارد کنید. برای نامحدود <code>-</code> بفرستید.", admin_back_kb("adm_coupons"))
+    mode = callback.data.split(":", 1)[1]
+    await state.update_data(coupon_cond_add_mode="or" if mode == "or" else "and")
+    await edit_or_answer(callback, header("افزودن شرط") + "نوع شرط را انتخاب کنید.", coupon_condition_type_kb())
 
 
-@router.message(AdminStates.waiting_coupon_users)
-async def admin_coupon_users_step(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "adm_coupon_cond_type_back")
+async def admin_coupon_condition_type_back(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("افزودن شرط") + "نوع شرط را انتخاب کنید.", coupon_condition_type_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_cond_type:"))
+async def admin_coupon_condition_type(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    ctype = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    mode = str(data.get("coupon_cond_add_mode") or "and")
+    if ctype == "first_purchase":
+        condition = add_coupon_clause(condition, {"type": "first_purchase"}, mode)
+        coupon["conditions"] = condition
+        await state.update_data(coupon=coupon)
+        await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+        return
+    if ctype == "channel_member":
+        channels = list_required_channels(active_only=True)
+        if not channels:
+            await callback.answer("ابتدا از بخش عضویت اجباری، حداقل یک کانال فعال ثبت کنید.", show_alert=True)
+            return
+        await edit_or_answer(callback, header("انتخاب کانال") + "یکی از کانال‌های ثبت‌شده را انتخاب کنید.", coupon_condition_channel_select_kb())
+        return
+    if ctype == "user_ids":
+        await state.set_state(AdminStates.waiting_coupon_condition_users)
+        await edit_or_answer(callback, header("لیست چت‌آیدی") + "چت‌آیدی کاربران مجاز را با کاما، فاصله یا خط جدید وارد کنید. مثال:\n<code>123456 987654</code>", admin_back_kb("adm_coupon_condition_builder"))
+        return
+    if ctype == "admin_roles":
+        await state.update_data(coupon_role_selection=[])
+        await edit_or_answer(callback, header("نوع ادمین") + "نقش‌های ادمین مجاز برای این شرط را انتخاب کنید.", coupon_condition_admin_roles_kb([]))
+        return
+    await callback.answer("نوع شرط معتبر نیست.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("adm_coupon_cond_channel:"))
+async def admin_coupon_condition_channel(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        channel_id = int(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("کانال معتبر نیست.", show_alert=True)
+        return
+    ch = required_channel_by_id(channel_id)
+    if not ch or not int(ch["is_active"] or 0):
+        await callback.answer("کانال پیدا نشد یا غیرفعال است.", show_alert=True)
+        return
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    mode = str(data.get("coupon_cond_add_mode") or "and")
+    condition = add_coupon_clause(condition, {"type": "channel_member", "chat_id": str(ch["chat_id"]), "title": required_channel_label(ch)}, mode)
+    coupon["conditions"] = condition
+    await state.update_data(coupon=coupon)
+    await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+
+
+@router.message(AdminStates.waiting_coupon_condition_users)
+async def admin_coupon_condition_users(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "coupons"):
         await message.answer("دسترسی ندارید.")
         return
     ids = [normalize_digits(x) for x in re.split(r"[,\s]+", message.text or "") if normalize_digits(x).isdigit()]
+    ids = list(dict.fromkeys(ids))
     if not ids:
         await message.answer("❌ حداقل یک چت‌آیدی معتبر وارد کنید.")
         return
     data = await state.get_data()
     coupon = dict(data.get("coupon") or {})
-    coupon["targets"] = ",".join(ids)
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    mode = str(data.get("coupon_cond_add_mode") or "and")
+    condition = add_coupon_clause(condition, {"type": "user_ids", "ids": ids}, mode)
+    coupon["conditions"] = condition
+    await state.set_state(None)
     await state.update_data(coupon=coupon)
+    await message.answer(coupon_condition_preview_text(condition), reply_markup=coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_cond_role_toggle:"))
+async def admin_coupon_condition_role_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    role = callback.data.split(":", 1)[1]
+    if role not in ADMIN_ROLE_PERMISSIONS:
+        await callback.answer("نقش معتبر نیست.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(data.get("coupon_role_selection") or [])
+    if role in selected:
+        selected.remove(role)
+    else:
+        selected.append(role)
+    await state.update_data(coupon_role_selection=selected)
+    await edit_or_answer(callback, header("نوع ادمین") + "نقش‌های ادمین مجاز برای این شرط را انتخاب کنید.", coupon_condition_admin_roles_kb(selected))
+
+
+@router.callback_query(F.data == "adm_coupon_cond_role_done")
+async def admin_coupon_condition_role_done(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(data.get("coupon_role_selection") or [])
+    if not selected:
+        await callback.answer("حداقل یک نقش را انتخاب کنید.", show_alert=True)
+        return
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    mode = str(data.get("coupon_cond_add_mode") or "and")
+    condition = add_coupon_clause(condition, {"type": "admin_roles", "roles": selected}, mode)
+    coupon["conditions"] = condition
+    await state.update_data(coupon=coupon, coupon_role_selection=[])
+    await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_cond_negate")
+async def admin_coupon_condition_negate(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    if not coupon_condition_groups(condition):
+        await callback.answer("هنوز شرطی ثبت نشده است.", show_alert=True)
+        return
+    condition = negate_last_coupon_clause(condition)
+    coupon["conditions"] = condition
+    await state.update_data(coupon=coupon)
+    await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_cond_clear")
+async def admin_coupon_condition_clear(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    coupon["conditions"] = empty_coupon_condition()
+    await state.update_data(coupon=coupon)
+    await edit_or_answer(callback, coupon_condition_preview_text(coupon["conditions"]), coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_cond_done")
+async def admin_coupon_condition_done(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    edit_code = data.get("coupon_edit_existing_code")
+    if edit_code:
+        update_coupon_condition_admin(str(edit_code), condition, callback.from_user.id)
+        await state.clear()
+        await edit_or_answer(
+            callback,
+            header("✅ شرایط کد ذخیره شد")
+            + f"کد: <code>{h(edit_code)}</code>\n\nشرایط جدید:\n<b>{h(render_coupon_condition_label(condition))}</b>",
+            admin_coupon_kb(),
+        )
+        return
     await state.set_state(AdminStates.waiting_coupon_usage_limit)
-    await message.answer(header("سقف مصرف کل", "مرحله ۵") + "حداکثر تعداد مصرف کل را وارد کنید. برای نامحدود <code>-</code> بفرستید.", reply_markup=admin_back_kb("adm_coupons"))
+    await edit_or_answer(callback, header("سقف مصرف کل", "مرحله بعد") + "حداکثر تعداد مصرف کل را وارد کنید. برای نامحدود <code>-</code> بفرستید.", admin_back_kb("adm_coupons"))
+
+
+@router.message(AdminStates.waiting_coupon_users)
+async def admin_coupon_users_step(message: Message, state: FSMContext) -> None:
+    # Compatibility for old unfinished FSM sessions.
+    await admin_coupon_condition_users(message, state)
 
 
 @router.message(AdminStates.waiting_coupon_usage_limit)
@@ -5419,18 +6159,23 @@ async def admin_coupon_expires_step(message: Message, state: FSMContext) -> None
         await message.answer("❌ تعداد روز معتبر وارد کنید یا برای بدون انقضا <code>-</code> بفرستید.")
         return
     data = await state.get_data(); coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    condition_label = render_coupon_condition_label(condition)
     create_coupon_admin(
-        coupon["code"], int(coupon["percent"]), f"کد تخفیف {coupon['code']}", coupon.get("scope", "all"), coupon.get("targets", ""),
+        coupon["code"], int(coupon["percent"]), f"کد تخفیف {coupon['code']}", "custom", "",
         coupon.get("usage_limit"), expires_days, message.from_user.id if message.from_user else 0,
         per_user_limit=int(coupon.get("per_user_limit", 1)),
         max_discount_percent=100,
         max_discount_amount=coupon.get("max_discount_amount"),
         min_order_amount=int(coupon.get("min_order_amount", 0)),
+        condition_json=json.dumps(condition, ensure_ascii=False),
+        condition_label=condition_label,
     )
     await state.clear()
     await message.answer(
         header("✅ کد تخفیف ذخیره شد")
         + f"کد <code>{h(coupon['code'])}</code> با تخفیف <b>{coupon['percent']}٪</b> فعال شد.\n"
+        + f"شرایط استفاده:\n<b>{h(condition_label)}</b>\n"
         + f"حداقل خرید: <b>{fmt_money(int(coupon.get('min_order_amount', 0)))}</b>\n"
         + (f"سقف مبلغ تخفیف: <b>{fmt_money(int(coupon['max_discount_amount']))}</b>\n" if coupon.get("max_discount_amount") else "سقف مبلغ تخفیف: <b>ندارد</b>\n"),
         reply_markup=admin_coupon_kb(),
@@ -5471,7 +6216,9 @@ async def admin_coupon_list(callback: CallbackQuery) -> None:
         for c in coupons:
             active = "✅" if int(c["active"]) else "⛔"
             limit = c["usage_limit"] if c["usage_limit"] is not None else "∞"
-            text += f"{active} <code>{h(c['code'])}</code> — {c['percent']}٪ — مصرف: {fmt_number(int(c['used_count']))}/{h(limit)} — scope: <code>{h(c['scope'])}</code>\n"
+            cond = c["condition_label"] if row_has(c, "condition_label") and c["condition_label"] else render_coupon_condition_label(safe_json_loads(c["condition_json"] if row_has(c, "condition_json") else None, None))
+            text += f"{active} <code>{h(c['code'])}</code> — {c['percent']}٪ — مصرف: {fmt_number(int(c['used_count']))}/{h(limit)}\n"
+            text += f"   شرط: <code>{h(cond)}</code>\n"
     await edit_or_answer(callback, text, admin_coupon_kb())
 
 
