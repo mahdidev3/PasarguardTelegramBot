@@ -1643,10 +1643,23 @@ class AdminStates(StatesGroup):
     waiting_package_description = State()
     waiting_package_conditions = State()
     waiting_package_max_subs = State()
-    waiting_package_manual_item = State()
-    waiting_package_sales_override = State()
+    waiting_package_manual_item = State()  # legacy fallback only
+    waiting_package_manual_title = State()
+    waiting_package_manual_data = State()
+    waiting_package_manual_days = State()
+    waiting_package_manual_price = State()
+    waiting_package_sales_override = State()  # legacy fallback only
+    waiting_package_sales_price = State()
+    waiting_package_sales_edit_title = State()
+    waiting_package_sales_edit_data = State()
+    waiting_package_sales_edit_days = State()
     waiting_package_assign_user = State()
-    waiting_package_assign_custom = State()
+    waiting_package_assign_custom = State()  # legacy fallback only
+    waiting_package_custom_price = State()
+    waiting_package_custom_max_subs = State()
+    waiting_package_custom_description = State()
+    waiting_package_custom_conditions = State()
+    waiting_package_custom_code = State()
 
 
 # -----------------------------
@@ -2498,55 +2511,57 @@ def parse_max_subscriptions(value: str) -> tuple[bool, int, str]:
     return True, count, ""
 
 
-def parse_package_item_manual(line: str) -> tuple[bool, dict[str, Any], str]:
-    parts = [x.strip() for x in split_escaped_pipe(line or "")]
-    if len(parts) != 4:
-        return False, {}, "فرمت درست: عنوان|حجم گیگ|روز|قیمت ساب"
-    title, data_s, days_s, price_s = parts
+def validate_package_item_title(value: str) -> tuple[bool, str]:
+    title = (value or "").strip()
     if len(title) < 2 or len(title) > 80:
-        return False, {}, "عنوان آیتم باید بین ۲ تا ۸۰ کاراکتر باشد."
+        return False, "عنوان ساب باید بین ۲ تا ۸۰ کاراکتر باشد."
+    return True, title
+
+
+def parse_package_data_gb(value: str) -> tuple[bool, float, str]:
+    raw = normalize_digits(value or "").strip().replace(",", ".")
     try:
-        data_gb = float(normalize_digits(data_s).replace(",", "."))
-        days = int(normalize_digits(days_s))
+        data_gb = float(raw)
     except Exception:
-        return False, {}, "حجم و روز باید عدد معتبر باشند."
-    ok, price, err = parse_positive_amount(price_s, allow_zero=True)
-    if not ok:
-        return False, {}, err
+        return False, 0.0, "حجم باید عدد معتبر باشد؛ مثلا 30 یا 1.5"
     if data_gb <= 0 or data_gb > 10000:
-        return False, {}, "حجم باید بزرگ‌تر از صفر باشد."
+        return False, 0.0, "حجم باید بزرگ‌تر از صفر و حداکثر ۱۰۰۰۰ گیگ باشد."
+    return True, data_gb, ""
+
+
+def parse_package_days(value: str) -> tuple[bool, int, str]:
+    raw = normalize_digits(value or "").strip()
+    if not raw.isdigit():
+        return False, 0, "روز اعتبار باید عدد صحیح باشد."
+    days = int(raw)
     if days <= 0 or days > 3650:
-        return False, {}, "روز اعتبار باید بین ۱ تا ۳۶۵۰ باشد."
-    return True, {"source_type": "manual", "source_plan_key": "", "title": title, "data_gb": data_gb, "days": days, "price": price}, ""
+        return False, 0, "روز اعتبار باید بین ۱ تا ۳۶۵۰ باشد."
+    return True, days, ""
 
 
-def parse_package_sales_override(line: str, plan: Plan) -> tuple[bool, dict[str, Any], str]:
-    raw = (line or "").strip()
-    if not raw:
-        return False, {}, "قیمت ساب را وارد کنید یا برای قیمت صفر، ۰ بفرستید."
-    parts = [x.strip() for x in split_escaped_pipe(raw)]
-    if len(parts) == 1:
-        ok, price, err = parse_positive_amount(parts[0], allow_zero=True)
-        if not ok:
-            return False, {}, err
-        return True, {"source_type": "sales_plan", "source_plan_key": plan.key, "title": plan.title, "data_gb": plan.data_gb, "days": plan.days, "price": price}, ""
-    if len(parts) != 4:
-        return False, {}, "فرمت درست: قیمت ساب|عنوان یا -|حجم یا -|روز یا -"
-    price_s, title_s, data_s, days_s = parts
-    ok, price, err = parse_positive_amount(price_s, allow_zero=True)
-    if not ok:
-        return False, {}, err
-    title = plan.title if title_s == "-" or not title_s else title_s
-    try:
-        data_gb = plan.data_gb if data_s == "-" or not data_s else float(normalize_digits(data_s).replace(",", "."))
-        days = plan.days if days_s == "-" or not days_s else int(normalize_digits(days_s))
-    except Exception:
-        return False, {}, "حجم و روز باید عدد معتبر باشند."
-    if len(title) < 2 or len(title) > 80:
-        return False, {}, "عنوان آیتم باید بین ۲ تا ۸۰ کاراکتر باشد."
-    if data_gb <= 0 or days <= 0:
-        return False, {}, "حجم و روز باید بزرگ‌تر از صفر باشند."
-    return True, {"source_type": "sales_plan_override" if (title != plan.title or data_gb != plan.data_gb or days != plan.days) else "sales_plan", "source_plan_key": plan.key, "title": title, "data_gb": data_gb, "days": days, "price": price}, ""
+def validate_user_package_code(value: str, user_package_id: int) -> tuple[bool, str]:
+    code = re.sub(r"\s+", "", normalize_digits(value or "").strip().upper())
+    if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
+        return False, "کد اختصاصی باید ۳ تا ۴۰ کاراکتر و فقط شامل حروف انگلیسی، عدد، خط تیره یا آندرلاین باشد."
+    with closing(db.connect()) as conn:
+        exists = conn.execute("SELECT id FROM user_packages WHERE code = ? AND id != ?", (code, user_package_id)).fetchone()
+    if exists:
+        return False, "این کد اختصاصی قبلاً برای کاربر دیگری ثبت شده است."
+    return True, code
+
+
+def package_item_preview_text(item: dict[str, Any], *, title: str = "👀 پیش‌نمایش ساب داخل پکیج") -> str:
+    return (
+        header(title)
+        + f"🧩 عنوان ساب: <b>{h(item.get('title'))}</b>\n"
+        + f"📦 حجم: <b>{fmt_number(float(item.get('data_gb', 0)))}</b> گیگ\n"
+        + f"⏳ مدت: <b>{fmt_number(int(item.get('days', 0)))}</b> روز\n"
+        + f"💰 قیمت ساب: <b>{'رایگان' if int(item.get('price', 0)) == 0 else fmt_money(int(item.get('price', 0)))}</b>\n\n"
+        + "در صورت نیاز یکی از فیلدها را با دکمه‌های زیر ویرایش کنید؛ در غیر این صورت ثبت آیتم را بزنید."
+    )
+
+
+# Package item creation is handled step-by-step with buttons; no multi-field pipe input is used.
 
 
 def package_by_id(package_id: int) -> Optional[sqlite3.Row]:
@@ -2763,6 +2778,34 @@ def package_sales_plan_kb() -> InlineKeyboardMarkup:
             rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_pkg_pick_sales:{p.key}")])
     rows.append([("⬅️ بازگشت", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
+
+
+def admin_package_manual_item_review_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ ثبت این آیتم", "adm_pkg_manual_save")],
+        [("✏️ تغییر عنوان", "adm_pkg_manual_edit:title"), ("📦 تغییر حجم", "adm_pkg_manual_edit:data")],
+        [("⏳ تغییر مدت", "adm_pkg_manual_edit:days"), ("💰 تغییر قیمت", "adm_pkg_manual_edit:price")],
+        [("⬅️ افزودن آیتم‌ها", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_package_sales_item_review_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("✅ ثبت این آیتم", "adm_pkg_sales_save")],
+        [("✏️ تغییر عنوان", "adm_pkg_sales_edit:title"), ("📦 تغییر حجم", "adm_pkg_sales_edit:data")],
+        [("⏳ تغییر مدت", "adm_pkg_sales_edit:days"), ("💰 تغییر قیمت", "adm_pkg_sales_edit:price")],
+        [("🔄 بازگردانی به مشخصات پلن پایه", "adm_pkg_sales_reset")],
+        [("⬅️ افزودن آیتم‌ها", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_user_package_custom_kb(user_package_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("💰 تغییر قیمت پک", f"adm_userpkg_edit:{user_package_id}:price"), ("🔢 تغییر تعداد ساب", f"adm_userpkg_edit:{user_package_id}:max_subs")],
+        [("📝 تغییر توضیح", f"adm_userpkg_edit:{user_package_id}:description"), ("📌 تغییر شرایط", f"adm_userpkg_edit:{user_package_id}:conditions")],
+        [("🧾 تغییر کد اختصاصی", f"adm_userpkg_edit:{user_package_id}:code")],
+        [("↩️ پیش‌نمایش", f"adm_userpkg_preview:{user_package_id}"), ("👑 منوی ادمین", "adm_home")],
+    ])
 
 
 def admin_package_assignment_preview_kb(user_package_id: int) -> InlineKeyboardMarkup:
@@ -5759,37 +5802,168 @@ async def admin_package_pick_sales(callback: CallbackQuery, state: FSMContext) -
     if not plan:
         await callback.answer("پلن پیدا نشد.", show_alert=True)
         return
-    await state.update_data(pkg_sales_plan_key=plan_key)
-    await state.set_state(AdminStates.waiting_package_sales_override)
-    text = header("✏️ قیمت و اورراید آیتم")
-    text += f"پلن پایه: <b>{h(plan.title)}</b> — {fmt_number(plan.data_gb)}GB / {fmt_number(plan.days)} روز\n\n"
-    text += "یکی از این دو حالت را بفرستید:\n"
-    text += "• فقط قیمت ساب: <code>50000</code>\n"
-    text += "• قیمت|عنوان یا -|حجم یا -|روز یا -\n"
-    text += "مثال: <code>50000|پلن ویژه|20|30</code>"
-    await edit_or_answer(callback, text, admin_back_kb("adm_pkg_add_items"))
+    item = {
+        "source_type": "sales_plan",
+        "source_plan_key": plan.key,
+        "title": plan.title,
+        "data_gb": plan.data_gb,
+        "days": plan.days,
+        "price": plan.price,
+    }
+    await state.update_data(pkg_sales_plan_key=plan_key, pkg_sales_item=item)
+    await state.set_state(AdminStates.waiting_package_sales_price)
+    text = header("💰 قیمت ساب داخل پکیج")
+    text += f"پلن پایه: <b>{h(plan.title)}</b> — {fmt_number(plan.data_gb)}GB / {fmt_number(plan.days)} روز\n"
+    text += f"قیمت فعلی پلن فروش: <b>{fmt_money(plan.price)}</b>\n\n"
+    text += "قیمت همین ساب داخل پکیج را وارد کنید. برای رایگان بودن <code>0</code> بفرستید. بعد از این مرحله می‌توانید عنوان، حجم و مدت را با دکمه جدا ویرایش کنید."
+    await edit_or_answer(callback, text, inline([[('✅ استفاده از قیمت فعلی پلن', 'adm_pkg_sales_use_plan_price')], [('⬅️ بازگشت', 'adm_pkg_item_sales'), ('👑 منوی ادمین', 'adm_home')]]))
 
 
-@router.message(AdminStates.waiting_package_sales_override)
-async def admin_package_sales_override_step(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data == "adm_pkg_sales_use_plan_price")
+async def admin_package_sales_use_plan_price(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    plan = PLANS.get(str(data.get("pkg_sales_plan_key") or ""))
+    if not item or not plan:
+        await callback.answer("پلن پایه پیدا نشد؛ دوباره انتخاب کنید.", show_alert=True)
+        return
+    item["price"] = int(plan.price)
+    await state.update_data(pkg_sales_item=item)
+    await state.set_state(None)
+    await edit_or_answer(callback, package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), admin_package_sales_item_review_kb())
+
+
+@router.message(AdminStates.waiting_package_sales_price)
+async def admin_package_sales_price_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
         await message.answer("دسترسی ندارید.")
         return
-    data = await state.get_data()
-    plan = PLANS.get(str(data.get("pkg_sales_plan_key") or ""))
-    if not plan:
-        await state.set_state(None)
-        await message.answer("پلن پایه پیدا نشد؛ دوباره انتخاب کنید.", reply_markup=package_item_add_kb())
-        return
-    ok, item, err = parse_package_sales_override(message.text or "", plan)
+    ok, price, err = parse_positive_amount(message.text or "", allow_zero=True)
     if not ok:
         await message.answer("❌ " + err)
         return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    if not item:
+        await state.set_state(None)
+        await message.answer("اطلاعات پلن پایه پیدا نشد؛ دوباره انتخاب کنید.", reply_markup=package_item_add_kb())
+        return
+    item["price"] = price
+    if data.get("pkg_sales_edit_field") == "price":
+        await state.update_data(pkg_sales_item=item, pkg_sales_edit_field=None)
+    else:
+        await state.update_data(pkg_sales_item=item)
+    await state.set_state(None)
+    await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), reply_markup=admin_package_sales_item_review_kb())
+
+
+@router.callback_query(F.data.startswith("adm_pkg_sales_edit:"))
+async def admin_package_sales_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    field = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if not data.get("pkg_sales_item"):
+        await callback.answer("آیتمی برای ویرایش وجود ندارد.", show_alert=True)
+        return
+    await state.update_data(pkg_sales_edit_field=field)
+    if field == "title":
+        await state.set_state(AdminStates.waiting_package_sales_edit_title)
+        await edit_or_answer(callback, header("✏️ تغییر عنوان ساب") + "عنوان جدید را وارد کنید.", admin_back_kb("adm_pkg_add_items"))
+    elif field == "data":
+        await state.set_state(AdminStates.waiting_package_sales_edit_data)
+        await edit_or_answer(callback, header("📦 تغییر حجم ساب") + "حجم جدید را به گیگ وارد کنید. مثال: <code>30</code>", admin_back_kb("adm_pkg_add_items"))
+    elif field == "days":
+        await state.set_state(AdminStates.waiting_package_sales_edit_days)
+        await edit_or_answer(callback, header("⏳ تغییر مدت ساب") + "مدت جدید را به روز وارد کنید. مثال: <code>30</code>", admin_back_kb("adm_pkg_add_items"))
+    elif field == "price":
+        await state.set_state(AdminStates.waiting_package_sales_price)
+        await edit_or_answer(callback, header("💰 تغییر قیمت ساب") + "قیمت جدید را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", admin_back_kb("adm_pkg_add_items"))
+    else:
+        await callback.answer("فیلد معتبر نیست.", show_alert=True)
+
+
+@router.message(AdminStates.waiting_package_sales_edit_title)
+async def admin_package_sales_edit_title_step(message: Message, state: FSMContext) -> None:
+    ok, title = validate_package_item_title(message.text or "")
+    if not ok:
+        await message.answer("❌ " + title)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    item["title"] = title
+    item["source_type"] = "sales_plan_override"
+    await state.update_data(pkg_sales_item=item, pkg_sales_edit_field=None)
+    await state.set_state(None)
+    await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), reply_markup=admin_package_sales_item_review_kb())
+
+
+@router.message(AdminStates.waiting_package_sales_edit_data)
+async def admin_package_sales_edit_data_step(message: Message, state: FSMContext) -> None:
+    ok, data_gb, err = parse_package_data_gb(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    item["data_gb"] = data_gb
+    item["source_type"] = "sales_plan_override"
+    await state.update_data(pkg_sales_item=item, pkg_sales_edit_field=None)
+    await state.set_state(None)
+    await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), reply_markup=admin_package_sales_item_review_kb())
+
+
+@router.message(AdminStates.waiting_package_sales_edit_days)
+async def admin_package_sales_edit_days_step(message: Message, state: FSMContext) -> None:
+    ok, days, err = parse_package_days(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    item["days"] = days
+    item["source_type"] = "sales_plan_override"
+    await state.update_data(pkg_sales_item=item, pkg_sales_edit_field=None)
+    await state.set_state(None)
+    await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), reply_markup=admin_package_sales_item_review_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_sales_reset")
+async def admin_package_sales_reset(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    plan = PLANS.get(str(data.get("pkg_sales_plan_key") or ""))
+    item = dict(data.get("pkg_sales_item") or {})
+    if not plan or not item:
+        await callback.answer("پلن پایه پیدا نشد.", show_alert=True)
+        return
+    price = int(item.get("price", plan.price))
+    item = {"source_type": "sales_plan", "source_plan_key": plan.key, "title": plan.title, "data_gb": plan.data_gb, "days": plan.days, "price": price}
+    await state.update_data(pkg_sales_item=item)
+    await edit_or_answer(callback, package_item_preview_text(item, title="👀 پیش‌نمایش آیتم از پلن فروش"), admin_package_sales_item_review_kb())
+
+
+@router.callback_query(F.data == "adm_pkg_sales_save")
+async def admin_package_sales_save(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_sales_item") or {})
+    if not item or "price" not in item:
+        await callback.answer("آیتم کامل نیست.", show_alert=True)
+        return
     items = list(data.get("pkg_items") or [])
     items.append(item)
-    await state.update_data(pkg_items=items, pkg_sales_plan_key=None)
+    await state.update_data(pkg_items=items, pkg_sales_item=None, pkg_sales_plan_key=None, pkg_sales_edit_field=None)
     await state.set_state(None)
-    await message.answer(header("✅ آیتم اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", reply_markup=package_item_add_kb())
+    await edit_or_answer(callback, header("✅ آیتم اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", package_item_add_kb())
 
 
 @router.callback_query(F.data == "adm_pkg_item_manual")
@@ -5797,28 +5971,128 @@ async def admin_package_item_manual(callback: CallbackQuery, state: FSMContext) 
     if not require_admin_id(callback.from_user.id, "packages"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_package_manual_item)
-    text = header("✍️ آیتم دستی پکیج")
-    text += "فرمت را دقیقاً این‌طور بفرستید:\n<code>عنوان|حجم گیگ|روز|قیمت ساب</code>\n\n"
-    text += "مثال: <code>ساب دانشجویی|30|30|50000</code>"
-    await edit_or_answer(callback, text, admin_back_kb("adm_pkg_add_items"))
+    await state.update_data(pkg_manual_item={}, pkg_manual_edit_field=None)
+    await state.set_state(AdminStates.waiting_package_manual_title)
+    await edit_or_answer(callback, header("✍️ ساخت ساب دستی", "مرحله ۱") + "عنوان ساب داخل پکیج را وارد کنید. مثال: <code>ساب دانشجویی</code>", admin_back_kb("adm_pkg_add_items"))
 
 
-@router.message(AdminStates.waiting_package_manual_item)
-async def admin_package_manual_item_step(message: Message, state: FSMContext) -> None:
+@router.message(AdminStates.waiting_package_manual_title)
+async def admin_package_manual_title_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
         await message.answer("دسترسی ندارید.")
         return
-    ok, item, err = parse_package_item_manual(message.text or "")
+    ok, title = validate_package_item_title(message.text or "")
+    if not ok:
+        await message.answer("❌ " + title)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_manual_item") or {})
+    item.update({"source_type": "manual", "source_plan_key": "", "title": title})
+    if data.get("pkg_manual_edit_field") == "title":
+        await state.update_data(pkg_manual_item=item, pkg_manual_edit_field=None)
+        await state.set_state(None)
+        await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم دستی"), reply_markup=admin_package_manual_item_review_kb())
+    else:
+        await state.update_data(pkg_manual_item=item)
+        await state.set_state(AdminStates.waiting_package_manual_data)
+        await message.answer(header("📦 حجم ساب", "مرحله ۲") + "حجم ساب را به گیگ وارد کنید. مثال: <code>30</code>", reply_markup=admin_back_kb("adm_pkg_add_items"))
+
+
+@router.message(AdminStates.waiting_package_manual_data)
+async def admin_package_manual_data_step(message: Message, state: FSMContext) -> None:
+    ok, data_gb, err = parse_package_data_gb(message.text or "")
     if not ok:
         await message.answer("❌ " + err)
         return
     data = await state.get_data()
+    item = dict(data.get("pkg_manual_item") or {})
+    item["data_gb"] = data_gb
+    if data.get("pkg_manual_edit_field") == "data":
+        await state.update_data(pkg_manual_item=item, pkg_manual_edit_field=None)
+        await state.set_state(None)
+        await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم دستی"), reply_markup=admin_package_manual_item_review_kb())
+    else:
+        await state.update_data(pkg_manual_item=item)
+        await state.set_state(AdminStates.waiting_package_manual_days)
+        await message.answer(header("⏳ مدت ساب", "مرحله ۳") + "مدت اعتبار را به روز وارد کنید. مثال: <code>30</code>", reply_markup=admin_back_kb("adm_pkg_add_items"))
+
+
+@router.message(AdminStates.waiting_package_manual_days)
+async def admin_package_manual_days_step(message: Message, state: FSMContext) -> None:
+    ok, days, err = parse_package_days(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_manual_item") or {})
+    item["days"] = days
+    if data.get("pkg_manual_edit_field") == "days":
+        await state.update_data(pkg_manual_item=item, pkg_manual_edit_field=None)
+        await state.set_state(None)
+        await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم دستی"), reply_markup=admin_package_manual_item_review_kb())
+    else:
+        await state.update_data(pkg_manual_item=item)
+        await state.set_state(AdminStates.waiting_package_manual_price)
+        await message.answer(header("💰 قیمت ساب", "مرحله ۴") + "قیمت این ساب داخل پکیج را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", reply_markup=admin_back_kb("adm_pkg_add_items"))
+
+
+@router.message(AdminStates.waiting_package_manual_price)
+async def admin_package_manual_price_step(message: Message, state: FSMContext) -> None:
+    ok, price, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_manual_item") or {})
+    item["price"] = price
+    await state.update_data(pkg_manual_item=item, pkg_manual_edit_field=None)
+    await state.set_state(None)
+    await message.answer(package_item_preview_text(item, title="👀 پیش‌نمایش آیتم دستی"), reply_markup=admin_package_manual_item_review_kb())
+
+
+@router.callback_query(F.data.startswith("adm_pkg_manual_edit:"))
+async def admin_package_manual_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    field = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    if not data.get("pkg_manual_item"):
+        await callback.answer("آیتم دستی برای ویرایش وجود ندارد.", show_alert=True)
+        return
+    await state.update_data(pkg_manual_edit_field=field)
+    if field == "title":
+        await state.set_state(AdminStates.waiting_package_manual_title)
+        await edit_or_answer(callback, header("✏️ تغییر عنوان ساب") + "عنوان جدید را وارد کنید.", admin_back_kb("adm_pkg_add_items"))
+    elif field == "data":
+        await state.set_state(AdminStates.waiting_package_manual_data)
+        await edit_or_answer(callback, header("📦 تغییر حجم ساب") + "حجم جدید را به گیگ وارد کنید.", admin_back_kb("adm_pkg_add_items"))
+    elif field == "days":
+        await state.set_state(AdminStates.waiting_package_manual_days)
+        await edit_or_answer(callback, header("⏳ تغییر مدت ساب") + "مدت جدید را به روز وارد کنید.", admin_back_kb("adm_pkg_add_items"))
+    elif field == "price":
+        await state.set_state(AdminStates.waiting_package_manual_price)
+        await edit_or_answer(callback, header("💰 تغییر قیمت ساب") + "قیمت جدید را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", admin_back_kb("adm_pkg_add_items"))
+    else:
+        await callback.answer("فیلد معتبر نیست.", show_alert=True)
+
+
+@router.callback_query(F.data == "adm_pkg_manual_save")
+async def admin_package_manual_save(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    item = dict(data.get("pkg_manual_item") or {})
+    for key in ("title", "data_gb", "days", "price"):
+        if key not in item:
+            await callback.answer("آیتم دستی هنوز کامل نیست.", show_alert=True)
+            return
     items = list(data.get("pkg_items") or [])
     items.append(item)
-    await state.update_data(pkg_items=items)
+    await state.update_data(pkg_items=items, pkg_manual_item=None, pkg_manual_edit_field=None)
     await state.set_state(None)
-    await message.answer(header("✅ آیتم دستی اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", reply_markup=package_item_add_kb())
+    await edit_or_answer(callback, header("✅ آیتم دستی اضافه شد") + f"{h(item['title'])} — قیمت ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n\nآیتم بعدی را اضافه کنید یا پکیج را ذخیره کنید.", package_item_add_kb())
 
 
 @router.callback_query(F.data == "adm_pkg_item_finish")
@@ -5937,71 +6211,135 @@ async def admin_userpkg_custom(callback: CallbackQuery, state: FSMContext) -> No
     if not up or str(up["status"]) != "draft":
         await callback.answer("این اختصاص قابل ویرایش نیست.", show_alert=True)
         return
-    await state.set_state(AdminStates.waiting_package_assign_custom)
-    await state.update_data(custom_user_package_id=user_package_id)
-    text = header("✏️ کاستوم پکیج برای همین کاربر")
-    text += "فرمت:\n<code>قیمت پک|تعداد ساب|توضیح|شرایط|کد اختصاصی</code>\n\n"
-    text += "مثال: <code>0|5|توضیح اختصاصی|شرایط اختصاصی|VIPUSER01</code>\n"
-    text += "برای هر فیلد که نمی‌خواهید تغییر کند <code>-</code> بگذارید."
-    await edit_or_answer(callback, text, admin_back_kb(f"adm_userpkg_preview:{user_package_id}"))
+    await state.clear()
+    await edit_or_answer(
+        callback,
+        header("✏️ کاستوم پکیج برای همین کاربر")
+        + user_package_text(up, user_view=False)
+        + "\nهر بخشی را که لازم است با دکمه جدا ویرایش کنید. هیچ فرمت چندبخشی لازم نیست.",
+        admin_user_package_custom_kb(user_package_id),
+    )
 
 
-@router.message(AdminStates.waiting_package_assign_custom)
-async def admin_userpkg_custom_step(message: Message, state: FSMContext) -> None:
+@router.callback_query(F.data.startswith("adm_userpkg_edit:"))
+async def admin_userpkg_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _tag, upid_s, field = callback.data.split(":")
+        upid = int(upid_s)
+    except Exception:
+        await callback.answer("اطلاعات ویرایش معتبر نیست.", show_alert=True)
+        return
+    up = user_package_by_id(upid)
+    if not up or str(up["status"]) != "draft":
+        await callback.answer("این اختصاص قابل ویرایش نیست.", show_alert=True)
+        return
+    await state.update_data(custom_user_package_id=upid)
+    if field == "price":
+        await state.set_state(AdminStates.waiting_package_custom_price)
+        await edit_or_answer(callback, header("💰 تغییر قیمت پک") + "قیمت نهایی پک برای همین کاربر را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", admin_back_kb(f"adm_userpkg_custom:{upid}"))
+    elif field == "max_subs":
+        await state.set_state(AdminStates.waiting_package_custom_max_subs)
+        await edit_or_answer(callback, header("🔢 تغییر تعداد ساب") + "تعداد ساب قابل ساخت برای همین کاربر را وارد کنید. مثال: <code>5</code>", admin_back_kb(f"adm_userpkg_custom:{upid}"))
+    elif field == "description":
+        await state.set_state(AdminStates.waiting_package_custom_description)
+        await edit_or_answer(callback, header("📝 تغییر توضیح پک") + "توضیح نهایی برای همین کاربر را بفرستید. برای خالی‌کردن توضیح <code>-</code> بفرستید.", admin_back_kb(f"adm_userpkg_custom:{upid}"))
+    elif field == "conditions":
+        await state.set_state(AdminStates.waiting_package_custom_conditions)
+        await edit_or_answer(callback, header("📌 تغییر شرایط پک") + "شرایط نهایی برای همین کاربر را بفرستید. برای خالی‌کردن شرایط <code>-</code> بفرستید.", admin_back_kb(f"adm_userpkg_custom:{upid}"))
+    elif field == "code":
+        await state.set_state(AdminStates.waiting_package_custom_code)
+        await edit_or_answer(callback, header("🧾 تغییر کد اختصاصی") + "کد اختصاصی این کاربر را وارد کنید. فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است.", admin_back_kb(f"adm_userpkg_custom:{upid}"))
+    else:
+        await callback.answer("فیلد معتبر نیست.", show_alert=True)
+
+
+async def _finish_userpkg_custom_message(message: Message, state: FSMContext, user_package_id: int, title: str = "✅ تغییر ذخیره شد") -> None:
+    await state.clear()
+    up = user_package_by_id(user_package_id)
+    await message.answer(header(title) + user_package_text(up, user_view=False), reply_markup=admin_user_package_custom_kb(user_package_id))
+
+
+@router.message(AdminStates.waiting_package_custom_price)
+async def admin_userpkg_custom_price_step(message: Message, state: FSMContext) -> None:
     if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
         await message.answer("دسترسی ندارید.")
         return
     data = await state.get_data()
-    user_package_id = int(data.get("custom_user_package_id", 0))
-    up = user_package_by_id(user_package_id)
-    if not up or str(up["status"]) != "draft":
-        await state.clear()
-        await message.answer("این اختصاص قابل ویرایش نیست.", reply_markup=admin_packages_kb())
+    upid = int(data.get("custom_user_package_id", 0))
+    ok, amount, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
         return
-    parts = [x.strip() for x in split_escaped_pipe(message.text or "")]
-    if len(parts) != 5:
-        await message.answer("❌ فرمت درست: قیمت|تعداد ساب|توضیح|شرایط|کد اختصاصی  یعنی دقیقاً ۵ بخش با | جدا شود.")
+    update_user_package(upid, price=amount)
+    await _finish_userpkg_custom_message(message, state, upid)
+
+
+@router.message(AdminStates.waiting_package_custom_max_subs)
+async def admin_userpkg_custom_max_subs_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
         return
-    updates: dict[str, Any] = {}
-    if parts[0] != "-":
-        ok, amount, err = parse_positive_amount(parts[0], allow_zero=True)
-        if not ok:
-            await message.answer("❌ " + err)
-            return
-        updates["price"] = amount
-    if parts[1] != "-":
-        ok, count, err = parse_max_subscriptions(parts[1])
-        if not ok:
-            await message.answer("❌ " + err)
-            return
-        updates["max_subscriptions"] = count
-    if parts[2] != "-":
-        ok, value = validate_long_text(parts[2], "توضیح", allow_empty=True)
-        if not ok:
-            await message.answer("❌ " + value)
-            return
-        updates["description"] = value
-    if parts[3] != "-":
-        ok, value = validate_long_text(parts[3], "شرایط", allow_empty=True)
-        if not ok:
-            await message.answer("❌ " + value)
-            return
-        updates["conditions"] = value
-    if parts[4] != "-":
-        code = re.sub(r"\s+", "", normalize_digits(parts[4]).strip().upper())
-        if not re.fullmatch(r"[A-Z0-9_-]{3,40}", code):
-            await message.answer("❌ کد اختصاصی باید ۳ تا ۴۰ کاراکتر و فقط شامل حروف انگلیسی، عدد، خط تیره یا آندرلاین باشد.")
-            return
-        with closing(db.connect()) as conn:
-            exists = conn.execute("SELECT id FROM user_packages WHERE code = ? AND id != ?", (code, user_package_id)).fetchone()
-        if exists:
-            await message.answer("❌ این کد اختصاصی قبلاً برای کاربر دیگری ثبت شده است.")
-            return
-        updates["code"] = code
-    update_user_package(user_package_id, **updates)
-    await state.clear()
-    up = user_package_by_id(user_package_id)
-    await message.answer(header("✅ کاستوم ذخیره شد") + user_package_text(up, user_view=False), reply_markup=admin_package_assignment_preview_kb(user_package_id))
+    data = await state.get_data()
+    upid = int(data.get("custom_user_package_id", 0))
+    ok, count, err = parse_max_subscriptions(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    up = user_package_by_id(upid)
+    used = count_package_subscriptions(upid) if up else 0
+    if count < used:
+        await message.answer(f"❌ این کاربر همین حالا {fmt_number(used)} ساب ساخته؛ تعداد جدید نمی‌تواند کمتر از مقدار استفاده‌شده باشد.")
+        return
+    update_user_package(upid, max_subscriptions=count)
+    await _finish_userpkg_custom_message(message, state, upid)
+
+
+@router.message(AdminStates.waiting_package_custom_description)
+async def admin_userpkg_custom_description_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    upid = int(data.get("custom_user_package_id", 0))
+    ok, value = validate_long_text(message.text or "", "توضیح", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_user_package(upid, description=value)
+    await _finish_userpkg_custom_message(message, state, upid)
+
+
+@router.message(AdminStates.waiting_package_custom_conditions)
+async def admin_userpkg_custom_conditions_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    upid = int(data.get("custom_user_package_id", 0))
+    ok, value = validate_long_text(message.text or "", "شرایط", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_user_package(upid, conditions=value)
+    await _finish_userpkg_custom_message(message, state, upid)
+
+
+@router.message(AdminStates.waiting_package_custom_code)
+async def admin_userpkg_custom_code_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    upid = int(data.get("custom_user_package_id", 0))
+    ok, value = validate_user_package_code(message.text or "", upid)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_user_package(upid, code=value)
+    await _finish_userpkg_custom_message(message, state, upid)
 
 
 @router.callback_query(F.data.startswith("adm_userpkg_preview:"))
