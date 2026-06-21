@@ -1145,7 +1145,7 @@ def admin_add_data_to_service(service_id: int, data_gb: float) -> None:
 def create_manual_service_for_user(telegram_id: int, plan_key: str, paid_amount: int, admin_id: int) -> Optional[int]:
     user = db.get_user(telegram_id)
     plan = PLANS.get(plan_key)
-    if not user or not plan:
+    if not user or not plan or not is_public_paid_plan(plan):
         return None
     order_id = db.create_order(telegram_id, plan_key, plan.price, max(plan.price - paid_amount, 0), 0, "paid", "ساخت دستی ادمین")
     service_id = db.create_service(telegram_id, make_service_name(telegram_id), plan, paid_amount, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
@@ -2159,8 +2159,29 @@ def back_home_kb() -> InlineKeyboardMarkup:
     return inline([[("🏠 منوی اصلی", "home")]])
 
 
+def is_package_internal_plan(plan_or_key: Any) -> bool:
+    """Return True for package-only catalog plans.
+
+    Package items are inserted into CatalogPlan only so Pasarguard templates can be
+    created for subs made from an admin-assigned package. They must never leak
+    into public service purchase, renewal, manual-service creation, or package
+    item selection as ordinary sale plans.
+    """
+    if isinstance(plan_or_key, str):
+        key = plan_or_key
+        category = ""
+    else:
+        key = str(getattr(plan_or_key, "key", "") or "")
+        category = str(getattr(plan_or_key, "category", "") or "")
+    return key.startswith("pkg_item_") or category in {"package", "package_internal", "__package_internal__"} or category.startswith("package:")
+
+
+def is_public_paid_plan(plan: Plan) -> bool:
+    return (not str(plan.category).startswith("free:")) and not is_package_internal_plan(plan)
+
+
 def paid_plan_categories() -> list[tuple[str, str, str]]:
-    used = {p.category for p in PLANS.values() if not str(p.category).startswith("free:")}
+    used = {p.category for p in PLANS.values() if is_public_paid_plan(p)}
     items: list[tuple[int, str, str, str]] = []
     for key, meta in PLAN_CATEGORIES.items():
         if key in used and bool(meta.get("is_active", True)):
@@ -2184,7 +2205,7 @@ def buy_type_kb() -> InlineKeyboardMarkup:
 def plans_kb(category: str) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for p in PLANS.values():
-        if p.category == category:
+        if p.category == category and is_public_paid_plan(p):
             rows.append([(f"{p.title} — {fmt_money(p.price)}", f"plan:{p.key}")])
     rows.append([("⬅️ بازگشت", "buy"), ("🏠 منوی اصلی", "home")])
     return inline(rows)
@@ -2319,7 +2340,7 @@ def renew_type_kb(service_id: int) -> InlineKeyboardMarkup:
 def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for p in PLANS.values():
-        if p.category == category:
+        if p.category == category and is_public_paid_plan(p):
             rows.append([(f"♻️ {p.title} — {fmt_money(p.price)}", f"renew_plan:{service_id}:{p.key}")])
     rows.append([("⬅️ بازگشت", f"renew_menu:{service_id}"), ("🏠 منوی اصلی", "home")])
     return inline(rows)
@@ -2660,7 +2681,8 @@ def card_active_select_kb() -> InlineKeyboardMarkup:
 def admin_manual_service_plans_kb(uid: int) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for p in PLANS.values():
-        rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_manual_service_plan:{uid}:{p.key}")])
+        if is_public_paid_plan(p):
+            rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_manual_service_plan:{uid}:{p.key}")])
     rows.append([("⬅️ پروفایل کاربر", f"adm_user:{uid}"), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
 
@@ -3433,7 +3455,7 @@ def package_item_add_kb() -> InlineKeyboardMarkup:
 def package_sales_plan_kb() -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for p in PLANS.values():
-        if not str(p.category).startswith("free:"):
+        if is_public_paid_plan(p):
             rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_pkg_pick_sales:{p.key}")])
     rows.append([("⬅️ بازگشت", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
@@ -3912,6 +3934,9 @@ async def buy_cb(callback: CallbackQuery, state: FSMContext) -> None:
 async def buy_cat(callback: CallbackQuery) -> None:
     category = callback.data.split(":", 1)[1]
     ensure_from_callback(callback)
+    if category not in {key for key, _title, _desc in paid_plan_categories()}:
+        await callback.answer("این دسته برای خرید عمومی فعال نیست.", show_alert=True)
+        return
     await edit_or_answer(callback, plan_category_text(category), plans_kb(category))
 
 
@@ -3920,8 +3945,8 @@ async def select_plan(callback: CallbackQuery, state: FSMContext) -> None:
     user = ensure_from_callback(callback)
     plan_key = callback.data.split(":", 1)[1]
     plan = PLANS.get(plan_key)
-    if not plan:
-        await callback.answer("پلن پیدا نشد.", show_alert=True)
+    if not plan or not is_public_paid_plan(plan):
+        await callback.answer("این پلن برای خرید عمومی فعال نیست.", show_alert=True)
         return
     text, amount, referral_discount, total_discount, payable = plan_summary_text(plan, user)
     await state.set_state(BuyStates.waiting_name)
@@ -4321,7 +4346,11 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         await complete_renew_order(callback, telegram_id, order, method, use_wallet)
         return
 
-    plan = PLANS[plan_key]
+    plan = PLANS.get(plan_key)
+    if not plan or not is_public_paid_plan(plan):
+        mark_order_terminal(order_id, status="cancelled", method=method, wallet_used=0, admin_note="hidden/package plan cannot be bought from public service purchase")
+        await callback.answer("این پلن برای خرید عمومی فعال نیست.", show_alert=True)
+        return
     payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
     user = db.get_user(telegram_id)
     if not user:
@@ -4564,6 +4593,9 @@ async def renew_category(callback: CallbackQuery) -> None:
     if not service or service["status"] == "deleted":
         await callback.answer("سرویس پیدا نشد.", show_alert=True)
         return
+    if category not in {key for key, _title, _desc in paid_plan_categories()}:
+        await callback.answer("این دسته برای تمدید عمومی فعال نیست.", show_alert=True)
+        return
     await edit_or_answer(callback, renew_category_text(service, category), renew_plans_kb(service_id, category))
 
 
@@ -4574,7 +4606,7 @@ async def renew_plan_selected(callback: CallbackQuery) -> None:
     service_id = int(service_id_s)
     service = db.get_service(service_id, int(user["telegram_id"]))
     plan = PLANS.get(plan_key)
-    if not service or service["status"] == "deleted" or not plan:
+    if not service or service["status"] == "deleted" or not plan or not is_public_paid_plan(plan):
         await callback.answer("سرویس یا پلن تمدید پیدا نشد.", show_alert=True)
         return
     if service["is_test"]:
@@ -5602,8 +5634,8 @@ async def admin_manual_service_plan(callback: CallbackQuery, state: FSMContext) 
     except (ValueError, TypeError):
         await callback.answer("درخواست نامعتبر است.", show_alert=True)
         return
-    if plan_key not in PLANS:
-        await callback.answer("پلن پیدا نشد.", show_alert=True)
+    if plan_key not in PLANS or not is_public_paid_plan(PLANS[plan_key]):
+        await callback.answer("پلن پیدا نشد یا برای ساخت سرویس عمومی فعال نیست.", show_alert=True)
         return
     await state.set_state(AdminStates.waiting_manual_service_amount)
     await state.update_data(target_user_id=uid, plan_key=plan_key)
@@ -5623,6 +5655,10 @@ async def admin_manual_service_amount_finish(message: Message, state: FSMContext
     data = await state.get_data()
     uid = int(data["target_user_id"])
     plan_key = str(data["plan_key"])
+    if plan_key not in PLANS or not is_public_paid_plan(PLANS[plan_key]):
+        await state.clear()
+        await message.answer("❌ این پلن برای ساخت سرویس عمومی فعال نیست.", reply_markup=admin_back_kb(f"adm_user:{uid}"))
+        return
     service_id = create_manual_service_for_user(uid, plan_key, amount, message.from_user.id if message.from_user else 0)
     await state.clear()
     if not service_id:
