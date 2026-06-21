@@ -1,12 +1,1 @@
 """Reports keyboard builders placeholder."""
-
-
-
-
-
-
-
-
-
-
-

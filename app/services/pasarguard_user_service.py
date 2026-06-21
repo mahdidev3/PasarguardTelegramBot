@@ -763,14 +763,3 @@ def render_remote_bulk_sync_report(report: RemoteBulkSyncReport) -> str:
         if len(report.errors) > 15:
             lines.append(f"… و {len(report.errors) - 15} خطای دیگر")
     return "\n".join(lines)
-
-
-
-
-
-
-
-
-
-
-

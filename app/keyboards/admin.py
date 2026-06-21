@@ -1,12 +1,1 @@
 """Admin keyboard builders placeholder."""
-
-
-
-
-
-
-
-
-
-
-

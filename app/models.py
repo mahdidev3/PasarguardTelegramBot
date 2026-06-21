@@ -523,14 +523,3 @@ class PasarguardRemoteSnapshot(Base):
     state_json: Mapped[dict | list | None] = mapped_column(JSON)
     created_by: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
-
-
-
-
-
-
-
-
-

@@ -23,14 +23,3 @@ async def audit_log(
                 details=details,
             )
         )
-
-
-
-
-
-
-
-
-
-
-

@@ -16,11 +16,3 @@ systemctl daemon-reload
 systemctl reset-failed "$SERVICE_NAME" || true
 
 echo "Removed: $SERVICE_NAME"
-
-
-
-
-
-
-
-

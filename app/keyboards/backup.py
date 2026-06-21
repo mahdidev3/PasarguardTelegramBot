@@ -1,12 +1,1 @@
 """Backup keyboard builders placeholder."""
-
-
-
-
-
-
-
-
-
-
-

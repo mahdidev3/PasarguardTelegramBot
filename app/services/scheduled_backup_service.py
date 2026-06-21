@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,9 +15,12 @@ from app.config import settings
 from app.database import session_scope
 from app.models import BotSetting
 from app.services.admin_audit_service import audit_log
-from app.services.backup_service import create_complete_backup
+from app.services.backup_service import create_complete_backup, render_backup_summary
+from app.services.deadline_service import run_deadline_cleanup_once
 
 UTC = timezone.utc
+logger = logging.getLogger("howtosee-auto-backup")
+_auto_backup_lock = asyncio.Lock()
 
 
 def _now() -> datetime:
@@ -88,32 +92,45 @@ def _chat_ids_from_config(config: dict[str, str]) -> list[int]:
 
 
 async def run_auto_backup_once(bot: Bot, reason: str = "manual") -> tuple[Path, dict]:
-    config = await get_auto_backup_config()
-    chat_ids = _chat_ids_from_config(config)
-    path, manifest = await create_complete_backup(admin_id=None, bot=bot)
-    usage = manifest.get("usage", {})
-    files = manifest.get("ticket_files", {})
-    caption = (
-        "🕒 بک‌آپ خودکار ساخته شد.\n"
-        f"دلیل: {reason}\n"
-        f"کاربران: {usage.get('users_total', 0)}\n"
-        f"سرویس‌های فعال: {usage.get('services_active', 0)}\n"
-        f"فایل‌های تیکت داخل بک‌آپ: {files.get('active_files_backed_up', 0)}\n"
-        f"فایل‌های ناموفق: {files.get('active_files_failed', 0)}"
-    )
-    for chat_id in chat_ids:
+    async with _auto_backup_lock:
+        config = await get_auto_backup_config()
+        chat_ids = _chat_ids_from_config(config)
+        # Before a backup, finalize any deadlines that passed while the bot was
+        # offline. This prevents stale pending receipts/orders from being archived
+        # as if they were still actionable.
         try:
-            await bot.send_document(chat_id, FSInputFile(path), caption=caption)
+            await run_deadline_cleanup_once()
         except Exception:
-            pass
-    interval_hours = int(config.get("interval_hours") or "12")
-    await set_setting("auto_backup_last_run_at", _now().isoformat())
-    await set_setting("auto_backup_next_run_at", (_now() + timedelta(hours=interval_hours)).isoformat())
-    try:
-        await audit_log(chat_ids[0] if chat_ids else 0, "AUTO_BACKUP_RUN", "backup", path.name, f"reason={reason}")
-    except Exception:
-        pass
-    return path, manifest
+            logger.exception("deadline cleanup before auto backup failed")
+        path, manifest = await create_complete_backup(admin_id=None, bot=bot)
+        usage = manifest.get("usage", {})
+        files = manifest.get("ticket_files", {})
+        receipt_files = manifest.get("receipt_files", {})
+        caption = (
+            "🕒 بک‌آپ خودکار ساخته شد.\n"
+            f"دلیل: {reason}\n"
+            f"کاربران: {usage.get('users_total', 0)}\n"
+            f"سرویس‌های فعال: {usage.get('services_active', 0)}\n"
+            f"فایل‌های تیکت داخل بک‌آپ: {files.get('active_files_backed_up', 0)}\n"
+            f"فایل‌های رسید داخل بک‌آپ: {receipt_files.get('files_backed_up', 0)}\n"
+            f"فایل‌های ناموفق: {files.get('active_files_failed', 0) + receipt_files.get('files_failed', 0)}"
+        )
+        summary = render_backup_summary(manifest)
+        for chat_id in chat_ids:
+            try:
+                await bot.send_document(chat_id, FSInputFile(path), caption=caption)
+                await bot.send_message(chat_id, summary)
+            except Exception:
+                logger.exception("failed to send auto backup to %s", chat_id)
+        interval_hours = int(config.get("interval_hours") or "12")
+        finished_at = _now()
+        await set_setting("auto_backup_last_run_at", finished_at.isoformat())
+        await set_setting("auto_backup_next_run_at", (finished_at + timedelta(hours=interval_hours)).isoformat())
+        try:
+            await audit_log(chat_ids[0] if chat_ids else 0, "AUTO_BACKUP_RUN", "backup", path.name, f"reason={reason}")
+        except Exception:
+            logger.exception("auto backup audit log failed")
+        return path, manifest
 
 
 async def auto_backup_loop(bot: Bot) -> None:
@@ -127,25 +144,16 @@ async def auto_backup_loop(bot: Bot) -> None:
                     next_run = _now() + timedelta(hours=interval_hours)
                     await set_setting("auto_backup_next_run_at", next_run.isoformat())
                 if _now() >= next_run:
-                    await run_auto_backup_once(bot, reason=f"every_{interval_hours}_hours")
+                    reason = f"catch_up_every_{interval_hours}_hours" if _now() > next_run + timedelta(minutes=1) else f"every_{interval_hours}_hours"
+                    await run_auto_backup_once(bot, reason=reason)
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Do not kill polling because an automatic backup failed.
-            pass
+            # Do not kill polling because an automatic backup failed. Keep next_run_at
+            # unchanged so the loop retries instead of silently skipping a backup.
+            logger.exception("automatic backup loop failed")
         await asyncio.sleep(60)
 
 
 def start_auto_backup_scheduler(bot: Bot) -> asyncio.Task:
     return asyncio.create_task(auto_backup_loop(bot), name="howtosee_auto_backup_loop")
-
-
-
-
-
-
-
-
-
-
-

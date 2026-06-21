@@ -11,14 +11,3 @@ def normalize_digits(value: str) -> str:
     for i, ch in enumerate(ar):
         value = value.replace(ch, str(i))
     return value
-
-
-
-
-
-
-
-
-
-
-

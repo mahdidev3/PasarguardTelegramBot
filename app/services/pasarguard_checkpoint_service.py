@@ -526,14 +526,3 @@ def render_reconcile_report(report: PasarguardReconcileReport) -> str:
     if not report.actions and not report.errors:
         lines.append("\n✅ اختلافی بین backup desired_state و پنل فعلی پیدا نشد.")
     return "\n".join(lines)
-
-
-
-
-
-
-
-
-
-
-

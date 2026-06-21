@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Inli
 
 from app.config import settings
 from app.services.admin_audit_service import audit_log
-from app.services.backup_service import create_complete_backup, inspect_backup_file
+from app.services.backup_service import create_complete_backup, inspect_backup_file, render_backup_summary
 from app.services.confirmation_service import create_confirmation, verify_confirmation
 from app.services.restore_service import restore_complete_backup
 from app.services.pasarguard_checkpoint_service import reconcile_backup_with_pasarguard, render_reconcile_report
@@ -109,6 +109,7 @@ async def create_backup(callback: CallbackQuery) -> None:
             f"actual {manifest.get('pasarguard', {}).get('actual_users', 0)} user"
         )
         await callback.message.answer_document(FSInputFile(path), caption=caption)
+        await callback.message.answer(render_backup_summary(manifest))
 
 
 @backup_router.callback_query(F.data == "adm_auto_backup")
@@ -196,8 +197,8 @@ async def auto_backup_run_now(callback: CallbackQuery) -> None:
     await edit_or_answer(
         callback,
         header("✅ بک‌آپ تستی اجرا شد")
-        + f"فایل: <code>{h(Path(path).name)}</code>\n"
-        + f"فایل‌های تیکت داخل بک‌آپ: <b>{h(manifest.get('ticket_files', {}).get('active_files_backed_up', 0))}</b>",
+        + f"فایل: <code>{h(Path(path).name)}</code>\n\n"
+        + render_backup_summary(manifest),
         backup_home_kb(),
     )
 
@@ -305,14 +306,3 @@ async def restore_confirm(message: Message, state: FSMContext) -> None:
     emergency = result.get("emergency_backup")
     if emergency and Path(str(emergency)).exists():
         await message.answer_document(FSInputFile(Path(str(emergency))), caption="🛟 بک‌آپ اضطراری قبل از ریستور")
-
-
-
-
-
-
-
-
-
-
-

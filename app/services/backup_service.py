@@ -27,7 +27,7 @@ from app.services.export_service import usage_summary_rows
 from app.services.pasarguard_checkpoint_service import write_pasarguard_checkpoint_files
 
 
-BACKUP_VERSION = 3
+BACKUP_VERSION = 4
 
 
 def _stamp() -> str:
@@ -247,13 +247,53 @@ def _desired_pasarguard_state(sqlite_data: dict[str, list[dict[str, Any]]], pg_d
             "data_used_mb": int(service.get("data_used_mb") or 0),
             "expires_at": service.get("expires_at"),
             "status": service.get("status"),
-            "pasarguard_remote_id": service.get("pasarguard_remote_id"),
+            "pasarguard_remote_id": service.get("pasarguard_user_id") or service.get("pasarguard_remote_id"),
             "phase3_note": "Pasarguard API is not connected yet; this is desired state only.",
         })
     return output
 
 
+def _runtime_feature_counts(sqlite_data: dict[str, list[dict[str, Any]]], pg_data: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
+    """Human-readable coverage counts for features added after Phase 3."""
+    return {
+        "required_channels": len(sqlite_data.get("required_channels", [])),
+        "package_templates": len(sqlite_data.get("package_templates", [])),
+        "package_template_items": len(sqlite_data.get("package_template_items", [])),
+        "user_packages": len(sqlite_data.get("user_packages", [])),
+        "package_subscriptions": len(sqlite_data.get("package_subscriptions", [])),
+        "payment_receipts": len(sqlite_data.get("payment_receipts", [])),
+        "payment_receipt_files": len(sqlite_data.get("payment_receipt_files", [])),
+        "deadline_events": len(sqlite_data.get("deadline_events", [])),
+        "scheduled_jobs": len(sqlite_data.get("scheduled_jobs", [])),
+        "admin_confirmations": len(pg_data.get("admin_confirmations", [])),
+        "bot_settings": len(pg_data.get("bot_settings", [])) + len(sqlite_data.get("bot_settings", [])),
+    }
+
+
+def _deadline_summary(sqlite_data: dict[str, list[dict[str, Any]]], pg_data: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
+    receipts = sqlite_data.get("payment_receipts", [])
+    orders = sqlite_data.get("orders", [])
+    confirmations = pg_data.get("admin_confirmations", [])
+    return {
+        "receipts_waiting": sum(1 for r in receipts if r.get("status") == "waiting_receipt"),
+        "receipts_pending_review": sum(1 for r in receipts if r.get("status") == "receipt_pending"),
+        "receipts_expired": sum(1 for r in receipts if r.get("status") == "expired"),
+        "orders_expired": sum(1 for r in orders if r.get("status") == "expired"),
+        "admin_confirmations_total": len(confirmations),
+        "admin_confirmations_unused": sum(1 for r in confirmations if not r.get("used_at")),
+    }
+
+
 async def create_complete_backup(admin_id: int | None = None, output_dir: str | Path = "/tmp/howtosee_backups", bot: Bot | None = None) -> tuple[Path, dict[str, Any]]:
+    # Finalize durable deadlines before taking a checkpoint. Backups should
+    # represent the state that the bot would enforce after restart, not stale
+    # in-memory/FSM assumptions.
+    try:
+        from app.services.deadline_service import run_deadline_cleanup_once
+
+        await run_deadline_cleanup_once()
+    except Exception:
+        pass
     base = Path(output_dir) / f"backup-work-{_stamp()}"
     base.mkdir(parents=True, exist_ok=True)
     sqlite_data = _sqlite_tables()
@@ -297,13 +337,15 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
     file_failed = sum(1 for row in ticket_file_manifest if not row.get("backed_up"))
     receipt_file_success = sum(1 for row in receipt_file_manifest if row.get("backed_up"))
     receipt_file_failed = sum(1 for row in receipt_file_manifest if not row.get("backed_up"))
+    runtime_feature_counts = _runtime_feature_counts(sqlite_data, pg_data)
+    deadline_summary = _deadline_summary(sqlite_data, pg_data)
     manifest = {
         "backup_version": BACKUP_VERSION,
         "bot_name": settings.brand_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "created_by": admin_id,
         "database_engine": "postgresql+legacy_sqlite_bridge",
-        "schema_version": "phase4.8-pasarguard-checkpoint",
+        "schema_version": "phase4.11-deadline-and-full-runtime-checkpoint",
         "counts": {
             "sqlite": {table: len(rows) for table, rows in sqlite_data.items()},
             "postgres": {table: len(rows) for table, rows in pg_data.items()},
@@ -312,6 +354,13 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         },
         "usage": usage,
         "finance": finance_summary,
+        "deadline_summary": deadline_summary,
+        "runtime_feature_counts": runtime_feature_counts,
+        "coverage": {
+            "sqlite_tables": sorted(sqlite_data.keys()),
+            "postgres_tables": sorted(pg_data.keys()),
+            "note": "SQLite and PostgreSQL tables are exported dynamically, so newly created runtime tables are included automatically when present.",
+        },
         "ticket_files": {
             "included": bot is not None,
             "active_files_backed_up": file_success,
@@ -371,12 +420,31 @@ def inspect_backup_file(zip_path: str | Path) -> dict[str, Any]:
         return manifest
 
 
-
-
-
-
-
-
-
-
-
+def render_backup_summary(manifest: dict[str, Any]) -> str:
+    """Compact Persian summary suitable for Telegram message after any backup."""
+    usage = manifest.get("usage", {}) or {}
+    counts = manifest.get("counts", {}) or {}
+    sqlite_counts = counts.get("sqlite", {}) or {}
+    pg_counts = counts.get("postgres", {}) or {}
+    ticket_files = manifest.get("ticket_files", {}) or {}
+    receipt_files = manifest.get("receipt_files", {}) or {}
+    finance = manifest.get("finance", {}) or {}
+    runtime = manifest.get("runtime_feature_counts", {}) or {}
+    deadlines = manifest.get("deadline_summary", {}) or {}
+    pasarguard = manifest.get("pasarguard", {}) or {}
+    return (
+        "📊 خلاصه بک‌آپ\n\n"
+        f"🧩 نسخه بک‌آپ: {manifest.get('backup_version', '-')}\n"
+        f"🕒 زمان ساخت: {manifest.get('created_at', '-')}\n"
+        f"🗄 جدول‌های SQLite: {len(sqlite_counts)} | جدول‌های PostgreSQL: {len(pg_counts)}\n\n"
+        f"👥 کاربران: {usage.get('users_total', sqlite_counts.get('users', 0))}\n"
+        f"📦 سرویس‌های فعال: {usage.get('services_active', 0)}\n"
+        f"🧾 سفارش‌ها: کل {finance.get('orders_total', sqlite_counts.get('orders', 0))} | پرداخت‌شده {finance.get('orders_paid', 0)} | رسید در انتظار {finance.get('orders_receipt_pending', 0)}\n"
+        f"💰 مبلغ پرداخت‌شده خالص: {finance.get('net_paid', 0)} تومان\n\n"
+        f"🎫 تیکت‌ها: {pg_counts.get('tickets', 0)} | فایل تیکت: {ticket_files.get('active_files_backed_up', 0)} موفق / {ticket_files.get('active_files_failed', 0)} ناموفق\n"
+        f"🧾 فایل رسید: {receipt_files.get('files_backed_up', 0)} موفق / {receipt_files.get('files_failed', 0)} ناموفق\n"
+        f"🎁 پکیج‌ها: قالب {runtime.get('package_templates', 0)} | اختصاصی کاربر {runtime.get('user_packages', 0)} | ساب پکیج {runtime.get('package_subscriptions', 0)}\n"
+        f"📣 کانال‌های الزامی: {runtime.get('required_channels', 0)} | Jobها: {runtime.get('scheduled_jobs', sqlite_counts.get('scheduled_jobs', 0))}\n\n"
+        f"⏳ رسید منتظر ارسال: {deadlines.get('receipts_waiting', 0)} | رسید منتظر بررسی: {deadlines.get('receipts_pending_review', 0)} | منقضی‌شده: {deadlines.get('receipts_expired', 0)}\n"
+        f"🔌 Pasarguard: desired {pasarguard.get('desired_users', 0)} user / actual {pasarguard.get('actual_users', 0)} user"
+    )

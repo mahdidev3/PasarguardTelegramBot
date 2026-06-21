@@ -326,14 +326,3 @@ async def admin_plans_sync(callback: CallbackQuery) -> None:
     await sync_legacy()
     await callback.answer("کاتالوگ خرید با دیتابیس همگام شد.", show_alert=True)
     await admin_plans(callback)
-
-
-
-
-
-
-
-
-
-
-

@@ -405,14 +405,3 @@ async def ticket_stats() -> TicketStats:
         waiting_user_count = await count_where("waiting_user")
         closed_count = await count_where("closed")
         return TicketStats(open_count, waiting_admin_count, waiting_user_count, closed_count)
-
-
-
-
-
-
-
-
-
-
-

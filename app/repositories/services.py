@@ -1,12 +1,1 @@
 """Service repository placeholder."""
-
-
-
-
-
-
-
-
-
-
-

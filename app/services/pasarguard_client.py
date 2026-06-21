@@ -233,14 +233,3 @@ class PasarguardClient:
     async def revoke_user_subscription(self, username: str) -> dict[str, Any]:
         await self.ensure_login()
         return await self._request("POST", f"/api/user/by-username/{username}/revoke_sub", retries=1)
-
-
-
-
-
-
-
-
-
-
-

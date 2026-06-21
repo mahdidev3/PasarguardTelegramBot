@@ -11,14 +11,3 @@ fi
 systemctl daemon-reload
 systemctl restart "$SERVICE_NAME"
 systemctl --no-pager --full status "$SERVICE_NAME" || true
-
-
-
-
-
-
-
-
-
-
-

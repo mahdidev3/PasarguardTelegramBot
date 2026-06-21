@@ -48,6 +48,8 @@ from app.routers.reports import reports_router
 from app.routers.backup import backup_router
 from app.routers.pasarguard import pasarguard_router
 from app.services.scheduled_backup_service import start_auto_backup_scheduler
+from app.services.deadline_service import expire_sqlite_payment_deadlines, run_deadline_cleanup_once
+from app.services.job_service import get_job, list_jobs, run_due_jobs_once, run_job_and_record, set_job_enabled, start_job_scheduler, update_job_interval
 from app.services.pasarguard_template_service import render_sync_report, sync_plan_templates
 from app.services.pasarguard_user_service import (
     apply_template_to_remote_user,
@@ -106,7 +108,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and set your bot token.")
 
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
-RECEIPT_UPLOAD_WINDOW_MINUTES = int(os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "20"))
+RECEIPT_UPLOAD_WINDOW_MINUTES = int(os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "30"))
 
 
 # -----------------------------
@@ -548,9 +550,11 @@ class DB:
         with closing(self.connect()) as conn:
             return list(conn.execute("SELECT * FROM services WHERE user_telegram_id = ? ORDER BY id DESC", (telegram_id,)).fetchall())
 
-    def list_orders(self, telegram_id: int, limit: int = 7) -> list[sqlite3.Row]:
+    def list_orders(self, telegram_id: int, limit: int = 7, include_expired: bool = False) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
-            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
+            if include_expired:
+                return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
+            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? AND COALESCE(status, '') != 'expired' ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
 
     def list_wallet_transactions(self, telegram_id: int, limit: int = 5) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
@@ -782,6 +786,16 @@ def ensure_admin_schema() -> None:
                 chat_id INTEGER NOT NULL,
                 caption TEXT,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS deadline_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                details TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_id, event_type)
             );
             """
         )
@@ -1798,7 +1812,16 @@ def receipt_deadline_expired(receipt: sqlite3.Row) -> bool:
     deadline = parse_dt(str(receipt["expires_at"]))
     if not deadline:
         return False
-    return deadline < datetime.now(TEHRAN_TZ)
+    expired = deadline <= datetime.now(TEHRAN_TZ)
+    if expired:
+        # Make expiration durable immediately. This is important when the bot was
+        # down during the payment window: the next interaction must not revive an
+        # old receipt/order.
+        try:
+            expire_sqlite_payment_deadlines()
+        except Exception:
+            logger.exception("failed to persist expired receipt deadline")
+    return expired
 
 
 def list_receipt_files(receipt_id: int) -> list[sqlite3.Row]:
@@ -2080,15 +2103,40 @@ class AdminStates(StatesGroup):
     waiting_package_custom_description = State()
     waiting_package_custom_conditions = State()
     waiting_package_custom_code = State()
+    waiting_job_interval = State()
 
 
 # -----------------------------
 # Keyboards
 # -----------------------------
+
+def has_visible_user_packages(telegram_id: Optional[int]) -> bool:
+    if telegram_id is None:
+        return False
+    try:
+        with closing(db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM user_packages
+                WHERE user_telegram_id = ?
+                  AND status IN ('offered', 'pending_payment', 'active')
+                """,
+                (int(telegram_id),),
+            ).fetchone()
+            return bool(row and int(row["c"] or 0) > 0)
+    except Exception:
+        return False
+
 def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
+    service_row = [KeyboardButton(text="📦 سرویس‌های من")]
+    # Users must never see assigned-package entry points unless an admin has
+    # actually assigned at least one actionable package to them. Public services
+    # and public plans remain visible for everyone.
+    if has_visible_user_packages(telegram_id):
+        service_row.append(KeyboardButton(text="🎁 پکیج‌های من"))
     rows = [
         [KeyboardButton(text="🛒 خرید سرویس")],
-        [KeyboardButton(text="📦 سرویس‌های من"), KeyboardButton(text="🎁 پکیج‌های من")],
+        service_row,
         [KeyboardButton(text="🎁 سرویس رایگان")],
         [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
@@ -2209,11 +2257,15 @@ def insufficient_wallet_kb(order_id: int, suggested_amount: int, back_callback: 
 
 
 def transactions_kb(orders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    try:
+        expire_sqlite_payment_deadlines()
+    except Exception:
+        logger.exception("failed to cleanup transaction deadlines before rendering keyboard")
     rows: list[list[tuple[str, str]]] = []
     for order in orders[:20]:
         if str(order["status"]) in {"pending", "payment_rejected"} and str(order["plan_key"]).startswith("wallet_topup:"):
             receipt = get_receipt_by_order(int(order["id"]))
-            if not receipt or str(receipt["status"]) == "waiting_receipt":
+            if not receipt or (str(receipt["status"]) == "waiting_receipt" and not receipt_deadline_expired(receipt)):
                 rows.append([(f"🧾 ثبت رسید تراکنش #{order['id']}", f"tx_receipt:{order['id']}")])
     rows.append([("💰 کیف پول", "wallet"), ("🏠 منوی اصلی", "home")])
     return inline(rows)
@@ -2341,7 +2393,8 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
     if appearance_row:
         rows.append(appearance_row)
     if admin_has(admin_id, "*"):
-        rows.append([("👮 مدیریت ادمین‌ها", "adm_admins"), ("📜 لاگ ادمین‌ها", "adm_logs")])
+        rows.append([("⏱ مدیریت Jobها", "adm_jobs"), ("👮 مدیریت ادمین‌ها", "adm_admins")])
+        rows.append([("📜 لاگ ادمین‌ها", "adm_logs")])
     rows.append([("🏠 منوی اصلی کاربر", "home")])
     return inline(rows)
 
@@ -2349,6 +2402,68 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
 def admin_back_kb(back: str = "adm_home") -> InlineKeyboardMarkup:
     return inline([[('⬅️ بازگشت', back), ('👑 منوی ادمین', 'adm_home')]])
 
+
+
+
+
+def _job_minutes(row: sqlite3.Row) -> int:
+    try:
+        return max(1, int(row["interval_seconds"] or 60) // 60)
+    except Exception:
+        return 1
+
+
+def admin_jobs_text() -> str:
+    jobs = list_jobs()
+    text = header("⏱ مدیریت Jobها")
+    text += "این Jobها به صورت دوره‌ای اجرا می‌شوند و بعد از خاموشی/ری‌استارت بات هم catch-up دارند. یعنی اگر زمان اجرای Job در زمان خاموشی گذشته باشد، بعد از بالا آمدن بات اجرا می‌شود.\n\n"
+    for job in jobs:
+        status = "فعال ✅" if int(job["enabled"] or 0) else "غیرفعال ⛔"
+        text += f"• <b>{h(job['title'])}</b> — {status}\n"
+        text += f"  ⏱ فاصله اجرا: هر <b>{fmt_number(_job_minutes(job))}</b> دقیقه\n"
+        text += f"  🕒 آخرین اجرا: <code>{h(fmt_jalali_datetime(job['last_run_at']) if job['last_run_at'] else 'ندارد')}</code>\n"
+        text += f"  ⏭ اجرای بعدی: <code>{h(fmt_jalali_datetime(job['next_run_at']) if job['next_run_at'] else 'در اولین فرصت')}</code>\n"
+        if job['last_summary']:
+            text += f"  📊 آخرین نتیجه: <code>{h(job['last_summary'])}</code>\n"
+        if job['last_error']:
+            text += f"  ⚠️ خطا: <code>{h(job['last_error'])}</code>\n"
+        text += "\n"
+    return text
+
+
+def admin_jobs_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for job in list_jobs():
+        icon = "✅" if int(job["enabled"] or 0) else "⛔"
+        rows.append([(f"{icon} {job['title']}", f"adm_job_view:{job['job_key']}")])
+    rows.append([("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_job_text(job: sqlite3.Row) -> str:
+    text = header("⏱ جزئیات Job", job["title"])
+    text += f"🔑 کلید: <code>{h(job['job_key'])}</code>\n"
+    text += f"وضعیت: <b>{'فعال ✅' if int(job['enabled'] or 0) else 'غیرفعال ⛔'}</b>\n"
+    text += f"⏱ فاصله اجرا: هر <b>{fmt_number(_job_minutes(job))}</b> دقیقه\n"
+    text += f"🕒 آخرین اجرا: <code>{h(fmt_jalali_datetime(job['last_run_at']) if job['last_run_at'] else 'ندارد')}</code>\n"
+    text += f"⏭ اجرای بعدی: <code>{h(fmt_jalali_datetime(job['next_run_at']) if job['next_run_at'] else 'در اولین فرصت')}</code>\n"
+    if job['last_status']:
+        text += f"📌 آخرین وضعیت: <code>{h(job['last_status'])}</code>\n"
+    if job['last_summary']:
+        text += f"📊 آخرین نتیجه: <code>{h(job['last_summary'])}</code>\n"
+    if job['last_error']:
+        text += f"⚠️ آخرین خطا: <code>{h(job['last_error'])}</code>\n"
+    text += f"\n📝 توضیح:\n{h(job['description'])}"
+    return text
+
+
+def admin_job_kb(job_key: str, enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "⛔ غیرفعال کردن" if enabled else "✅ فعال کردن"
+    return inline([
+        [("▶️ اجرای دستی الان", f"adm_job_run:{job_key}"), ("⏱ تغییر فاصله", f"adm_job_interval:{job_key}")],
+        [(toggle_text, f"adm_job_toggle:{job_key}")],
+        [("⬅️ لیست Jobها", "adm_jobs"), ("👑 منوی ادمین", "adm_home")],
+    ])
 
 def admin_users_kb() -> InlineKeyboardMarkup:
     return inline([
@@ -3057,7 +3172,7 @@ def user_package_by_id(user_package_id: int, telegram_id: int | None = None) -> 
         return conn.execute("SELECT * FROM user_packages WHERE id = ? AND user_telegram_id = ?", (user_package_id, telegram_id)).fetchone()
 
 
-def list_user_packages(telegram_id: int, include_old: bool = True) -> list[sqlite3.Row]:
+def list_user_packages(telegram_id: int, include_old: bool = False) -> list[sqlite3.Row]:
     with closing(db.connect()) as conn:
         if include_old:
             return list(conn.execute("SELECT * FROM user_packages WHERE user_telegram_id = ? ORDER BY id DESC", (telegram_id,)).fetchall())
@@ -4558,6 +4673,10 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
 
 
 def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row]]:
+    try:
+        expire_sqlite_payment_deadlines()
+    except Exception:
+        logger.exception("failed to cleanup transaction deadlines before rendering list")
     orders = db.list_orders(int(user["telegram_id"]))
     text = header("💳 تراکنش‌های شما")
     if not orders:
@@ -4571,6 +4690,7 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
                 "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
                 "receipt_pending": "رسید در انتظار تأیید 🧾",
                 "payment_rejected": "رسید رد شد ❌",
+                "expired": "منقضی شده ⏳",
                 "rejected": "رد شده ❌",
             }
             status = status_map.get(str(order["status"]), h(order["status"]))
@@ -4776,6 +4896,107 @@ async def admin_home_cb(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     await show_admin_home(callback, int(callback.from_user.id))
+
+
+
+@router.callback_query(F.data == "adm_jobs")
+async def admin_jobs_home(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط سوپرادمین می‌تواند Jobها را مدیریت کند.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_jobs_text(), admin_jobs_kb())
+
+
+@router.callback_query(F.data.startswith("adm_job_view:"))
+async def admin_job_view(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    job_key = callback.data.split(":", 1)[1]
+    job = get_job(job_key)
+    if not job:
+        await callback.answer("Job پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_job_text(job), admin_job_kb(job_key, bool(int(job["enabled"] or 0))))
+
+
+@router.callback_query(F.data.startswith("adm_job_toggle:"))
+async def admin_job_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    job_key = callback.data.split(":", 1)[1]
+    job = get_job(job_key)
+    if not job:
+        await callback.answer("Job پیدا نشد.", show_alert=True)
+        return
+    set_job_enabled(job_key, not bool(int(job["enabled"] or 0)))
+    job = get_job(job_key)
+    await edit_or_answer(callback, admin_job_text(job), admin_job_kb(job_key, bool(int(job["enabled"] or 0))))
+
+
+@router.callback_query(F.data.startswith("adm_job_run:"))
+async def admin_job_run_now(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    job_key = callback.data.split(":", 1)[1]
+    if not get_job(job_key):
+        await callback.answer("Job پیدا نشد.", show_alert=True)
+        return
+    await callback.answer("Job در حال اجراست…", show_alert=False)
+    try:
+        result = await run_job_and_record(job_key)
+        admin_log(callback.from_user.id, "JOB_RUN_MANUAL", "job", job_key, str(result))
+        job = get_job(job_key)
+        await edit_or_answer(callback, header("✅ Job اجرا شد") + admin_job_text(job), admin_job_kb(job_key, bool(int(job["enabled"] or 0))))
+    except Exception as exc:
+        job = get_job(job_key)
+        await edit_or_answer(callback, header("❌ اجرای Job ناموفق بود") + f"خطا: <code>{h(exc)}</code>\n\n" + (admin_job_text(job) if job else ""), admin_back_kb("adm_jobs"))
+
+
+@router.callback_query(F.data.startswith("adm_job_interval:"))
+async def admin_job_interval_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    job_key = callback.data.split(":", 1)[1]
+    job = get_job(job_key)
+    if not job:
+        await callback.answer("Job پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_job_interval)
+    await state.update_data(job_key=job_key)
+    await edit_or_answer(
+        callback,
+        header("⏱ تغییر فاصله اجرای Job", job["title"])
+        + "فاصله جدید را به دقیقه وارد کنید. حداقل ۱ دقیقه است.\n\n"
+        + f"فاصله فعلی: <b>{fmt_number(_job_minutes(job))}</b> دقیقه",
+        admin_back_kb(f"adm_job_view:{job_key}"),
+    )
+
+
+@router.message(AdminStates.waiting_job_interval)
+async def admin_job_interval_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    job_key = str(data.get("job_key") or "")
+    raw = normalize_digits(message.text or "").strip()
+    if not raw.isdigit() or int(raw) < 1:
+        await message.answer("❌ فاصله باید عدد دقیقه و حداقل ۱ باشد.")
+        return
+    minutes = int(raw)
+    if not update_job_interval(job_key, minutes):
+        await state.clear()
+        await message.answer("Job پیدا نشد.", reply_markup=admin_back_kb("adm_jobs"))
+        return
+    admin_log(message.from_user.id if message.from_user else 0, "JOB_INTERVAL_UPDATE", "job", job_key, f"minutes={minutes}")
+    await state.clear()
+    job = get_job(job_key)
+    await message.answer(header("✅ فاصله Job تغییر کرد") + admin_job_text(job), reply_markup=admin_job_kb(job_key, bool(int(job["enabled"] or 0))))
 
 
 @router.callback_query(F.data == "adm_users")
@@ -7502,15 +7723,21 @@ async def admin_package_assignments(callback: CallbackQuery) -> None:
 @router.message(F.text == "🎁 پکیج‌های من")
 async def my_packages_msg(message: Message) -> None:
     user = ensure_from_message(message)
-    packages = list_user_packages(int(user["telegram_id"]), include_old=True)
-    await message.answer(header("🎁 پکیج‌های من") + ("هنوز پکیجی برای شما ثبت نشده است." if not packages else "یکی از پکیج‌ها را انتخاب کنید."), reply_markup=user_packages_kb(packages))
+    packages = list_user_packages(int(user["telegram_id"]), include_old=False)
+    if not packages:
+        await message.answer("فعلاً هیچ پکیج اختصاصی فعالی برای شما ثبت نشده است.", reply_markup=main_menu_kb(int(user["telegram_id"])))
+        return
+    await message.answer(header("🎁 پکیج‌های من") + "یکی از پکیج‌ها را انتخاب کنید.", reply_markup=user_packages_kb(packages))
 
 
 @router.callback_query(F.data == "my_packages")
 async def my_packages_cb(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
-    packages = list_user_packages(int(user["telegram_id"]), include_old=True)
-    await edit_or_answer(callback, header("🎁 پکیج‌های من") + ("هنوز پکیجی برای شما ثبت نشده است." if not packages else "یکی از پکیج‌ها را انتخاب کنید."), user_packages_kb(packages))
+    packages = list_user_packages(int(user["telegram_id"]), include_old=False)
+    if not packages:
+        await edit_or_answer(callback, "فعلاً هیچ پکیج اختصاصی فعالی برای شما ثبت نشده است.", back_home_kb())
+        return
+    await edit_or_answer(callback, header("🎁 پکیج‌های من") + "یکی از پکیج‌ها را انتخاب کنید.", user_packages_kb(packages))
 
 
 @router.callback_query(F.data.startswith("pkg_view:"))
@@ -7602,6 +7829,10 @@ async def unknown(message: Message, state: FSMContext) -> None:
 
 async def main() -> None:
     await bootstrap_phase1()
+    # Startup catch-up: deadlines and scheduled jobs that became due while the bot was down
+    # must be finalized before users/admins interact with stale orders, receipts or tickets.
+    await run_deadline_cleanup_once()
+    await run_due_jobs_once()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.middleware(AccessGuardMiddleware())
@@ -7616,23 +7847,14 @@ async def main() -> None:
     dp.include_router(pasarguard_router)
     dp.include_router(router)
     auto_backup_task = start_auto_backup_scheduler(bot)
+    job_scheduler_task = start_job_scheduler()
     logger.info("Bot started: @%s", BOT_USERNAME)
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         auto_backup_task.cancel()
+        job_scheduler_task.cancel()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
-
-
-
-
-
-

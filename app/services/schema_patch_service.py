@@ -42,14 +42,3 @@ async def apply_runtime_schema_patches() -> None:
 
         # Admin display names for the admin-management panel.
         await conn.execute(text("ALTER TABLE IF EXISTS admins ADD COLUMN IF NOT EXISTS display_name VARCHAR(120)"))
-
-
-
-
-
-
-
-
-
-
-

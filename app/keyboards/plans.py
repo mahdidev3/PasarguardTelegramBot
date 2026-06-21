@@ -1,12 +1,1 @@
 """Plans keyboard builders placeholder."""
-
-
-
-
-
-
-
-
-
-
-

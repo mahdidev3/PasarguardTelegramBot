@@ -1,12 +1,1 @@
 """User keyboard builders placeholder."""
-
-
-
-
-
-
-
-
-
-
-

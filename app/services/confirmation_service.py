@@ -73,7 +73,7 @@ async def verify_confirmation(
             return None
         if action and item.action != action:
             return None
-        if item.expires_at < datetime.now(TEHRAN_TZ):
+        if _aware_tehran(item.expires_at) <= datetime.now(TEHRAN_TZ):
             return None
         if item.code_hash != _hash_code(normalized):
             return None
@@ -84,14 +84,3 @@ async def verify_confirmation(
             .values(used_at=datetime.now(TEHRAN_TZ))
         )
         return payload
-
-
-
-
-
-
-
-
-
-
-
