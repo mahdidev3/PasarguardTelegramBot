@@ -2492,7 +2492,7 @@ def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
         return inline([
             [("♻️ بازگردانی کاربر", f"adm_user_restore:{uid}")],
             [("🧾 سفارش‌ها", f"adm_user_orders:{uid}"), ("📦 سرویس‌های کاربر", f"adm_user_services:{uid}")],
-            [("📝 یادداشت ادمین", f"adm_user_note:{uid}")],
+            [("🎁 پکیج‌های کاربر", f"adm_user_packages:{uid}"), ("📝 یادداشت ادمین", f"adm_user_note:{uid}")],
             [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
         ])
 
@@ -2507,7 +2507,7 @@ def admin_user_kb(user: sqlite3.Row) -> InlineKeyboardMarkup:
         status_row,
         [("🗑 حذف کاربر", f"adm_user_delete:{uid}"), ("🎁 ریست تست رایگان", f"adm_user_reset_free:{uid}")],
         [("📝 یادداشت ادمین", f"adm_user_note:{uid}"), ("➕ ساخت سرویس دستی", f"adm_manual_service:{uid}")],
-        [("🎁 اختصاص پکیج", f"adm_pkg_assign_user:{uid}")],
+        [("🎁 اختصاص پکیج", f"adm_pkg_assign_user:{uid}"), ("🎁 پکیج‌های کاربر", f"adm_user_packages:{uid}")],
         [("⬅️ کاربران", "adm_users"), ("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -3190,6 +3190,85 @@ def list_package_subscriptions(user_package_id: int) -> list[sqlite3.Row]:
         return list(conn.execute("SELECT * FROM package_subscriptions WHERE user_package_id = ? ORDER BY id DESC", (user_package_id,)).fetchall())
 
 
+def list_user_package_assignments(package_id: int | None = None, user_telegram_id: int | None = None, limit: int = 50) -> list[sqlite3.Row]:
+    """List package assignments for admin management.
+
+    This is an admin-only view and intentionally includes revoked/cancelled/declined
+    assignments too, so support can audit and manage old packages.
+    """
+    where: list[str] = []
+    params: list[Any] = []
+    if package_id is not None:
+        where.append("package_id = ?")
+        params.append(int(package_id))
+    if user_telegram_id is not None:
+        where.append("user_telegram_id = ?")
+        params.append(int(user_telegram_id))
+    sql = "SELECT * FROM user_packages"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    with closing(db.connect()) as conn:
+        return list(conn.execute(sql, tuple(params)).fetchall())
+
+
+def package_subscription_details(user_package_id: int) -> list[tuple[sqlite3.Row, Optional[sqlite3.Row], Optional[sqlite3.Row]]]:
+    """Return subscription rows with their service and package item for admin pages."""
+    details: list[tuple[sqlite3.Row, Optional[sqlite3.Row], Optional[sqlite3.Row]]] = []
+    for sub in list_package_subscriptions(user_package_id):
+        service = db.get_service(int(sub["service_id"]))
+        item = package_item_by_id(int(sub["package_item_id"]))
+        details.append((sub, service, item))
+    return details
+
+
+def user_package_status_label(status: str) -> str:
+    return {
+        "draft": "پیش‌نویس",
+        "offered": "پیشنهاد شده",
+        "pending_payment": "در انتظار پرداخت",
+        "active": "فعال",
+        "declined": "رد شده توسط کاربر",
+        "cancelled": "لغوشده",
+        "revoked": "پس‌گرفته‌شده از کاربر",
+    }.get(str(status), str(status))
+
+
+def revoke_user_package_local(user_package_id: int, *, delete_subscriptions: bool, admin_id: int) -> list[sqlite3.Row]:
+    """Revoke an assigned package. If requested, mark its created services as deleted.
+
+    Services are not physically removed from the database; they are marked deleted so
+    audit/backup remains safe and Pasarguard can be disabled by the caller.
+    """
+    affected_services: list[sqlite3.Row] = []
+    with closing(db.connect()) as conn:
+        up = conn.execute("SELECT * FROM user_packages WHERE id = ?", (user_package_id,)).fetchone()
+        if not up:
+            return []
+        conn.execute(
+            "UPDATE user_packages SET status = 'revoked', updated_at = ? WHERE id = ?",
+            (now_iso(), user_package_id),
+        )
+        if up["order_id"]:
+            conn.execute(
+                "UPDATE orders SET status = 'cancelled', admin_note = COALESCE(admin_note, ?) WHERE id = ? AND status != 'paid'",
+                (f"package revoked by admin {admin_id}", int(up["order_id"])),
+            )
+        if delete_subscriptions:
+            rows = list(conn.execute("SELECT service_id FROM package_subscriptions WHERE user_package_id = ?", (user_package_id,)).fetchall())
+            for row in rows:
+                service = conn.execute("SELECT * FROM services WHERE id = ?", (int(row["service_id"]),)).fetchone()
+                if service:
+                    affected_services.append(service)
+                    conn.execute(
+                        "UPDATE services SET status = 'deleted', locked_reason = ? WHERE id = ?",
+                        (f"package revoked by admin {admin_id}", int(service["id"])),
+                    )
+        conn.commit()
+    return affected_services
+
+
 def create_package_template(data: dict[str, Any], items: list[dict[str, Any]], admin_id: int) -> int:
     with closing(db.connect()) as conn:
         cur = conn.execute(
@@ -3289,10 +3368,9 @@ def user_package_text(user_package: sqlite3.Row, *, user_view: bool = True) -> s
     package = package_by_id(int(user_package["package_id"]))
     items = package_items(int(user_package["package_id"])) if package else []
     title = package["name"] if package else f"پکیج #{user_package['package_id']}"
-    status_map = {"draft": "پیش‌نویس", "offered": "در انتظار تأیید شما", "pending_payment": "در انتظار پرداخت", "active": "فعال", "declined": "رد شده", "cancelled": "لغوشده"}
     text = header("🎁 پکیج اختصاصی شما" if user_view else "🎁 پکیج اختصاصی کاربر", title)
     text += f"🧾 کد اختصاصی: <code>{h(user_package['code'])}</code>\n"
-    text += f"📌 وضعیت: <b>{h(status_map.get(str(user_package['status']), user_package['status']))}</b>\n"
+    text += f"📌 وضعیت: <b>{h(user_package_status_label(str(user_package['status'])))}</b>\n"
     text += f"💰 قیمت پک: <b>{'رایگان' if int(user_package['price']) == 0 else fmt_money(int(user_package['price']))}</b>\n"
     text += f"🔢 تعداد ساب قابل ساخت: <b>{fmt_number(int(user_package['max_subscriptions']))}</b>\n"
     text += f"✅ ساب‌های ساخته‌شده: <b>{fmt_number(count_package_subscriptions(int(user_package['id'])))}</b>\n"
@@ -3311,6 +3389,7 @@ def admin_packages_kb() -> InlineKeyboardMarkup:
     return inline([
         [("➕ ساخت پکیج جدید", "adm_pkg_new"), ("📋 لیست پکیج‌ها", "adm_pkg_list")],
         [("🎯 اختصاص پکیج به کاربر", "adm_pkg_assign_start")],
+        [("👥 همه پکیج‌های اختصاصی", "adm_userpkg_all")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -3394,6 +3473,57 @@ def admin_package_assignment_preview_kb(user_package_id: int) -> InlineKeyboardM
         [("✏️ کاستوم برای این کاربر", f"adm_userpkg_custom:{user_package_id}")],
         [("❌ لغو اختصاص", f"adm_userpkg_cancel:{user_package_id}"), ("👑 منوی ادمین", "adm_home")],
     ])
+
+
+def admin_user_package_manage_kb(user_package: sqlite3.Row) -> InlineKeyboardMarkup:
+    upid = int(user_package["id"])
+    uid = int(user_package["user_telegram_id"])
+    package_id = int(user_package["package_id"])
+    status = str(user_package["status"])
+    rows: list[list[tuple[str, str]]] = []
+    if status == "draft":
+        rows.append([("✅ ارسال پیشنهاد برای کاربر", f"adm_userpkg_send:{upid}")])
+        rows.append([("✏️ کاستوم برای این کاربر", f"adm_userpkg_custom:{upid}")])
+        rows.append([("❌ لغو پیش‌نویس", f"adm_userpkg_cancel:{upid}")])
+    rows.append([("🧩 ساب‌های این پکیج", f"adm_userpkg_subs:{upid}"), ("👤 پروفایل کاربر", f"adm_user:{uid}")])
+    if status in {"offered", "pending_payment", "active"}:
+        rows.append([("🚫 گرفتن پک با اطلاع", f"adm_userpkg_revoke:{upid}:keep:notify")])
+        rows.append([("🚫 گرفتن پک بی‌صدا", f"adm_userpkg_revoke:{upid}:keep:silent")])
+        rows.append([("🗑 گرفتن پک + حذف ساب‌ها با اطلاع", f"adm_userpkg_revoke:{upid}:delete:notify")])
+        rows.append([("🗑 گرفتن پک + حذف ساب‌ها بی‌صدا", f"adm_userpkg_revoke:{upid}:delete:silent")])
+    rows.append([("⬅️ اختصاص‌های این پکیج", f"adm_pkg_assignments:{package_id}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_user_package_list_kb(assignments: list[sqlite3.Row], back: str = "adm_packages") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    icon_map = {
+        "draft": "📝",
+        "offered": "🆕",
+        "pending_payment": "💳",
+        "active": "✅",
+        "declined": "❌",
+        "cancelled": "🚫",
+        "revoked": "⛔",
+    }
+    for up in assignments[:50]:
+        package = package_by_id(int(up["package_id"]))
+        title = package["name"] if package else f"پکیج #{up['package_id']}"
+        icon = icon_map.get(str(up["status"]), "🎁")
+        label = f"{icon} #{up['id']} | {title} | کاربر {up['user_telegram_id']}"
+        rows.append([(label[:64], f"adm_userpkg:{up['id']}")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_user_package_subs_kb(user_package_id: int, details: list[tuple[sqlite3.Row, Optional[sqlite3.Row], Optional[sqlite3.Row]]]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for sub, service, item in details[:50]:
+        if service:
+            title = item["title"] if item else service["name"]
+            rows.append([(f"📦 سرویس #{service['id']} | {title} | {service['status']}"[:64], f"adm_service:{service['id']}")])
+    rows.append([("⬅️ مدیریت پکیج اختصاصی", f"adm_userpkg:{user_package_id}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
 
 
 def user_packages_kb(packages: list[sqlite3.Row]) -> InlineKeyboardMarkup:
@@ -7701,23 +7831,142 @@ async def admin_userpkg_send(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("✅ پیشنهاد پکیج ارسال شد") + user_package_text(up, user_view=False), admin_back_kb("adm_packages"))
 
 
+@router.callback_query(F.data == "adm_userpkg_all")
+async def admin_all_user_packages(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    rows = list_user_package_assignments(limit=50)
+    text = header("👥 همه پکیج‌های اختصاصی")
+    if not rows:
+        text += "هنوز هیچ پکیج اختصاصی برای کاربران ثبت نشده است."
+    else:
+        text += "هر مورد را برای مدیریت کامل انتخاب کنید."
+    await edit_or_answer(callback, text, admin_user_package_list_kb(rows, "adm_packages"))
+
+
+@router.callback_query(F.data.startswith("adm_user_packages:"))
+async def admin_user_packages(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    uid = int(callback.data.split(":", 1)[1])
+    rows = list_user_package_assignments(user_telegram_id=uid, limit=50)
+    text = header("🎁 پکیج‌های اختصاصی کاربر", str(uid))
+    if not rows:
+        text += "برای این کاربر هنوز پکیج اختصاصی ثبت نشده است."
+    else:
+        text += "هر پکیج را برای مدیریت، گرفتن از کاربر یا مشاهده ساب‌ها انتخاب کنید."
+    await edit_or_answer(callback, text, admin_user_package_list_kb(rows, f"adm_user:{uid}"))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg:"))
+async def admin_user_package_detail(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid)
+    if not up:
+        await callback.answer("پکیج اختصاصی پیدا نشد.", show_alert=True)
+        return
+    text = header("🛠 مدیریت پکیج اختصاصی") + user_package_text(up, user_view=False)
+    text += "\nاز اینجا می‌توانید پک را از کاربر بگیرید، ساب‌های ساخته‌شده را ببینید، یا در صورت نیاز ساب‌ها را هم حذف/غیرفعال کنید."
+    await edit_or_answer(callback, text, admin_user_package_manage_kb(up))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_subs:"))
+async def admin_user_package_subscriptions(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    upid = int(callback.data.split(":", 1)[1])
+    up = user_package_by_id(upid)
+    if not up:
+        await callback.answer("پکیج اختصاصی پیدا نشد.", show_alert=True)
+        return
+    details = package_subscription_details(upid)
+    text = header("🧩 ساب‌های ساخته‌شده از پکیج")
+    text += user_package_text(up, user_view=False) + "\n"
+    if not details:
+        text += "\nبرای این پکیج هنوز هیچ سابی ساخته نشده است."
+    else:
+        text += "\n📦 ساب‌ها / سرویس‌ها:\n"
+        for sub, service, item in details:
+            if service:
+                item_title = item["title"] if item else "آیتم نامشخص"
+                text += f"• سرویس #{service['id']} | {h(item_title)} | وضعیت: <b>{h(service['status'])}</b> | نام: <code>{h(service['name'])}</code>\n"
+            else:
+                text += f"• رکورد ساب #{sub['id']} | سرویس حذف/ناموجود #{sub['service_id']}\n"
+    await edit_or_answer(callback, text, admin_user_package_subs_kb(upid, details))
+
+
+@router.callback_query(F.data.startswith("adm_userpkg_revoke:"))
+async def admin_user_package_revoke(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _prefix, upid_s, action, notify_mode = callback.data.split(":", 3)
+        upid = int(upid_s)
+    except Exception:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    up = user_package_by_id(upid)
+    if not up:
+        await callback.answer("پکیج اختصاصی پیدا نشد.", show_alert=True)
+        return
+    if str(up["status"]) not in {"offered", "pending_payment", "active"}:
+        await callback.answer("این پکیج در وضعیت قابل پس‌گرفتن نیست.", show_alert=True)
+        return
+    delete_subs = action == "delete"
+    affected_before = revoke_user_package_local(upid, delete_subscriptions=delete_subs, admin_id=callback.from_user.id)
+    remote_notices: list[str] = []
+    if delete_subs:
+        for old_service in affected_before:
+            service = db.get_service(int(old_service["id"]))
+            if service:
+                try:
+                    result = await set_remote_user_status(db, service, "deleted")
+                    if result:
+                        remote_notices.append(result.notice())
+                except Exception as exc:
+                    remote_notices.append(f"\n⚠️ Pasarguard service #{old_service['id']}: {h(exc)}")
+    up_after = user_package_by_id(upid) or up
+    if notify_mode == "notify":
+        try:
+            if delete_subs:
+                msg = header("⛔ پکیج اختصاصی شما غیرفعال شد") + "این پکیج از حساب شما برداشته شد و ساب‌های ساخته‌شده از این پکیج هم غیرفعال شدند."
+            else:
+                msg = header("⛔ پکیج اختصاصی شما برداشته شد") + "این پکیج دیگر برای شما قابل استفاده نیست؛ اما ساب‌هایی که قبلاً از آن ساخته‌اید دست‌نخورده باقی می‌مانند."
+            await callback.bot.send_message(int(up["user_telegram_id"]), msg)
+        except Exception as exc:
+            logger.warning("Failed to notify user package revoke %s: %s", upid, exc)
+            await callback.answer("پک پس گرفته شد، اما اطلاع‌رسانی به کاربر ناموفق بود.", show_alert=True)
+    admin_log(callback.from_user.id, "USER_PACKAGE_REVOKE", "user_package", upid, f"delete_subs={delete_subs}; notify={notify_mode}")
+    text = header("✅ پکیج از کاربر گرفته شد") + user_package_text(up_after, user_view=False)
+    if delete_subs:
+        text += f"\n🗑 تعداد ساب/سرویس غیرفعال‌شده: <b>{fmt_number(len(affected_before))}</b>"
+    else:
+        text += "\n📦 ساب‌های ساخته‌شده قبلی دست‌نخورده باقی ماندند."
+    if remote_notices:
+        text += "\n" + "".join(remote_notices[:8])
+    await edit_or_answer(callback, text, admin_user_package_manage_kb(up_after))
+
+
 @router.callback_query(F.data.startswith("adm_pkg_assignments:"))
 async def admin_package_assignments(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "packages"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
         return
     package_id = int(callback.data.split(":", 1)[1])
-    with closing(db.connect()) as conn:
-        rows = list(conn.execute("SELECT * FROM user_packages WHERE package_id = ? ORDER BY id DESC LIMIT 30", (package_id,)).fetchall())
+    rows = list_user_package_assignments(package_id=package_id, limit=50)
     text = header("👥 اختصاص‌های پکیج")
     if not rows:
         text += "هنوز برای این پکیج اختصاصی ثبت نشده است."
     else:
-        for up in rows:
-            subs = list_package_subscriptions(int(up["id"]))
-            sub_text = "، ".join(f"سرویس #{s['service_id']}" for s in subs[:5]) if subs else "بدون ساب"
-            text += f"#{up['id']} | کاربر <code>{up['user_telegram_id']}</code> | <b>{h(up['status'])}</b> | {h(up['code'])} | {fmt_money(int(up['price']))} | {h(sub_text)}\n"
-    await edit_or_answer(callback, text, admin_package_kb(package_id))
+        text += "هر مورد را برای مدیریت کامل، مشاهده ساب‌ها یا گرفتن پک از کاربر انتخاب کنید."
+    await edit_or_answer(callback, text, admin_user_package_list_kb(rows, f"adm_pkg:{package_id}"))
 
 
 @router.message(F.text == "🎁 پکیج‌های من")
@@ -7745,8 +7994,8 @@ async def user_package_view(callback: CallbackQuery) -> None:
     user = ensure_from_callback(callback)
     upid = int(callback.data.split(":", 1)[1])
     up = user_package_by_id(upid, int(user["telegram_id"]))
-    if not up:
-        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+    if not up or str(up["status"]) not in {"offered", "pending_payment", "active"}:
+        await callback.answer("این پکیج دیگر برای شما فعال یا قابل مشاهده نیست.", show_alert=True)
         return
     await edit_or_answer(callback, user_package_text(up), user_package_view_kb(up))
 
