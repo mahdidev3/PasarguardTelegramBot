@@ -800,8 +800,20 @@ def ensure_admin_schema() -> None:
             );
 
 
+            CREATE TABLE IF NOT EXISTS tutorial_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS tutorials (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
                 title TEXT NOT NULL,
                 body TEXT NOT NULL,
                 media_type TEXT,
@@ -847,10 +859,30 @@ def ensure_admin_schema() -> None:
             ("payment_receipts", "admin_note", "ALTER TABLE payment_receipts ADD COLUMN admin_note TEXT"),
             ("payment_receipts", "expires_at", "ALTER TABLE payment_receipts ADD COLUMN expires_at TEXT"),
             ("payment_receipts", "submitted_at", "ALTER TABLE payment_receipts ADD COLUMN submitted_at TEXT"),
+            ("tutorials", "category_id", "ALTER TABLE tutorials ADD COLUMN category_id INTEGER"),
+            ("tutorial_categories", "description", "ALTER TABLE tutorial_categories ADD COLUMN description TEXT"),
         ]:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if column not in cols:
                 conn.execute(ddl)
+        # Ensure tutorial center has a default category and assign old uncategorized tutorials.
+        default_cat = conn.execute("SELECT id FROM tutorial_categories ORDER BY id ASC LIMIT 1").fetchone()
+        if not default_cat:
+            cur_cat = conn.execute(
+                """
+                INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+                VALUES (?, ?, 10, 1, NULL, ?, ?)
+                """,
+                ("آموزش‌های عمومی", "راهنمای کلی استفاده از ربات و سرویس‌ها", now_iso(), now_iso()),
+            )
+            default_cat_id = int(cur_cat.lastrowid)
+        else:
+            default_cat_id = int(default_cat["id"])
+        try:
+            conn.execute("UPDATE tutorials SET category_id = ? WHERE category_id IS NULL", (default_cat_id,))
+        except Exception:
+            pass
+
         # Retire the removed service-pause feature: old paused rows are made active again.
         conn.execute("UPDATE services SET status = 'active', locked_reason = NULL WHERE status = ?", ("fro" + "zen",))
         conn.execute("UPDATE coupons SET max_discount_percent = 100 WHERE max_discount_percent IS NULL OR max_discount_percent < 100")
@@ -2129,25 +2161,164 @@ class AdminStates(StatesGroup):
     waiting_tutorial_edit_body = State()
     waiting_tutorial_edit_sort = State()
     waiting_tutorial_edit_media = State()
+    waiting_tutorial_category_title = State()
+    waiting_tutorial_category_description = State()
+    waiting_tutorial_category_sort = State()
+    waiting_tutorial_category_edit_title = State()
+    waiting_tutorial_category_edit_description = State()
+    waiting_tutorial_category_edit_sort = State()
 
 
 
 # -----------------------------
 # Tutorials / education center
 # -----------------------------
-def tutorial_count_active() -> int:
+def _row_has_col(row: Optional[sqlite3.Row], col: str) -> bool:
     try:
-        return db_count("SELECT COUNT(*) FROM tutorials WHERE is_active = 1")
+        return bool(row is not None and col in row.keys())
+    except Exception:
+        return False
+
+
+def tutorial_category_count_active() -> int:
+    try:
+        return db_count("SELECT COUNT(*) FROM tutorial_categories WHERE is_active = 1")
     except Exception:
         return 0
 
 
-def list_tutorials(active_only: bool = True) -> list[sqlite3.Row]:
+def tutorial_count_active() -> int:
+    try:
+        return db_count(
+            """
+            SELECT COUNT(*)
+            FROM tutorials t
+            JOIN tutorial_categories c ON c.id = t.category_id
+            WHERE t.is_active = 1 AND c.is_active = 1
+            """
+        )
+    except Exception:
+        try:
+            return db_count("SELECT COUNT(*) FROM tutorials WHERE is_active = 1")
+        except Exception:
+            return 0
+
+
+def list_tutorial_categories(active_only: bool = True, include_counts: bool = False) -> list[sqlite3.Row]:
     try:
         with closing(db.connect()) as conn:
+            if include_counts:
+                sql = """
+                    SELECT c.*,
+                           COUNT(t.id) AS tutorials_count,
+                           COALESCE(SUM(CASE WHEN t.is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tutorials_count
+                    FROM tutorial_categories c
+                    LEFT JOIN tutorials t ON t.category_id = c.id
+                """
+                params: tuple[Any, ...] = ()
+                if active_only:
+                    sql += " WHERE c.is_active = 1"
+                sql += " GROUP BY c.id ORDER BY c.sort_order ASC, c.id ASC"
+                return list(conn.execute(sql, params).fetchall())
             if active_only:
-                return list(conn.execute("SELECT * FROM tutorials WHERE is_active = 1 ORDER BY sort_order ASC, id ASC").fetchall())
-            return list(conn.execute("SELECT * FROM tutorials ORDER BY sort_order ASC, id ASC").fetchall())
+                return list(conn.execute("SELECT * FROM tutorial_categories WHERE is_active = 1 ORDER BY sort_order ASC, id ASC").fetchall())
+            return list(conn.execute("SELECT * FROM tutorial_categories ORDER BY sort_order ASC, id ASC").fetchall())
+    except Exception:
+        return []
+
+
+def get_tutorial_category(category_id: int) -> Optional[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            return conn.execute("SELECT * FROM tutorial_categories WHERE id = ?", (int(category_id),)).fetchone()
+    except Exception:
+        return None
+
+
+def default_tutorial_category_id() -> int:
+    categories = list_tutorial_categories(active_only=False)
+    if categories:
+        return int(categories[0]["id"])
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, 10, 1, NULL, ?, ?)
+            """,
+            ("آموزش‌های عمومی", "راهنمای کلی استفاده از ربات و سرویس‌ها", now_iso(), now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def next_tutorial_category_sort_order() -> int:
+    try:
+        with closing(db.connect()) as conn:
+            row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorial_categories").fetchone()
+            return int(row["n"] or 10)
+    except Exception:
+        return 10
+
+
+def create_tutorial_category(title: str, description: str, sort_order: int, admin_id: int) -> int:
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
+            """,
+            (title.strip(), description.strip() or None, int(sort_order), int(admin_id), now_iso(), now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_tutorial_category_field(category_id: int, field: str, value: Any) -> None:
+    allowed = {"title", "description", "sort_order", "is_active"}
+    if field not in allowed:
+        raise ValueError("invalid tutorial category field")
+    with closing(db.connect()) as conn:
+        conn.execute(f"UPDATE tutorial_categories SET {field} = ?, updated_at = ? WHERE id = ?", (value, now_iso(), int(category_id)))
+        conn.commit()
+
+
+def delete_tutorial_category(category_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM tutorials WHERE category_id = ?", (int(category_id),)).fetchone()
+        if row and int(row["c"] or 0) > 0:
+            return False
+        conn.execute("DELETE FROM tutorial_categories WHERE id = ?", (int(category_id),))
+        conn.commit()
+        return True
+
+
+def tutorial_category_label(row: Optional[sqlite3.Row]) -> str:
+    if not row:
+        return "بدون دسته"
+    status = "✅" if int(row["is_active"] or 0) else "⛔"
+    return f"{status} {row['title']}"
+
+
+def list_tutorials(active_only: bool = True, category_id: int | None = None) -> list[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            sql = """
+                SELECT t.*, c.title AS category_title, c.sort_order AS category_sort_order, c.is_active AS category_is_active
+                FROM tutorials t
+                LEFT JOIN tutorial_categories c ON c.id = t.category_id
+            """
+            where: list[str] = []
+            params: list[Any] = []
+            if active_only:
+                where.append("t.is_active = 1")
+                where.append("COALESCE(c.is_active, 1) = 1")
+            if category_id is not None:
+                where.append("t.category_id = ?")
+                params.append(int(category_id))
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY COALESCE(c.sort_order, 999999) ASC, t.sort_order ASC, t.id ASC"
+            return list(conn.execute(sql, tuple(params)).fetchall())
     except Exception:
         return []
 
@@ -2155,30 +2326,44 @@ def list_tutorials(active_only: bool = True) -> list[sqlite3.Row]:
 def get_tutorial(tutorial_id: int) -> Optional[sqlite3.Row]:
     try:
         with closing(db.connect()) as conn:
-            return conn.execute("SELECT * FROM tutorials WHERE id = ?", (tutorial_id,)).fetchone()
+            return conn.execute(
+                """
+                SELECT t.*, c.title AS category_title, c.is_active AS category_is_active
+                FROM tutorials t
+                LEFT JOIN tutorial_categories c ON c.id = t.category_id
+                WHERE t.id = ?
+                """,
+                (int(tutorial_id),),
+            ).fetchone()
     except Exception:
         return None
 
 
-def next_tutorial_sort_order() -> int:
+def next_tutorial_sort_order(category_id: int | None = None) -> int:
     try:
         with closing(db.connect()) as conn:
-            row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorials").fetchone()
+            if category_id is not None:
+                row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorials WHERE category_id = ?", (int(category_id),)).fetchone()
+            else:
+                row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorials").fetchone()
             return int(row["n"] or 10)
     except Exception:
         return 10
 
 
-def create_tutorial(title: str, body: str, sort_order: int, admin_id: int, media: dict[str, str] | None = None) -> int:
+def create_tutorial(category_id: int, title: str, body: str, sort_order: int, admin_id: int, media: dict[str, str] | None = None) -> int:
     media = media or {}
+    if not get_tutorial_category(int(category_id)):
+        category_id = default_tutorial_category_id()
     with closing(db.connect()) as conn:
         cur = conn.execute(
             """
             INSERT INTO tutorials
-            (title, body, media_type, media_file_id, media_file_unique_id, sort_order, is_active, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            (category_id, title, body, media_type, media_file_id, media_file_unique_id, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
+                int(category_id),
                 title.strip(),
                 body.strip(),
                 media.get("media_type") or None,
@@ -2195,11 +2380,25 @@ def create_tutorial(title: str, body: str, sort_order: int, admin_id: int, media
 
 
 def update_tutorial_field(tutorial_id: int, field: str, value: Any) -> None:
-    allowed = {"title", "body", "sort_order", "is_active", "media_type", "media_file_id", "media_file_unique_id"}
+    allowed = {"category_id", "title", "body", "sort_order", "is_active", "media_type", "media_file_id", "media_file_unique_id"}
     if field not in allowed:
         raise ValueError("invalid tutorial field")
     with closing(db.connect()) as conn:
         conn.execute(f"UPDATE tutorials SET {field} = ?, updated_at = ? WHERE id = ?", (value, now_iso(), int(tutorial_id)))
+        conn.commit()
+
+
+def update_tutorial_media(tutorial_id: int, media: dict[str, str] | None) -> None:
+    media = media or {}
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE tutorials
+            SET media_type = ?, media_file_id = ?, media_file_unique_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (media.get("media_type") or None, media.get("media_file_id") or None, media.get("media_file_unique_id") or None, now_iso(), int(tutorial_id)),
+        )
         conn.commit()
 
 
@@ -2224,31 +2423,65 @@ def extract_tutorial_media(message: Message) -> dict[str, str]:
     return {}
 
 
-def tutorials_user_text() -> str:
+def tutorials_user_text(category_id: int | None = None) -> str:
+    if category_id is not None:
+        cat = get_tutorial_category(category_id)
+        rows = list_tutorials(active_only=True, category_id=category_id)
+        if not cat or int(cat["is_active"] or 0) != 1:
+            return header("📚 آموزش‌ها") + "این دسته‌بندی در حال حاضر فعال نیست."
+        text = header("📚 آموزش‌ها", str(cat["title"]))
+        if cat["description"]:
+            text += f"{h(cat['description'])}\n\n"
+        if not rows:
+            text += "در این دسته‌بندی هنوز آموزشی برای نمایش وجود ندارد."
+            return text
+        for idx, row in enumerate(rows, start=1):
+            text += f"{idx}. <b>{h(row['title'])}</b>\n"
+        return text
+
+    categories = list_tutorial_categories(active_only=True, include_counts=True)
     rows = list_tutorials(active_only=True)
     if not rows:
         return header("📚 آموزش‌ها") + "در حال حاضر آموزشی برای نمایش وجود ندارد."
-    text = header("📚 آموزش‌ها", "راهنمای همه‌جانبه استفاده از سرویس‌ها")
-    text += "یکی از آموزش‌های زیر را انتخاب کنید. آموزش‌ها می‌توانند مربوط به نصب برنامه‌ها، استفاده از لینک اشتراک، مدیریت ساب، تیکت، تمدید، افزایش حجم و سایر بخش‌ها باشند.\n\n"
-    for idx, row in enumerate(rows, start=1):
-        text += f"{idx}. <b>{h(row['title'])}</b>\n"
-    return text
+    text = header("📚 آموزش‌ها", "راهنمای همه‌جانبه استفاده از ربات و سرویس‌ها")
+    text += "آموزش‌ها دسته‌بندی شده‌اند؛ می‌توانید یک دسته را انتخاب کنید یا از لیست زیر آموزش مدنظر را مستقیم باز کنید.\n\n"
+    for cat in categories:
+        if int(cat["active_tutorials_count"] or 0) <= 0:
+            continue
+        text += f"<b>📂 {h(cat['title'])}</b>"
+        if cat["description"]:
+            text += f" — {h(cat['description'])}"
+        text += "\n"
+        for row in [r for r in rows if int(r["category_id"] or 0) == int(cat["id"])][:5]:
+            text += f"   • {h(row['title'])}\n"
+        text += "\n"
+    return text.rstrip()
 
 
-def tutorials_user_kb(back_callback: str = "home") -> InlineKeyboardMarkup:
+def tutorials_user_kb(back_callback: str = "home", category_id: int | None = None) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
-    for row in list_tutorials(active_only=True)[:50]:
-        rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
+    if category_id is None:
+        cats = [c for c in list_tutorial_categories(active_only=True, include_counts=True) if int(c["active_tutorials_count"] or 0) > 0]
+        for cat in cats[:30]:
+            rows.append([(f"📂 {str(cat['title'])[:35]} ({int(cat['active_tutorials_count'] or 0)})", f"tutorial_cat:{cat['id']}")])
+        for row in list_tutorials(active_only=True)[:50]:
+            rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
+    else:
+        for row in list_tutorials(active_only=True, category_id=category_id)[:50]:
+            rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
+        rows.append([("⬅️ همه آموزش‌ها", "tutorials")])
     rows.append([("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
 
-def tutorial_detail_kb() -> InlineKeyboardMarkup:
-    return inline([[('⬅️ لیست آموزش‌ها', 'tutorials'), ('🏠 منوی اصلی', 'home')]])
+def tutorial_detail_kb(category_id: int | None = None) -> InlineKeyboardMarkup:
+    back = f"tutorial_cat:{category_id}" if category_id else "tutorials"
+    return inline([[("⬅️ لیست آموزش‌ها", back), ("🏠 منوی اصلی", "home")]])
 
 
 def tutorial_text(row: sqlite3.Row) -> str:
-    return header("📚 آموزش", str(row["title"])) + str(row["body"] or "")
+    cat = str(row["category_title"] or "آموزش") if _row_has_col(row, "category_title") else "آموزش"
+    return header("📚 آموزش", f"{cat} / {row['title']}") + str(row["body"] or "")
 
 
 async def send_tutorial_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
@@ -2271,43 +2504,130 @@ async def send_tutorial_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> Non
         except Exception:
             logger.exception("failed to send tutorial media tutorial_id=%s", row["id"])
             text += "\n\n⚠️ فایل این آموزش در حال حاضر قابل ارسال نیست."
-    await bot.send_message(chat_id, text, reply_markup=tutorial_detail_kb(), disable_web_page_preview=True)
+    await bot.send_message(chat_id, text, reply_markup=tutorial_detail_kb(int(row["category_id"] or 0) if _row_has_col(row, "category_id") else None), disable_web_page_preview=True)
 
 
 def admin_tutorials_text() -> str:
-    rows = list_tutorials(active_only=False)
+    total = len(list_tutorials(active_only=False))
+    active = tutorial_count_active()
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
     text = header("📚 مدیریت آموزش‌ها")
-    text += "این بخش فقط برای مدیر اصلی فعال است. آموزش‌های فعال برای کاربر در دکمه «📚 آموزش‌ها» نمایش داده می‌شوند و ترتیب نمایش با عدد ترتیب مشخص می‌شود؛ عدد کمتر یعنی بالاتر.\n\n"
+    text += "مدیریت این بخش کاملاً مرحله‌ای است و نیازی به جداکننده | ندارد. آموزش‌ها دسته‌بندی، فایل، متن، وضعیت و ترتیب نمایش جداگانه دارند.\n\n"
+    text += f"📂 دسته‌ها: <b>{fmt_number(len(cats))}</b>\n📘 آموزش‌ها: <b>{fmt_number(total)}</b>\n✅ آموزش فعال قابل نمایش: <b>{fmt_number(active)}</b>\n\n"
+    if not cats:
+        text += "هنوز دسته‌بندی ثبت نشده است. ابتدا یک دسته بسازید."
+    else:
+        text += "دسته‌بندی‌ها:\n"
+        for cat in cats[:12]:
+            status = "✅" if int(cat["is_active"] or 0) else "⛔"
+            text += f"{status} #{cat['id']} | <b>{h(cat['title'])}</b> — آموزش فعال: <code>{int(cat['active_tutorials_count'] or 0)}</code> — ترتیب: <code>{cat['sort_order']}</code>\n"
+    return text
+
+
+def admin_tutorials_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("📘 لیست آموزش‌ها", "adm_tut_list"), ("📂 دسته‌بندی‌ها", "adm_tut_cats")],
+        [("➕ افزودن آموزش", "adm_tut_add"), ("➕ افزودن دسته", "adm_tut_cat_add")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_tutorial_list_text(category_id: int | None = None) -> str:
+    cat = get_tutorial_category(category_id) if category_id else None
+    rows = list_tutorials(active_only=False, category_id=category_id)
+    title = "📘 آموزش‌ها" if not cat else f"📘 آموزش‌های {cat['title']}"
+    text = header(title)
     if not rows:
         text += "هنوز آموزشی ثبت نشده است."
         return text
     for row in rows:
         status = "فعال ✅" if int(row["is_active"] or 0) else "غیرفعال ⛔"
         media = " + فایل" if row["media_file_id"] else ""
-        text += f"#{row['id']} | <b>{h(row['title'])}</b> — {status}{media} — ترتیب: <code>{row['sort_order']}</code>\n"
+        cat_label = f"📂 {h(row['category_title'] or 'بدون دسته')} — " if not category_id else ""
+        text += f"#{row['id']} | {cat_label}<b>{h(row['title'])}</b> — {status}{media} — ترتیب: <code>{row['sort_order']}</code>\n"
     return text
 
 
-def admin_tutorials_kb() -> InlineKeyboardMarkup:
+def admin_tutorial_list_kb(category_id: int | None = None) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = [[("➕ افزودن آموزش", "adm_tut_add")]]
-    for row in list_tutorials(active_only=False)[:30]:
+    for row in list_tutorials(active_only=False, category_id=category_id)[:40]:
         status = "✅" if int(row["is_active"] or 0) else "⛔"
         rows.append([(f"{status} #{row['id']} | {str(row['title'])[:35]}", f"adm_tut_view:{row['id']}")])
-    rows.append([("👑 منوی ادمین", "adm_home")])
+    rows.append([("⬅️ مدیریت آموزش‌ها", "adm_tutorials"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_tutorial_categories_text() -> str:
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
+    text = header("📂 دسته‌بندی آموزش‌ها")
+    text += "هر دسته می‌تواند فعال/غیرفعال باشد و ترتیب خودش را داشته باشد. دسته غیرفعال و آموزش‌های داخلش برای کاربر نمایش داده نمی‌شوند.\n\n"
+    if not cats:
+        text += "هنوز دسته‌ای ثبت نشده است."
+        return text
+    for cat in cats:
+        status = "فعال ✅" if int(cat["is_active"] or 0) else "غیرفعال ⛔"
+        desc = f" — {h(cat['description'])}" if cat["description"] else ""
+        text += f"#{cat['id']} | <b>{h(cat['title'])}</b>{desc}\nوضعیت: {status} | ترتیب: <code>{cat['sort_order']}</code> | آموزش‌ها: <code>{int(cat['tutorials_count'] or 0)}</code> | فعال: <code>{int(cat['active_tutorials_count'] or 0)}</code>\n\n"
+    return text.rstrip()
+
+
+def admin_tutorial_categories_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("➕ افزودن دسته", "adm_tut_cat_add")]]
+    for cat in list_tutorial_categories(active_only=False, include_counts=True)[:30]:
+        status = "✅" if int(cat["is_active"] or 0) else "⛔"
+        rows.append([(f"{status} #{cat['id']} | {str(cat['title'])[:35]}", f"adm_tut_cat_view:{cat['id']}")])
+    rows.append([("⬅️ مدیریت آموزش‌ها", "adm_tutorials"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_tutorial_category_view_text(cat: sqlite3.Row) -> str:
+    status = "فعال ✅" if int(cat["is_active"] or 0) else "غیرفعال ⛔"
+    rows = list_tutorials(active_only=False, category_id=int(cat["id"]))
+    desc = str(cat["description"] or "-")
+    text = header("📂 جزئیات دسته آموزش", f"#{cat['id']}")
+    text += f"عنوان: <b>{h(cat['title'])}</b>\n"
+    text += f"توضیح: {h(desc)}\n"
+    text += f"وضعیت: <b>{status}</b>\n"
+    text += f"ترتیب نمایش: <code>{cat['sort_order']}</code>\n"
+    text += f"تعداد آموزش: <b>{fmt_number(len(rows))}</b>\n"
+    return text
+
+
+def admin_tutorial_category_view_kb(cat: sqlite3.Row) -> InlineKeyboardMarkup:
+    cid = int(cat["id"])
+    toggle = "⛔ غیرفعال کردن" if int(cat["is_active"] or 0) else "✅ فعال کردن"
+    return inline([
+        [(toggle, f"adm_tut_cat_toggle:{cid}"), ("📘 آموزش‌های این دسته", f"adm_tut_list_cat:{cid}")],
+        [("✏️ ویرایش عنوان", f"adm_tut_cat_edit_title:{cid}"), ("📝 ویرایش توضیح", f"adm_tut_cat_edit_desc:{cid}")],
+        [("🔢 تغییر ترتیب", f"adm_tut_cat_edit_sort:{cid}"), ("🗑 حذف دسته", f"adm_tut_cat_delete:{cid}")],
+        [("⬅️ دسته‌بندی‌ها", "adm_tut_cats"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def tutorial_category_select_kb(prefix: str, back: str = "adm_tutorials") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
+    for cat in cats[:40]:
+        status = "✅" if int(cat["is_active"] or 0) else "⛔"
+        rows.append([(f"{status} {str(cat['title'])[:35]}", f"{prefix}:{cat['id']}")])
+    rows.append([("➕ ساخت دسته جدید", "adm_tut_cat_add")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
 
 
 def admin_tutorial_view_text(row: sqlite3.Row) -> str:
     status = "فعال ✅" if int(row["is_active"] or 0) else "غیرفعال ⛔"
+    cat_status = "فعال" if int(row["category_is_active"] or 1) else "غیرفعال"
     media = f"{row['media_type']} ✅" if row["media_file_id"] else "ندارد"
     body = str(row["body"] or "")
     if len(body) > 1200:
         body = body[:1200] + "…"
     return (
         header("📚 جزئیات آموزش", f"#{row['id']}")
+        + f"دسته: <b>{h(row['category_title'] or 'بدون دسته')}</b> ({cat_status})\n"
         + f"عنوان: <b>{h(row['title'])}</b>\n"
-        + f"وضعیت: <b>{status}</b>\n"
-        + f"ترتیب نمایش: <code>{row['sort_order']}</code>\n"
+        + f"وضعیت آموزش: <b>{status}</b>\n"
+        + f"ترتیب نمایش در دسته: <code>{row['sort_order']}</code>\n"
         + f"فایل/مدیا: <b>{h(media)}</b>\n\n"
         + f"متن:\n{h(body)}"
     )
@@ -2315,13 +2635,14 @@ def admin_tutorial_view_text(row: sqlite3.Row) -> str:
 
 def admin_tutorial_view_kb(row: sqlite3.Row) -> InlineKeyboardMarkup:
     tid = int(row["id"])
+    cid = int(row["category_id"] or 0)
     toggle = "⛔ غیرفعال کردن" if int(row["is_active"] or 0) else "✅ فعال کردن"
     return inline([
         [(toggle, f"adm_tut_toggle:{tid}"), ("👁 پیش‌نمایش", f"adm_tut_preview:{tid}")],
+        [("📂 تغییر دسته", f"adm_tut_edit_cat:{tid}"), ("🔢 تغییر ترتیب", f"adm_tut_edit_sort:{tid}")],
         [("✏️ ویرایش عنوان", f"adm_tut_edit_title:{tid}"), ("📝 ویرایش متن", f"adm_tut_edit_body:{tid}")],
-        [("🔢 تغییر ترتیب", f"adm_tut_edit_sort:{tid}"), ("📎 تغییر/حذف فایل", f"adm_tut_edit_media:{tid}")],
-        [("🗑 حذف", f"adm_tut_delete:{tid}")],
-        [("⬅️ لیست آموزش‌ها", "adm_tutorials"), ("👑 منوی ادمین", "adm_home")],
+        [("📎 تغییر/حذف فایل", f"adm_tut_edit_media:{tid}"), ("🗑 حذف", f"adm_tut_delete:{tid}")],
+        [("⬅️ لیست این دسته", f"adm_tut_list_cat:{cid}"), ("📚 مدیریت آموزش‌ها", "adm_tutorials")],
     ])
 
 # -----------------------------
@@ -6315,12 +6636,27 @@ async def tutorials_cb(callback: CallbackQuery, state: FSMContext) -> None:
     await edit_or_answer(callback, tutorials_user_text(), tutorials_user_kb("home"))
 
 
+@router.callback_query(F.data.startswith("tutorial_cat:"))
+async def tutorial_category_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    ensure_from_callback(callback)
+    category_id = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(category_id)
+    if not cat or int(cat["is_active"] or 0) != 1:
+        await callback.answer("این دسته‌بندی در حال حاضر فعال نیست.", show_alert=True)
+        return
+    if not list_tutorials(active_only=True, category_id=category_id):
+        await callback.answer("در این دسته‌بندی آموزشی برای نمایش وجود ندارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, tutorials_user_text(category_id), tutorials_user_kb("tutorials", category_id))
+
+
 @router.callback_query(F.data.startswith("tutorial:"))
 async def tutorial_view_cb(callback: CallbackQuery) -> None:
     ensure_from_callback(callback)
     tutorial_id = int(callback.data.split(":", 1)[1])
     row = get_tutorial(tutorial_id)
-    if not row or int(row["is_active"] or 0) != 1:
+    if not row or int(row["is_active"] or 0) != 1 or int(row["category_is_active"] or 0) != 1:
         await callback.answer("این آموزش در حال حاضر فعال نیست.", show_alert=True)
         return
     media_file_id = str(row["media_file_id"] or "") if "media_file_id" in row.keys() else ""
@@ -6328,7 +6664,7 @@ async def tutorial_view_cb(callback: CallbackQuery) -> None:
         await callback.answer("آموزش ارسال شد.")
         await send_tutorial_content(callback.bot, callback.from_user.id, row)
     else:
-        await edit_or_answer(callback, tutorial_text(row), tutorial_detail_kb())
+        await edit_or_answer(callback, tutorial_text(row), tutorial_detail_kb(int(row["category_id"] or 0)))
 
 
 @router.callback_query(F.data == "adm_tutorials")
@@ -6340,14 +6676,267 @@ async def admin_tutorials(callback: CallbackQuery, state: FSMContext) -> None:
     await edit_or_answer(callback, admin_tutorials_text(), admin_tutorials_kb())
 
 
+@router.callback_query(F.data == "adm_tut_list")
+async def admin_tutorial_list_all(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_list_text(), admin_tutorial_list_kb())
+
+
+@router.callback_query(F.data.startswith("adm_tut_list_cat:"))
+async def admin_tutorial_list_by_category(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    await edit_or_answer(callback, admin_tutorial_list_text(cid), admin_tutorial_list_kb(cid))
+
+
+@router.callback_query(F.data == "adm_tut_cats")
+async def admin_tutorial_categories(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_categories_text(), admin_tutorial_categories_kb())
+
+
+@router.callback_query(F.data == "adm_tut_cat_add")
+async def admin_tutorial_category_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_title)
+    await edit_or_answer(callback, header("➕ افزودن دسته آموزش", "مرحله ۱ از ۳") + "عنوان دسته را بفرستید. مثال: <code>آموزش اتصال</code>", admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_title)
+async def admin_tutorial_category_add_title(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان دسته باید بین ۲ تا ۸۰ کاراکتر باشد.", reply_markup=admin_back_kb("adm_tut_cats"))
+        return
+    await state.update_data(tutorial_category_title=title)
+    await state.set_state(AdminStates.waiting_tutorial_category_description)
+    await message.answer(header("➕ افزودن دسته آموزش", "مرحله ۲ از ۳") + "توضیح کوتاه دسته را بفرستید. اگر توضیح نمی‌خواهید بنویسید: <code>-</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_description)
+async def admin_tutorial_category_add_description(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.html_text or message.text or "").strip()
+    description = "" if normalize_digits(raw) in {"-", "ندارد", "بدون توضیح"} else raw
+    await state.update_data(tutorial_category_description=description)
+    await state.set_state(AdminStates.waiting_tutorial_category_sort)
+    await message.answer(header("➕ افزودن دسته آموزش", "مرحله ۳ از ۳") + f"عدد ترتیب نمایش دسته را بفرستید. عدد کمتر زودتر نمایش داده می‌شود. پیشنهاد: <code>{next_tutorial_category_sort_order()}</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_sort)
+async def admin_tutorial_category_add_sort(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید. مثال: <code>10</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+        return
+    data = await state.get_data()
+    cid = create_tutorial_category(str(data.get("tutorial_category_title") or ""), str(data.get("tutorial_category_description") or ""), int(raw), int(message.from_user.id))
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_CREATE", "tutorial_category", cid, str(data.get("tutorial_category_title") or ""))
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ دسته ساخته شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_view:"))
+async def admin_tutorial_category_view(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_category_view_text(cat), admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_toggle:"))
+async def admin_tutorial_category_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    new_value = 0 if int(cat["is_active"] or 0) else 1
+    update_tutorial_category_field(cid, "is_active", new_value)
+    admin_log(callback.from_user.id, "TUTORIAL_CATEGORY_TOGGLE", "tutorial_category", cid, f"is_active={new_value}")
+    cat = get_tutorial_category(cid)
+    await edit_or_answer(callback, admin_tutorial_category_view_text(cat), admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_title:"))
+async def admin_tutorial_category_edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial_category(cid):
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_title)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("✏️ ویرایش عنوان دسته") + "عنوان جدید دسته را بفرستید.", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_title)
+async def admin_tutorial_category_edit_title_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان باید بین ۲ تا ۸۰ کاراکتر باشد.", reply_markup=admin_back_kb(f"adm_tut_cat_view:{cid}"))
+        return
+    update_tutorial_category_field(cid, "title", title)
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_TITLE", "tutorial_category", cid, title)
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ عنوان دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_desc:"))
+async def admin_tutorial_category_edit_desc_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial_category(cid):
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_description)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("📝 ویرایش توضیح دسته") + "توضیح جدید را بفرستید. برای حذف توضیح بنویسید: <code>-</code>", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_description)
+async def admin_tutorial_category_edit_desc_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    raw = (message.html_text or message.text or "").strip()
+    description = "" if normalize_digits(raw) in {"-", "ندارد", "بدون توضیح"} else raw
+    update_tutorial_category_field(cid, "description", description or None)
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_DESC", "tutorial_category", cid, "")
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ توضیح دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_sort:"))
+async def admin_tutorial_category_edit_sort_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_sort)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("🔢 تغییر ترتیب دسته") + f"ترتیب فعلی: <code>{cat['sort_order']}</code>\nعدد جدید را بفرستید.", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_sort)
+async def admin_tutorial_category_edit_sort_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید.", reply_markup=admin_back_kb(f"adm_tut_cat_view:{cid}"))
+        return
+    update_tutorial_category_field(cid, "sort_order", int(raw))
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_SORT", "tutorial_category", cid, raw)
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ ترتیب دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_delete:"))
+async def admin_tutorial_category_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    rows = list_tutorials(active_only=False, category_id=cid)
+    if rows:
+        await callback.answer("این دسته آموزش دارد؛ اول آموزش‌های داخلش را حذف یا به دسته دیگری منتقل کن.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("🗑 حذف دسته") + f"آیا دسته <b>{h(cat['title'])}</b> حذف شود؟", inline([[('✅ حذف دسته', f'adm_tut_cat_delete_yes:{cid}')], [('❌ انصراف', f'adm_tut_cat_view:{cid}')]]))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_delete_yes:"))
+async def admin_tutorial_category_delete_do(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    ok = delete_tutorial_category(cid)
+    if not ok:
+        await callback.answer("این دسته هنوز آموزش دارد و حذف نشد.", show_alert=True)
+        return
+    admin_log(callback.from_user.id, "TUTORIAL_CATEGORY_DELETE", "tutorial_category", cid, "")
+    await edit_or_answer(callback, header("✅ دسته حذف شد") + admin_tutorial_categories_text(), admin_tutorial_categories_kb())
+
+
 @router.callback_query(F.data == "adm_tut_add")
 async def admin_tutorial_add_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "*"):
         await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
         return
+    if not list_tutorial_categories(active_only=False):
+        default_tutorial_category_id()
+    await state.clear()
+    await edit_or_answer(callback, header("➕ افزودن آموزش", "مرحله ۱ از ۵") + "اول دسته‌بندی آموزش را انتخاب کنید.", tutorial_category_select_kb("adm_tut_add_cat", "adm_tutorials"))
+
+
+@router.callback_query(F.data.startswith("adm_tut_add_cat:"))
+async def admin_tutorial_add_category_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
     await state.set_state(AdminStates.waiting_tutorial_title)
-    await state.update_data(tutorial_back="adm_tutorials")
-    await edit_or_answer(callback, header("➕ افزودن آموزش", "مرحله ۱ از ۴") + "عنوان آموزش را بفرستید. مثال: <code>آموزش اتصال در Android</code>", admin_back_kb("adm_tutorials"))
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("➕ افزودن آموزش", "مرحله ۲ از ۵") + f"دسته انتخابی: <b>{h(cat['title'])}</b>\n\nعنوان آموزش را بفرستید. مثال: <code>آموزش اتصال در Android</code>", admin_back_kb("adm_tutorials"))
 
 
 @router.message(AdminStates.waiting_tutorial_title)
@@ -6361,7 +6950,7 @@ async def admin_tutorial_add_title(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(tutorial_title=title)
     await state.set_state(AdminStates.waiting_tutorial_body)
-    await message.answer(header("➕ افزودن آموزش", "مرحله ۲ از ۴") + "متن کامل آموزش را بفرستید. می‌توانید چندخطی بنویسید.", reply_markup=admin_back_kb("adm_tutorials"))
+    await message.answer(header("➕ افزودن آموزش", "مرحله ۳ از ۵") + "متن کامل آموزش را بفرستید. می‌توانید چندخطی بنویسید. نیازی به | نیست.", reply_markup=admin_back_kb("adm_tutorials"))
 
 
 @router.message(AdminStates.waiting_tutorial_body)
@@ -6373,9 +6962,11 @@ async def admin_tutorial_add_body(message: Message, state: FSMContext) -> None:
     if len(body) < 2:
         await message.answer("متن آموزش خالی است. دوباره متن را بفرستید.", reply_markup=admin_back_kb("adm_tutorials"))
         return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id") or default_tutorial_category_id())
     await state.update_data(tutorial_body=body)
     await state.set_state(AdminStates.waiting_tutorial_sort)
-    await message.answer(header("➕ افزودن آموزش", "مرحله ۳ از ۴") + f"عدد ترتیب نمایش را بفرستید. عدد کمتر زودتر نمایش داده می‌شود. پیشنهاد فعلی: <code>{next_tutorial_sort_order()}</code>", reply_markup=admin_back_kb("adm_tutorials"))
+    await message.answer(header("➕ افزودن آموزش", "مرحله ۴ از ۵") + f"عدد ترتیب نمایش این آموزش در دسته را بفرستید. عدد کمتر زودتر نمایش داده می‌شود. پیشنهاد فعلی: <code>{next_tutorial_sort_order(cid)}</code>", reply_markup=admin_back_kb("adm_tutorials"))
 
 
 @router.message(AdminStates.waiting_tutorial_sort)
@@ -6390,7 +6981,7 @@ async def admin_tutorial_add_sort(message: Message, state: FSMContext) -> None:
     await state.update_data(tutorial_sort=int(raw))
     await state.set_state(AdminStates.waiting_tutorial_media)
     await message.answer(
-        header("➕ افزودن آموزش", "مرحله ۴ از ۴")
+        header("➕ افزودن آموزش", "مرحله ۵ از ۵")
         + "اگر این آموزش عکس، ویدیو، ویس، فایل یا صوت دارد همین حالا ارسال کنید. اگر فایل ندارد، فقط بنویسید: <code>-</code>",
         reply_markup=admin_back_kb("adm_tutorials"),
     )
@@ -6407,7 +6998,8 @@ async def admin_tutorial_add_media(message: Message, state: FSMContext) -> None:
     if not media and raw not in {"-", "رد", "skip", "بدون فایل"}:
         await message.answer("فایل معتبر ارسال نشد. عکس/ویدیو/ویس/فایل بفرستید یا برای رد کردن بنویسید: <code>-</code>", reply_markup=admin_back_kb("adm_tutorials"))
         return
-    tid = create_tutorial(str(data.get("tutorial_title") or ""), str(data.get("tutorial_body") or ""), int(data.get("tutorial_sort") or 100), int(message.from_user.id), media)
+    cid = int(data.get("tutorial_category_id") or default_tutorial_category_id())
+    tid = create_tutorial(cid, str(data.get("tutorial_title") or ""), str(data.get("tutorial_body") or ""), int(data.get("tutorial_sort") or 100), int(message.from_user.id), media)
     admin_log(int(message.from_user.id), "TUTORIAL_CREATE", "tutorial", tid, str(data.get("tutorial_title") or ""))
     await state.clear()
     row = get_tutorial(tid)
@@ -6459,6 +7051,36 @@ async def admin_tutorial_preview(callback: CallbackQuery) -> None:
     await send_tutorial_content(callback.bot, callback.from_user.id, row)
 
 
+@router.callback_query(F.data.startswith("adm_tut_edit_cat:"))
+async def admin_tutorial_edit_category_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial(tid):
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await edit_or_answer(callback, header("📂 تغییر دسته آموزش") + "دسته جدید را انتخاب کنید.", tutorial_category_select_kb(f"adm_tut_set_cat:{tid}", f"adm_tut_view:{tid}"))
+
+
+@router.callback_query(F.data.startswith("adm_tut_set_cat:"))
+async def admin_tutorial_edit_category_finish(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    _, tid_s, cid_s = callback.data.split(":")
+    tid = int(tid_s)
+    cid = int(cid_s)
+    if not get_tutorial(tid) or not get_tutorial_category(cid):
+        await callback.answer("آموزش یا دسته پیدا نشد.", show_alert=True)
+        return
+    update_tutorial_field(tid, "category_id", cid)
+    admin_log(callback.from_user.id, "TUTORIAL_EDIT_CATEGORY", "tutorial", tid, f"category_id={cid}")
+    row = get_tutorial(tid)
+    await edit_or_answer(callback, header("✅ دسته آموزش ذخیره شد") + admin_tutorial_view_text(row), admin_tutorial_view_kb(row))
+
+
 @router.callback_query(F.data.startswith("adm_tut_edit_title:"))
 async def admin_tutorial_edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "*"):
@@ -6502,7 +7124,7 @@ async def admin_tutorial_edit_body_start(callback: CallbackQuery, state: FSMCont
         return
     await state.set_state(AdminStates.waiting_tutorial_edit_body)
     await state.update_data(tutorial_id=tid)
-    await edit_or_answer(callback, header("📝 ویرایش متن آموزش") + "متن جدید آموزش را بفرستید.", admin_back_kb(f"adm_tut_view:{tid}"))
+    await edit_or_answer(callback, header("📝 ویرایش متن آموزش") + "متن جدید آموزش را بفرستید. چندخطی و بدون | قابل قبول است.", admin_back_kb(f"adm_tut_view:{tid}"))
 
 
 @router.message(AdminStates.waiting_tutorial_edit_body)
@@ -6556,7 +7178,6 @@ async def admin_tutorial_edit_sort_finish(message: Message, state: FSMContext) -
     await message.answer(header("✅ ترتیب ذخیره شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
 
 
-
 @router.callback_query(F.data.startswith("adm_tut_edit_media:"))
 async def admin_tutorial_edit_media_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not require_admin_id(callback.from_user.id, "*"):
@@ -6568,12 +7189,7 @@ async def admin_tutorial_edit_media_start(callback: CallbackQuery, state: FSMCon
         return
     await state.set_state(AdminStates.waiting_tutorial_edit_media)
     await state.update_data(tutorial_id=tid)
-    await edit_or_answer(
-        callback,
-        header("📎 تغییر/حذف فایل آموزش")
-        + "برای جایگزینی فایل، عکس/ویدیو/ویس/فایل جدید را بفرستید.\nبرای حذف فایل فعلی و نگه داشتن فقط متن، بنویسید: <code>-</code>",
-        admin_back_kb(f"adm_tut_view:{tid}"),
-    )
+    await edit_or_answer(callback, header("📎 تغییر فایل آموزش") + "فایل جدید را بفرستید. برای حذف فایل فعلی بنویسید: <code>-</code>", admin_back_kb(f"adm_tut_view:{tid}"))
 
 
 @router.message(AdminStates.waiting_tutorial_edit_media)
@@ -6583,29 +7199,21 @@ async def admin_tutorial_edit_media_finish(message: Message, state: FSMContext) 
         return
     data = await state.get_data()
     tid = int(data.get("tutorial_id", 0))
-    row = get_tutorial(tid)
-    if not row:
-        await state.clear()
-        await message.answer("آموزش پیدا نشد.", reply_markup=admin_back_kb("adm_tutorials"))
-        return
     raw = normalize_digits((message.text or "").strip())
     media = extract_tutorial_media(message)
-    if raw in {"-", "حذف", "remove", "بدون فایل"}:
-        update_tutorial_field(tid, "media_type", None)
-        update_tutorial_field(tid, "media_file_id", None)
-        update_tutorial_field(tid, "media_file_unique_id", None)
-        admin_log(int(message.from_user.id), "TUTORIAL_REMOVE_MEDIA", "tutorial", tid, "")
+    if raw in {"-", "حذف", "delete", "بدون فایل"}:
+        update_tutorial_media(tid, None)
+        action = "حذف شد"
     elif media:
-        update_tutorial_field(tid, "media_type", media["media_type"])
-        update_tutorial_field(tid, "media_file_id", media["media_file_id"])
-        update_tutorial_field(tid, "media_file_unique_id", media.get("media_file_unique_id") or "")
-        admin_log(int(message.from_user.id), "TUTORIAL_EDIT_MEDIA", "tutorial", tid, media["media_type"])
+        update_tutorial_media(tid, media)
+        action = "ذخیره شد"
     else:
-        await message.answer("فایل معتبر ارسال نشد. فایل جدید بفرستید یا برای حذف فایل فعلی بنویسید: <code>-</code>", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
+        await message.answer("فایل معتبر ارسال نشد. عکس/ویدیو/ویس/فایل بفرستید یا برای حذف فایل بنویسید: <code>-</code>", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
         return
+    admin_log(int(message.from_user.id), "TUTORIAL_EDIT_MEDIA", "tutorial", tid, action)
     await state.clear()
     row = get_tutorial(tid)
-    await message.answer(header("✅ فایل آموزش بروزرسانی شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+    await message.answer(header(f"✅ فایل آموزش {action}") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
 
 
 @router.callback_query(F.data.startswith("adm_tut_delete:"))
@@ -6633,7 +7241,7 @@ async def admin_tutorial_delete_do(callback: CallbackQuery) -> None:
         return
     delete_tutorial(tid)
     admin_log(callback.from_user.id, "TUTORIAL_DELETE", "tutorial", tid, str(row['title']))
-    await edit_or_answer(callback, header("✅ آموزش حذف شد") + admin_tutorials_text(), admin_tutorials_kb())
+    await edit_or_answer(callback, header("✅ آموزش حذف شد") + admin_tutorial_list_text(), admin_tutorial_list_kb())
 
 
 @router.callback_query(F.data == "adm_broadcast")
