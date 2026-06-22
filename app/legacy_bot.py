@@ -8,6 +8,7 @@ import re
 import secrets
 import sqlite3
 import string
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -41,7 +42,7 @@ from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
 from app.services.ticket_service import deactivate_admin_role, upsert_admin_role
-from app.services.plan_service import upsert_plan_from_line
+from app.services.plan_service import is_free_test_plan_active_for_user, sync_legacy_catalog_from_db, upsert_plan_from_line
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
@@ -2828,6 +2829,14 @@ def free_package_text(service_type: str) -> str:
     return header("🎁 انتخاب پکیج رایگان", item["title"]) + f"{h(item['subtitle'])}\n\nپکیج موردنظر را انتخاب کنید:"
 
 
+async def refresh_catalog_cache_silent() -> None:
+    """Refresh legacy in-memory catalogs from PostgreSQL without breaking user flow."""
+    try:
+        await sync_legacy_catalog_from_db(sys.modules[__name__])
+    except Exception:
+        logger.exception("legacy catalog refresh failed")
+
+
 def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int, int]:
     referral_discount = 0
     if user["referred_by_telegram_id"] and not user["first_purchase_done"]:
@@ -4780,6 +4789,7 @@ async def free_test_menu_cb(callback: CallbackQuery) -> None:
 
 
 async def show_free_service_menu(message: Message, telegram_id: int, edit_callback: Optional[CallbackQuery] = None) -> None:
+    await refresh_catalog_cache_silent()
     user = db.get_user(telegram_id)
     if user and user["free_test_used"]:
         text = header("🎁 سرویس رایگان") + "شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.\n\nبرای ادامه استفاده، یکی از پلن‌های اصلی را انتخاب کنید."
@@ -4805,6 +4815,10 @@ async def free_type_selected(callback: CallbackQuery) -> None:
     if service_type not in FREE_SERVICE_TYPES:
         await callback.answer("نوع سرویس پیدا نشد.", show_alert=True)
         return
+    await refresh_catalog_cache_silent()
+    if not any(p.category == f"free:{service_type}" for p in FREE_TEST_PLANS.values()):
+        await callback.answer("در حال حاضر پکیج رایگان فعالی برای این بخش وجود ندارد.", show_alert=True)
+        return
     await edit_or_answer(callback, free_package_text(service_type), free_packages_kb(service_type))
 
 
@@ -4816,7 +4830,14 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
         await callback.answer("شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.", show_alert=True)
         return
     plan_key = callback.data.split(":", 1)[1]
+    if not await is_free_test_plan_active_for_user(plan_key):
+        FREE_TEST_PLANS.pop(plan_key, None)
+        await callback.answer("این پکیج رایگان غیرفعال شده است.", show_alert=True)
+        return
     test_plan = FREE_TEST_PLANS.get(plan_key)
+    if not test_plan:
+        await refresh_catalog_cache_silent()
+        test_plan = FREE_TEST_PLANS.get(plan_key)
     if not test_plan:
         await callback.answer("پکیج رایگان پیدا نشد.", show_alert=True)
         return

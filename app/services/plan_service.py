@@ -269,13 +269,68 @@ async def upsert_addon_from_line(line: str, admin_id: int) -> tuple[bool, str]:
     return True, f"بسته حجم <code>{key}</code> ذخیره شد."
 
 
+async def list_active_free_test_plans_for_user() -> list[FreeTestPlanDB]:
+    """Return free-test plans that are active in both free and catalog tables.
+
+    The public free-service menu is backed by FreeTestPlanDB, while admins may
+    disable the same key from the main CatalogPlan list because free plans also
+    need Pasarguard templates. If either side is inactive, the user must not see
+    or activate that plan.
+    """
+    async with session_scope() as session:
+        free_plans = list(
+            (
+                await session.execute(
+                    select(FreeTestPlanDB)
+                    .where(FreeTestPlanDB.is_active.is_(True))
+                    .order_by(FreeTestPlanDB.sort_order)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        keys = [p.key for p in free_plans]
+        if not keys:
+            return []
+        catalog_rows = list(
+            (await session.execute(select(CatalogPlan).where(CatalogPlan.key.in_(keys))))
+            .scalars()
+            .all()
+        )
+        catalog_active = {row.key: bool(row.is_active) for row in catalog_rows}
+        return [p for p in free_plans if catalog_active.get(p.key, True)]
+
+
+async def is_free_test_plan_active_for_user(key: str) -> bool:
+    """Check whether a free-test plan is currently visible/usable by users."""
+    key = (key or "").strip()
+    if not key:
+        return False
+    async with session_scope() as session:
+        free_plan = (
+            await session.execute(
+                select(FreeTestPlanDB).where(
+                    FreeTestPlanDB.key == key,
+                    FreeTestPlanDB.is_active.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if free_plan is None:
+            return False
+        catalog_plan = (
+            await session.execute(select(CatalogPlan).where(CatalogPlan.key == key))
+        ).scalar_one_or_none()
+        if catalog_plan is not None and not bool(catalog_plan.is_active):
+            return False
+        return True
+
+
 async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
     """Push DB catalog into the old legacy dictionaries until all buy flow is refactored."""
     plans = await list_plans(active_only=True)
     addons = await list_addons(active_only=True)
     categories = await list_categories(active_only=True)
-    async with session_scope() as session:
-        free_plans = list((await session.execute(select(FreeTestPlanDB).where(FreeTestPlanDB.is_active.is_(True)).order_by(FreeTestPlanDB.sort_order))).scalars().all())
+    free_plans = await list_active_free_test_plans_for_user()
     if hasattr(legacy_module, "PLAN_CATEGORIES"):
         legacy_module.PLAN_CATEGORIES.clear()
         for c in categories:

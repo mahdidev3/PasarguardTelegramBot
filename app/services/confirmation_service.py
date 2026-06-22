@@ -24,6 +24,19 @@ class PendingConfirmation:
     expires_at: datetime
 
 
+
+def _aware_tehran(value: datetime) -> datetime:
+    """Return a timezone-aware datetime in Tehran time.
+
+    SQLAlchemy/asyncpg may return naive datetimes for columns that were
+    inserted with timezone info depending on DB column type. Confirmation
+    expiry checks must handle both naive and aware values safely.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=TEHRAN_TZ)
+    return value.astimezone(TEHRAN_TZ)
+
+
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
