@@ -256,8 +256,31 @@ def make_service_name(telegram_id: int) -> str:
     # Keep the generated tail numeric-only. If SERVICE_NAME_PREFIX is empty,
     # the generated service name is only digits. Pasarguard template prefix can
     # still be controlled separately with PASARGUARD_USERNAME_PREFIX.
-    suffix = f"{str(telegram_id)[-5:]}{random.randint(10, 99)}"
-    return f"{SERVICE_NAME_PREFIX}{suffix}"[:48]
+    #
+    # The old implementation could rarely generate a duplicate name. We now try
+    # several candidates and, when the DB helper is already available, skip any
+    # name that is already used by an active service or an open order.
+    last_candidate = ""
+    checker = globals().get("service_name_taken")
+    for _ in range(50):
+        suffix = f"{str(telegram_id)[-5:]}{random.randint(10, 99)}"
+        candidate = f"{SERVICE_NAME_PREFIX}{suffix}"[:48]
+        last_candidate = candidate
+        try:
+            if callable(checker) and not checker(candidate):
+                return candidate
+        except Exception:
+            return candidate
+        if not callable(checker):
+            return candidate
+    # Extremely unlikely fallback: add a short random numeric tail.
+    fallback = f"{SERVICE_NAME_PREFIX}{str(telegram_id)[-5:]}{random.randint(1000, 9999)}"[:48]
+    try:
+        if callable(checker) and not checker(fallback):
+            return fallback
+    except Exception:
+        pass
+    return fallback or last_candidate
 
 
 def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
@@ -2066,6 +2089,49 @@ def receipt_notify_admin_text(order: sqlite3.Row, receipt: sqlite3.Row) -> str:
 
 db = DB(DATABASE_PATH)
 ensure_admin_schema()
+
+
+def service_name_taken(name: str, *, exclude_order_id: int | None = None) -> bool:
+    """Return True when a service/order already uses this visible service name.
+
+    Pasarguard usernames are derived from the service name. A duplicate name can
+    make provisioning fail or confuse the user, so we block duplicates before
+    creating a new order/service. Expired/rejected/deleted records are ignored.
+    """
+    value = (name or "").strip().lower()
+    if not value:
+        return False
+    with closing(db.connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM services
+            WHERE LOWER(name) = ?
+              AND COALESCE(status, 'active') NOT IN ('deleted')
+            """,
+            (value,),
+        ).fetchone()
+        if row and int(row["c"] or 0) > 0:
+            return True
+
+        params: list[Any] = [value]
+        extra = ""
+        if exclude_order_id is not None:
+            extra = " AND id != ?"
+            params.append(int(exclude_order_id))
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM orders
+            WHERE LOWER(COALESCE(service_name, '')) = ?
+              AND COALESCE(status, '') NOT IN ('payment_expired', 'payment_rejected', 'cancelled', 'canceled', 'failed')
+              {extra}
+            """,
+            tuple(params),
+        ).fetchone()
+        return bool(row and int(row["c"] or 0) > 0)
+
+
 router = Router()
 
 
@@ -2439,22 +2505,16 @@ def tutorials_user_text(category_id: int | None = None) -> str:
             text += f"{idx}. <b>{h(row['title'])}</b>\n"
         return text
 
-    categories = list_tutorial_categories(active_only=True, include_counts=True)
-    rows = list_tutorials(active_only=True)
-    if not rows:
+    categories = [c for c in list_tutorial_categories(active_only=True, include_counts=True) if int(c["active_tutorials_count"] or 0) > 0]
+    if not categories:
         return header("📚 آموزش‌ها") + "در حال حاضر آموزشی برای نمایش وجود ندارد."
-    text = header("📚 آموزش‌ها", "راهنمای همه‌جانبه استفاده از ربات و سرویس‌ها")
-    text += "آموزش‌ها دسته‌بندی شده‌اند؛ می‌توانید یک دسته را انتخاب کنید یا از لیست زیر آموزش مدنظر را مستقیم باز کنید.\n\n"
-    for cat in categories:
-        if int(cat["active_tutorials_count"] or 0) <= 0:
-            continue
-        text += f"<b>📂 {h(cat['title'])}</b>"
+    text = header("📚 آموزش‌ها", "راهنمای مرحله‌به‌مرحله استفاده از ربات و سرویس‌ها")
+    text += "اول دسته موردنظرتان را انتخاب کنید؛ بعد آموزش‌های همان دسته نمایش داده می‌شود.\n\n"
+    for idx, cat in enumerate(categories, start=1):
+        text += f"{idx}. <b>📂 {h(cat['title'])}</b>"
         if cat["description"]:
             text += f" — {h(cat['description'])}"
-        text += "\n"
-        for row in [r for r in rows if int(r["category_id"] or 0) == int(cat["id"])][:5]:
-            text += f"   • {h(row['title'])}\n"
-        text += "\n"
+        text += f"\n   تعداد آموزش‌ها: <code>{int(cat['active_tutorials_count'] or 0)}</code>\n"
     return text.rstrip()
 
 
@@ -2464,8 +2524,6 @@ def tutorials_user_kb(back_callback: str = "home", category_id: int | None = Non
         cats = [c for c in list_tutorial_categories(active_only=True, include_counts=True) if int(c["active_tutorials_count"] or 0) > 0]
         for cat in cats[:30]:
             rows.append([(f"📂 {str(cat['title'])[:35]} ({int(cat['active_tutorials_count'] or 0)})", f"tutorial_cat:{cat['id']}")])
-        for row in list_tutorials(active_only=True)[:50]:
-            rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
     else:
         for row in list_tutorials(active_only=True, category_id=category_id)[:50]:
             rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
@@ -4533,6 +4591,12 @@ async def custom_name(message: Message, state: FSMContext) -> None:
     if not ok:
         await message.answer("❌ نام واردشده معتبر نیست.\n\n" + error + "\n\nلطفاً دوباره وارد کنید یا از دکمه ساخت خودکار استفاده کنید.")
         return
+    if service_name_taken(name):
+        await message.answer(
+            "❌ این نام قبلاً برای یک سرویس یا سفارش فعال استفاده شده است.\n\n"
+            "لطفاً یک نام دیگر وارد کنید یا از دکمه ساخت خودکار استفاده کنید."
+        )
+        return
     await create_pending_order_and_show_payment(message, state, name)
 
 
@@ -4540,6 +4604,8 @@ async def create_pending_order_and_show_payment(target: Message | CallbackQuery,
     data = await state.get_data()
     plan = PLANS[data["plan_key"]]
     tg_id = target.from_user.id
+    if service_name_taken(service_name):
+        service_name = make_service_name(int(tg_id))
     user = db.get_user(tg_id) or db.ensure_user(tg_id, target.from_user.username, target.from_user.first_name)
     amount = int(data.get("amount", plan.price))
     referral_discount = int(data.get("referral_discount", 0))
