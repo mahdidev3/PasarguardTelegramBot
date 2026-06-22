@@ -554,7 +554,7 @@ class DB:
         with closing(self.connect()) as conn:
             if include_expired:
                 return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
-            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? AND COALESCE(status, '') != 'expired' ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
+            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
 
     def list_wallet_transactions(self, telegram_id: int, limit: int = 5) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
@@ -1940,6 +1940,7 @@ def payment_receipt_summary_for_order(order_id: int) -> str:
         "receipt_pending": "رسید در انتظار بررسی",
         "approved": "رسید تأیید شده",
         "rejected": "رسید رد شده",
+        "expired": "رسید منقضی شده",
         "approved_provisioning_failed": "رسید تأیید شد، فعال‌سازی نیازمند بررسی",
     }
     text = "\n\n🧾 <b>رسید کارت‌به‌کارت</b>\n"
@@ -2560,7 +2561,9 @@ def admin_service_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
 def admin_orders_kb() -> InlineKeyboardMarkup:
     return inline([
         [("⏳ در انتظار پرداخت", "adm_orders_pending"), ("🧾 رسیدهای در انتظار", "adm_orders_receipts")],
-        [("✅ پرداخت‌شده", "adm_orders_paid"), ("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
+        [("✅ پرداخت‌شده", "adm_orders_paid"), ("⌛ منقضی‌شده‌ها", "adm_orders_expired")],
+        [("🧹 اسکن کل رسیدها/سفارش‌ها", "adm_orders_expire_scan")],
+        [("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -4852,6 +4855,7 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
                 "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
                 "receipt_pending": "رسید در انتظار تأیید 🧾",
                 "payment_rejected": "رسید رد شد ❌",
+                "payment_expired": "منقضی شده ⏳",
                 "expired": "منقضی شده ⏳",
                 "rejected": "رد شده ❌",
             }
@@ -5693,7 +5697,27 @@ async def admin_orders(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("🧾 مدیریت سفارش‌ها") + "یک دسته را انتخاب کنید.", admin_orders_kb())
 
 
-@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_latest"}))
+@router.callback_query(F.data == "adm_orders_expire_scan")
+async def admin_orders_expire_scan(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await callback.answer("اسکن کل دیتابیس در حال اجراست…", show_alert=False)
+    try:
+        result = expire_sqlite_payment_deadlines()
+        admin_log(callback.from_user.id, "PAYMENT_DEADLINE_FULL_SCAN", "orders", "all", str(result))
+        text = header("✅ اسکن کل رسیدها/سفارش‌ها انجام شد")
+        text += "این عملیات هیچ رسیدی را حذف نمی‌کند؛ فقط وضعیت‌های منقضی‌شده را ثبت می‌کند.\n\n"
+        text += f"🧾 رسیدهای منقضی‌شده: <b>{fmt_number(int(result.get('receipts_expired', 0)))}</b>\n"
+        text += f"⌛ سفارش‌های منقضی‌شده: <b>{fmt_number(int(result.get('orders_payment_expired', result.get('orders_expired', 0))))}</b>\n"
+        text += f"📎 فایل‌های حفظ‌شده: <b>{fmt_number(int(result.get('files_preserved', 0)))}</b>\n"
+        await edit_or_answer(callback, text, admin_orders_kb())
+    except Exception as exc:
+        logger.exception("manual payment deadline full scan failed")
+        await edit_or_answer(callback, header("❌ اسکن ناموفق بود") + f"خطا: <code>{h(exc)}</code>", admin_back_kb("adm_orders"))
+
+
+@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_expired", "adm_orders_latest"}))
 async def admin_orders_list(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
@@ -5709,6 +5733,9 @@ async def admin_orders_list(callback: CallbackQuery) -> None:
     elif callback.data == "adm_orders_receipts":
         status = "receipt_pending"
         title = "رسیدهای در انتظار تأیید"
+    elif callback.data == "adm_orders_expired":
+        status = "payment_expired"
+        title = "سفارش‌های منقضی‌شده"
     orders = list_orders_admin(20, status)
     await edit_or_answer(callback, header("🧾 " + title) + ("سفارشی پیدا نشد." if not orders else "برای جزئیات انتخاب کنید."), admin_order_list_kb(orders, "adm_orders"))
 

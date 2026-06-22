@@ -39,8 +39,8 @@ class JobSpec:
 DEFAULT_JOBS: dict[str, JobSpec] = {
     "receipt_deadline_cleanup": JobSpec(
         key="receipt_deadline_cleanup",
-        title="پاکسازی رسیدهای منقضی",
-        description="سفارش‌ها و رسیدهای کارت‌به‌کارت که مهلت ارسال رسیدشان گذشته را از حالت pending خارج می‌کند تا دیگر در تراکنش‌های کاربر نمایش داده نشوند.",
+        title="منقضی‌سازی رسیدها",
+        description="کل دیتابیس را اسکن می‌کند و سفارش‌ها/رسیدهایی را که مهلت ارسال رسیدشان گذشته، بدون حذف‌کردن داده یا فایل، به وضعیت منقضی‌شده تبدیل می‌کند.",
         default_interval_minutes=1,
     ),
     "closed_ticket_cleanup": JobSpec(

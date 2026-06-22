@@ -278,7 +278,8 @@ def _deadline_summary(sqlite_data: dict[str, list[dict[str, Any]]], pg_data: dic
         "receipts_waiting": sum(1 for r in receipts if r.get("status") == "waiting_receipt"),
         "receipts_pending_review": sum(1 for r in receipts if r.get("status") == "receipt_pending"),
         "receipts_expired": sum(1 for r in receipts if r.get("status") == "expired"),
-        "orders_expired": sum(1 for r in orders if r.get("status") == "expired"),
+        "orders_payment_expired": sum(1 for r in orders if r.get("status") in {"payment_expired", "expired"}),
+        "orders_expired": sum(1 for r in orders if r.get("status") in {"payment_expired", "expired"}),
         "admin_confirmations_total": len(confirmations),
         "admin_confirmations_unused": sum(1 for r in confirmations if not r.get("used_at")),
     }
@@ -321,6 +322,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         "orders_paid": len(paid_orders),
         "orders_receipt_pending": sum(1 for row in orders_rows if row.get("status") == "receipt_pending"),
         "orders_payment_rejected": sum(1 for row in orders_rows if row.get("status") == "payment_rejected"),
+        "orders_payment_expired": sum(1 for row in orders_rows if row.get("status") in {"payment_expired", "expired"}),
         "gross_paid": sum(int(row.get("amount") or 0) for row in paid_orders),
         "discount_paid": sum(int(row.get("discount_amount") or 0) for row in paid_orders),
         "net_paid": sum(int(row.get("amount") or 0) - int(row.get("discount_amount") or 0) for row in paid_orders),
@@ -328,6 +330,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         "receipts_pending": sum(1 for row in receipts_rows if row.get("status") == "receipt_pending"),
         "receipts_approved": sum(1 for row in receipts_rows if row.get("status") == "approved"),
         "receipts_rejected": sum(1 for row in receipts_rows if row.get("status") == "rejected"),
+        "receipts_expired": sum(1 for row in receipts_rows if row.get("status") == "expired"),
         "wallet_transactions_total": len(wallet_rows),
         "wallet_positive_total": sum(int(row.get("amount") or 0) for row in wallet_rows if int(row.get("amount") or 0) > 0),
         "wallet_negative_total_abs": sum(abs(int(row.get("amount") or 0)) for row in wallet_rows if int(row.get("amount") or 0) < 0),
@@ -439,7 +442,7 @@ def render_backup_summary(manifest: dict[str, Any]) -> str:
         f"🗄 جدول‌های SQLite: {len(sqlite_counts)} | جدول‌های PostgreSQL: {len(pg_counts)}\n\n"
         f"👥 کاربران: {usage.get('users_total', sqlite_counts.get('users', 0))}\n"
         f"📦 سرویس‌های فعال: {usage.get('services_active', 0)}\n"
-        f"🧾 سفارش‌ها: کل {finance.get('orders_total', sqlite_counts.get('orders', 0))} | پرداخت‌شده {finance.get('orders_paid', 0)} | رسید در انتظار {finance.get('orders_receipt_pending', 0)}\n"
+        f"🧾 سفارش‌ها: کل {finance.get('orders_total', sqlite_counts.get('orders', 0))} | پرداخت‌شده {finance.get('orders_paid', 0)} | رسید در انتظار {finance.get('orders_receipt_pending', 0)} | منقضی‌شده {finance.get('orders_payment_expired', 0)}\n"
         f"💰 مبلغ پرداخت‌شده خالص: {finance.get('net_paid', 0)} تومان\n\n"
         f"🎫 تیکت‌ها: {pg_counts.get('tickets', 0)} | فایل تیکت: {ticket_files.get('active_files_backed_up', 0)} موفق / {ticket_files.get('active_files_failed', 0)} ناموفق\n"
         f"🧾 فایل رسید: {receipt_files.get('files_backed_up', 0)} موفق / {receipt_files.get('files_failed', 0)} ناموفق\n"

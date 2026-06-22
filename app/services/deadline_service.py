@@ -25,7 +25,9 @@ from app.models import AdminConfirmation
 logger = logging.getLogger("howtosee-deadlines")
 
 DEADLINE_CLEANUP_INTERVAL_SECONDS = int(os.getenv("DEADLINE_CLEANUP_INTERVAL_SECONDS", "60"))
-RECEIPT_UPLOAD_WINDOW_MINUTES = int(os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "30"))
+RECEIPT_UPLOAD_WINDOW_MINUTES = int(
+    os.getenv("PAYMENT_RECEIPT_TTL_MINUTES", os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "30"))
+)
 CONFIRMATION_RETENTION_HOURS = int(os.getenv("CONFIRMATION_RETENTION_HOURS", "24"))
 
 
@@ -107,31 +109,23 @@ def _expire_receipt(conn: sqlite3.Connection, receipt: sqlite3.Row, *, now_iso: 
         """
         UPDATE payment_receipts
         SET status = 'expired',
-            receipt_file_id = NULL,
-            receipt_file_unique_id = NULL,
-            receipt_file_type = NULL,
-            receipt_message_id = NULL,
-            receipt_chat_id = NULL,
             updated_at = ?
         WHERE id = ? AND status = 'waiting_receipt'
         """,
         (now_iso, receipt_id),
     )
-    # Files that were uploaded but not submitted before the deadline must not be
-    # treated as a real transaction. Removing the DB references also keeps future
-    # backups from downloading stale receipt media.
-    if _table_exists(conn, "payment_receipt_files"):
-        conn.execute("DELETE FROM payment_receipt_files WHERE receipt_id = ?", (receipt_id,))
+    # Important: do NOT delete receipt rows, file references, or receipt files.
+    # Expired receipts are accounting/audit evidence and must stay reportable.
     conn.execute(
         """
         UPDATE orders
-        SET status = 'expired', admin_note = COALESCE(admin_note, 'مهلت ارسال رسید تمام شد.')
+        SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت ارسال رسید تمام شد.')
         WHERE id = ? AND status IN ('pending', 'payment_rejected')
         """,
         (order_id,),
     )
     _record_event(conn, "payment_receipt", receipt_id, "expired", f"order_id={order_id}")
-    _record_event(conn, "order", order_id, "expired", f"receipt_id={receipt_id}")
+    _record_event(conn, "order", order_id, "payment_expired", f"receipt_id={receipt_id}")
     return True
 
 
@@ -143,19 +137,29 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
     """
     path = _sqlite_path()
     if not path.exists():
-        return {"receipts_expired": 0, "orders_expired": 0, "files_removed": 0}
+        return {"receipts_expired": 0, "orders_payment_expired": 0, "orders_expired": 0, "files_preserved": 0}
 
     now_dt = (now or _now()).astimezone(TEHRAN_TZ)
     now_iso = now_dt.isoformat(timespec="seconds")
     receipts_expired = 0
     orders_expired = 0
-    files_removed = 0
+    files_preserved = 0
 
     with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
         if not _table_exists(conn, "orders"):
-            return {"receipts_expired": 0, "orders_expired": 0, "files_removed": 0}
+            return {"receipts_expired": 0, "orders_payment_expired": 0, "orders_expired": 0, "files_preserved": 0}
         _ensure_deadline_schema(conn)
+        # Backward compatibility for older code that used orders.status='expired'.
+        # From now on order status is payment_expired, while receipt status remains expired.
+        order_cols = _columns(conn, "orders")
+        if {"id", "status"}.issubset(order_cols):
+            migrated = conn.execute(
+                "UPDATE orders SET status = 'payment_expired' WHERE status = 'expired'"
+            ).rowcount or 0
+            if migrated:
+                for row in conn.execute("SELECT id FROM orders WHERE status = 'payment_expired'").fetchall():
+                    _record_event(conn, "order", int(row["id"]), "migrated_to_payment_expired", "old_status=expired")
 
         if _table_exists(conn, "payment_receipts"):
             receipt_cols = _columns(conn, "payment_receipts")
@@ -173,18 +177,16 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
                         if _expire_receipt(conn, receipt, now_iso=now_iso):
                             receipts_expired += 1
                             orders_expired += 1
-                            files_removed += before
+                            files_preserved += before
 
-        # Wallet top-up orders that never reached the receipt page should not live
-        # forever in the user's transaction list. They are checkout attempts, not
-        # completed wallet transactions.
+        # Any checkout/order that never submitted a receipt must not stay pending forever.
+        # Manual full-scan and the periodic job both use this path and scan the whole DB.
         order_cols = _columns(conn, "orders")
-        if {"id", "status", "plan_key", "created_at"}.issubset(order_cols):
+        if {"id", "status", "created_at"}.issubset(order_cols):
             rows = conn.execute(
                 """
                 SELECT * FROM orders
                 WHERE status IN ('pending', 'payment_rejected')
-                  AND plan_key LIKE 'wallet_topup:%'
                 """
             ).fetchall()
             for order in rows:
@@ -206,18 +208,18 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
                     cur = conn.execute(
                         """
                         UPDATE orders
-                        SET status = 'expired', admin_note = COALESCE(admin_note, 'مهلت تکمیل پرداخت تمام شد.')
+                        SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت تکمیل پرداخت تمام شد.')
                         WHERE id = ? AND status IN ('pending', 'payment_rejected')
                         """,
                         (int(order["id"]),),
                     )
                     if cur.rowcount:
                         orders_expired += int(cur.rowcount)
-                        _record_event(conn, "order", int(order["id"]), "expired", "wallet_topup_without_active_receipt")
+                        _record_event(conn, "order", int(order["id"]), "payment_expired", "order_without_active_receipt")
 
         conn.commit()
 
-    return {"receipts_expired": receipts_expired, "orders_expired": orders_expired, "files_removed": files_removed}
+    return {"receipts_expired": receipts_expired, "orders_payment_expired": orders_expired, "orders_expired": orders_expired, "files_preserved": files_preserved}
 
 
 async def cleanup_expired_admin_confirmations(now: datetime | None = None) -> dict[str, int]:

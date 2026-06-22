@@ -174,6 +174,7 @@ def _financial_summary_rows() -> list[dict[str, Any]]:
         {"section": "orders", "metric": "orders_pending", "title": "سفارش‌های در انتظار پرداخت", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'pending'"), "created_at": created_at},
         {"section": "orders", "metric": "orders_receipt_pending", "title": "رسیدهای در انتظار بررسی", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'receipt_pending'"), "created_at": created_at},
         {"section": "orders", "metric": "orders_rejected", "title": "پرداخت‌های ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'payment_rejected'"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_payment_expired", "title": "سفارش‌های پرداخت منقضی‌شده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status IN ('payment_expired', 'expired')"), "created_at": created_at},
         {"section": "orders", "metric": "gross_paid", "title": "مبلغ خام سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
         {"section": "orders", "metric": "discount_paid", "title": "جمع تخفیف سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
         {"section": "orders", "metric": "net_paid", "title": "خالص فروش پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
@@ -183,6 +184,7 @@ def _financial_summary_rows() -> list[dict[str, Any]]:
         {"section": "receipts", "metric": "receipts_pending", "title": "رسیدهای در انتظار", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'"), "created_at": created_at},
         {"section": "receipts", "metric": "receipts_approved", "title": "رسیدهای تأییدشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'"), "created_at": created_at},
         {"section": "receipts", "metric": "receipts_rejected", "title": "رسیدهای ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'rejected'"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_expired", "title": "رسیدهای منقضی‌شده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'expired'"), "created_at": created_at},
     ]
     for row in _sqlite_group_rows("SELECT COALESCE(payment_method, 'unknown') AS method, COUNT(*) AS count, COALESCE(SUM(amount - discount_amount), 0) AS net_amount FROM orders WHERE status = 'paid' GROUP BY COALESCE(payment_method, 'unknown') ORDER BY net_amount DESC"):
         rows.append({"section": "paid_by_method", "metric": row.get("method"), "title": f"فروش پرداخت‌شده با {row.get('method')}", "value": row.get("net_amount"), "count": row.get("count"), "created_at": created_at})
@@ -262,6 +264,8 @@ async def usage_summary_rows() -> list[dict[str, Any]]:
         ("sales_total", "فروش کل پرداخت‌شده", _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'")),
         ("receipts_pending", "رسیدهای کارت‌به‌کارت در انتظار", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'")),
         ("receipts_approved", "رسیدهای تأییدشده", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'")),
+        ("receipts_expired", "رسیدهای منقضی‌شده", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'expired'")),
+        ("orders_payment_expired", "سفارش‌های پرداخت منقضی‌شده", _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status IN ('payment_expired', 'expired')")),
         ("wallet_balance_total", "جمع موجودی کیف پول کاربران", _sqlite_scalar("SELECT COALESCE(SUM(wallet_balance), 0) FROM users")),
     ]
     pg_metrics: list[tuple[str, str, Any]] = []
