@@ -104,3 +104,5 @@ settings = Settings(
     pasarguard_username_prefix=os.getenv("PASARGUARD_USERNAME_PREFIX", "").strip()[:20],
     pasarguard_username_suffix=os.getenv("PASARGUARD_USERNAME_SUFFIX", "").strip()[:20],
 )
+
+

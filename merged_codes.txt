@@ -15,6 +15,8 @@ REFERRED_DISCOUNT_PERCENT=5
 FREE_TEST_MB=150
 WALLET_MIN_TOPUP=50000
 RECEIPT_UPLOAD_WINDOW_MINUTES=20
+PAYMENT_RECEIPT_TTL_MINUTES=20
+DEADLINE_CLEANUP_INTERVAL_SECONDS=60
 SERVICE_NAME_PREFIX=howtosee_
 ADMIN_CHAT_IDS=6413811117
 PASARGUARD_ENABLED=true
@@ -29,6 +31,7 @@ PASARGUARD_TEMPLATE_GROUP_IDS=1
 PASARGUARD_USERNAME_PREFIX=
 PASARGUARD_USERNAME_SUFFIX=
 SALES_ADMIN_CHAT_IDS=483137754
+
 
 
 ================================================================================
@@ -576,6 +579,7 @@ import re
 import secrets
 import sqlite3
 import string
+import sys
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -609,7 +613,7 @@ from app.config import settings
 from app.utils.line_parser import split_escaped_pipe, pipe_escape_hint
 from app.services.text_template_service import render_template_sync
 from app.services.ticket_service import deactivate_admin_role, upsert_admin_role
-from app.services.plan_service import upsert_plan_from_line
+from app.services.plan_service import is_free_test_plan_active_for_user, sync_legacy_catalog_from_db, upsert_plan_from_line
 from app.routers.tickets import ticket_router
 from app.routers.broadcast import broadcast_router
 from app.routers.reports import reports_router
@@ -823,8 +827,31 @@ def make_service_name(telegram_id: int) -> str:
     # Keep the generated tail numeric-only. If SERVICE_NAME_PREFIX is empty,
     # the generated service name is only digits. Pasarguard template prefix can
     # still be controlled separately with PASARGUARD_USERNAME_PREFIX.
-    suffix = f"{str(telegram_id)[-5:]}{random.randint(10, 99)}"
-    return f"{SERVICE_NAME_PREFIX}{suffix}"[:48]
+    #
+    # The old implementation could rarely generate a duplicate name. We now try
+    # several candidates and, when the DB helper is already available, skip any
+    # name that is already used by an active service or an open order.
+    last_candidate = ""
+    checker = globals().get("service_name_taken")
+    for _ in range(50):
+        suffix = f"{str(telegram_id)[-5:]}{random.randint(10, 99)}"
+        candidate = f"{SERVICE_NAME_PREFIX}{suffix}"[:48]
+        last_candidate = candidate
+        try:
+            if callable(checker) and not checker(candidate):
+                return candidate
+        except Exception:
+            return candidate
+        if not callable(checker):
+            return candidate
+    # Extremely unlikely fallback: add a short random numeric tail.
+    fallback = f"{SERVICE_NAME_PREFIX}{str(telegram_id)[-5:]}{random.randint(1000, 9999)}"[:48]
+    try:
+        if callable(checker) and not checker(fallback):
+            return fallback
+    except Exception:
+        pass
+    return fallback or last_candidate
 
 
 def validate_service_name_input(raw: str) -> tuple[bool, str, str]:
@@ -1122,7 +1149,7 @@ class DB:
         with closing(self.connect()) as conn:
             if include_expired:
                 return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
-            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? AND COALESCE(status, '') != 'expired' ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
+            return list(conn.execute("SELECT * FROM orders WHERE user_telegram_id = ? ORDER BY id DESC LIMIT ?", (telegram_id, limit)).fetchall())
 
     def list_wallet_transactions(self, telegram_id: int, limit: int = 5) -> list[sqlite3.Row]:
         with closing(self.connect()) as conn:
@@ -1365,6 +1392,33 @@ def ensure_admin_schema() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(entity_type, entity_id, event_type)
             );
+
+
+            CREATE TABLE IF NOT EXISTS tutorial_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                description TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tutorials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                media_type TEXT,
+                media_file_id TEXT,
+                media_file_unique_id TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 100,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         for table, column, ddl in [
@@ -1399,10 +1453,30 @@ def ensure_admin_schema() -> None:
             ("payment_receipts", "admin_note", "ALTER TABLE payment_receipts ADD COLUMN admin_note TEXT"),
             ("payment_receipts", "expires_at", "ALTER TABLE payment_receipts ADD COLUMN expires_at TEXT"),
             ("payment_receipts", "submitted_at", "ALTER TABLE payment_receipts ADD COLUMN submitted_at TEXT"),
+            ("tutorials", "category_id", "ALTER TABLE tutorials ADD COLUMN category_id INTEGER"),
+            ("tutorial_categories", "description", "ALTER TABLE tutorial_categories ADD COLUMN description TEXT"),
         ]:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
             if column not in cols:
                 conn.execute(ddl)
+        # Ensure tutorial center has a default category and assign old uncategorized tutorials.
+        default_cat = conn.execute("SELECT id FROM tutorial_categories ORDER BY id ASC LIMIT 1").fetchone()
+        if not default_cat:
+            cur_cat = conn.execute(
+                """
+                INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+                VALUES (?, ?, 10, 1, NULL, ?, ?)
+                """,
+                ("آموزش‌های عمومی", "راهنمای کلی استفاده از ربات و سرویس‌ها", now_iso(), now_iso()),
+            )
+            default_cat_id = int(cur_cat.lastrowid)
+        else:
+            default_cat_id = int(default_cat["id"])
+        try:
+            conn.execute("UPDATE tutorials SET category_id = ? WHERE category_id IS NULL", (default_cat_id,))
+        except Exception:
+            pass
+
         # Retire the removed service-pause feature: old paused rows are made active again.
         conn.execute("UPDATE services SET status = 'active', locked_reason = NULL WHERE status = ?", ("fro" + "zen",))
         conn.execute("UPDATE coupons SET max_discount_percent = 100 WHERE max_discount_percent IS NULL OR max_discount_percent < 100")
@@ -2508,6 +2582,7 @@ def payment_receipt_summary_for_order(order_id: int) -> str:
         "receipt_pending": "رسید در انتظار بررسی",
         "approved": "رسید تأیید شده",
         "rejected": "رسید رد شده",
+        "expired": "رسید منقضی شده",
         "approved_provisioning_failed": "رسید تأیید شد، فعال‌سازی نیازمند بررسی",
     }
     text = "\n\n🧾 <b>رسید کارت‌به‌کارت</b>\n"
@@ -2585,6 +2660,49 @@ def receipt_notify_admin_text(order: sqlite3.Row, receipt: sqlite3.Row) -> str:
 
 db = DB(DATABASE_PATH)
 ensure_admin_schema()
+
+
+def service_name_taken(name: str, *, exclude_order_id: int | None = None) -> bool:
+    """Return True when a service/order already uses this visible service name.
+
+    Pasarguard usernames are derived from the service name. A duplicate name can
+    make provisioning fail or confuse the user, so we block duplicates before
+    creating a new order/service. Expired/rejected/deleted records are ignored.
+    """
+    value = (name or "").strip().lower()
+    if not value:
+        return False
+    with closing(db.connect()) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM services
+            WHERE LOWER(name) = ?
+              AND COALESCE(status, 'active') NOT IN ('deleted')
+            """,
+            (value,),
+        ).fetchone()
+        if row and int(row["c"] or 0) > 0:
+            return True
+
+        params: list[Any] = [value]
+        extra = ""
+        if exclude_order_id is not None:
+            extra = " AND id != ?"
+            params.append(int(exclude_order_id))
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS c
+            FROM orders
+            WHERE LOWER(COALESCE(service_name, '')) = ?
+              AND COALESCE(status, '') NOT IN ('payment_expired', 'payment_rejected', 'cancelled', 'canceled', 'failed')
+              {extra}
+            """,
+            tuple(params),
+        ).fetchone()
+        return bool(row and int(row["c"] or 0) > 0)
+
+
 router = Router()
 
 
@@ -2672,7 +2790,489 @@ class AdminStates(StatesGroup):
     waiting_package_custom_conditions = State()
     waiting_package_custom_code = State()
     waiting_job_interval = State()
+    waiting_tutorial_title = State()
+    waiting_tutorial_body = State()
+    waiting_tutorial_sort = State()
+    waiting_tutorial_media = State()
+    waiting_tutorial_edit_title = State()
+    waiting_tutorial_edit_body = State()
+    waiting_tutorial_edit_sort = State()
+    waiting_tutorial_edit_media = State()
+    waiting_tutorial_category_title = State()
+    waiting_tutorial_category_description = State()
+    waiting_tutorial_category_sort = State()
+    waiting_tutorial_category_edit_title = State()
+    waiting_tutorial_category_edit_description = State()
+    waiting_tutorial_category_edit_sort = State()
 
+
+
+# -----------------------------
+# Tutorials / education center
+# -----------------------------
+def _row_has_col(row: Optional[sqlite3.Row], col: str) -> bool:
+    try:
+        return bool(row is not None and col in row.keys())
+    except Exception:
+        return False
+
+
+def tutorial_category_count_active() -> int:
+    try:
+        return db_count("SELECT COUNT(*) FROM tutorial_categories WHERE is_active = 1")
+    except Exception:
+        return 0
+
+
+def tutorial_count_active() -> int:
+    try:
+        return db_count(
+            """
+            SELECT COUNT(*)
+            FROM tutorials t
+            JOIN tutorial_categories c ON c.id = t.category_id
+            WHERE t.is_active = 1 AND c.is_active = 1
+            """
+        )
+    except Exception:
+        try:
+            return db_count("SELECT COUNT(*) FROM tutorials WHERE is_active = 1")
+        except Exception:
+            return 0
+
+
+def list_tutorial_categories(active_only: bool = True, include_counts: bool = False) -> list[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            if include_counts:
+                sql = """
+                    SELECT c.*,
+                           COUNT(t.id) AS tutorials_count,
+                           COALESCE(SUM(CASE WHEN t.is_active = 1 THEN 1 ELSE 0 END), 0) AS active_tutorials_count
+                    FROM tutorial_categories c
+                    LEFT JOIN tutorials t ON t.category_id = c.id
+                """
+                params: tuple[Any, ...] = ()
+                if active_only:
+                    sql += " WHERE c.is_active = 1"
+                sql += " GROUP BY c.id ORDER BY c.sort_order ASC, c.id ASC"
+                return list(conn.execute(sql, params).fetchall())
+            if active_only:
+                return list(conn.execute("SELECT * FROM tutorial_categories WHERE is_active = 1 ORDER BY sort_order ASC, id ASC").fetchall())
+            return list(conn.execute("SELECT * FROM tutorial_categories ORDER BY sort_order ASC, id ASC").fetchall())
+    except Exception:
+        return []
+
+
+def get_tutorial_category(category_id: int) -> Optional[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            return conn.execute("SELECT * FROM tutorial_categories WHERE id = ?", (int(category_id),)).fetchone()
+    except Exception:
+        return None
+
+
+def default_tutorial_category_id() -> int:
+    categories = list_tutorial_categories(active_only=False)
+    if categories:
+        return int(categories[0]["id"])
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, 10, 1, NULL, ?, ?)
+            """,
+            ("آموزش‌های عمومی", "راهنمای کلی استفاده از ربات و سرویس‌ها", now_iso(), now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def next_tutorial_category_sort_order() -> int:
+    try:
+        with closing(db.connect()) as conn:
+            row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorial_categories").fetchone()
+            return int(row["n"] or 10)
+    except Exception:
+        return 10
+
+
+def create_tutorial_category(title: str, description: str, sort_order: int, admin_id: int) -> int:
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tutorial_categories (title, description, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?, ?)
+            """,
+            (title.strip(), description.strip() or None, int(sort_order), int(admin_id), now_iso(), now_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_tutorial_category_field(category_id: int, field: str, value: Any) -> None:
+    allowed = {"title", "description", "sort_order", "is_active"}
+    if field not in allowed:
+        raise ValueError("invalid tutorial category field")
+    with closing(db.connect()) as conn:
+        conn.execute(f"UPDATE tutorial_categories SET {field} = ?, updated_at = ? WHERE id = ?", (value, now_iso(), int(category_id)))
+        conn.commit()
+
+
+def delete_tutorial_category(category_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM tutorials WHERE category_id = ?", (int(category_id),)).fetchone()
+        if row and int(row["c"] or 0) > 0:
+            return False
+        conn.execute("DELETE FROM tutorial_categories WHERE id = ?", (int(category_id),))
+        conn.commit()
+        return True
+
+
+def tutorial_category_label(row: Optional[sqlite3.Row]) -> str:
+    if not row:
+        return "بدون دسته"
+    status = "✅" if int(row["is_active"] or 0) else "⛔"
+    return f"{status} {row['title']}"
+
+
+def list_tutorials(active_only: bool = True, category_id: int | None = None) -> list[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            sql = """
+                SELECT t.*, c.title AS category_title, c.sort_order AS category_sort_order, c.is_active AS category_is_active
+                FROM tutorials t
+                LEFT JOIN tutorial_categories c ON c.id = t.category_id
+            """
+            where: list[str] = []
+            params: list[Any] = []
+            if active_only:
+                where.append("t.is_active = 1")
+                where.append("COALESCE(c.is_active, 1) = 1")
+            if category_id is not None:
+                where.append("t.category_id = ?")
+                params.append(int(category_id))
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY COALESCE(c.sort_order, 999999) ASC, t.sort_order ASC, t.id ASC"
+            return list(conn.execute(sql, tuple(params)).fetchall())
+    except Exception:
+        return []
+
+
+def get_tutorial(tutorial_id: int) -> Optional[sqlite3.Row]:
+    try:
+        with closing(db.connect()) as conn:
+            return conn.execute(
+                """
+                SELECT t.*, c.title AS category_title, c.is_active AS category_is_active
+                FROM tutorials t
+                LEFT JOIN tutorial_categories c ON c.id = t.category_id
+                WHERE t.id = ?
+                """,
+                (int(tutorial_id),),
+            ).fetchone()
+    except Exception:
+        return None
+
+
+def next_tutorial_sort_order(category_id: int | None = None) -> int:
+    try:
+        with closing(db.connect()) as conn:
+            if category_id is not None:
+                row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorials WHERE category_id = ?", (int(category_id),)).fetchone()
+            else:
+                row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS n FROM tutorials").fetchone()
+            return int(row["n"] or 10)
+    except Exception:
+        return 10
+
+
+def create_tutorial(category_id: int, title: str, body: str, sort_order: int, admin_id: int, media: dict[str, str] | None = None) -> int:
+    media = media or {}
+    if not get_tutorial_category(int(category_id)):
+        category_id = default_tutorial_category_id()
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tutorials
+            (category_id, title, body, media_type, media_file_id, media_file_unique_id, sort_order, is_active, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                int(category_id),
+                title.strip(),
+                body.strip(),
+                media.get("media_type") or None,
+                media.get("media_file_id") or None,
+                media.get("media_file_unique_id") or None,
+                int(sort_order),
+                int(admin_id),
+                now_iso(),
+                now_iso(),
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_tutorial_field(tutorial_id: int, field: str, value: Any) -> None:
+    allowed = {"category_id", "title", "body", "sort_order", "is_active", "media_type", "media_file_id", "media_file_unique_id"}
+    if field not in allowed:
+        raise ValueError("invalid tutorial field")
+    with closing(db.connect()) as conn:
+        conn.execute(f"UPDATE tutorials SET {field} = ?, updated_at = ? WHERE id = ?", (value, now_iso(), int(tutorial_id)))
+        conn.commit()
+
+
+def update_tutorial_media(tutorial_id: int, media: dict[str, str] | None) -> None:
+    media = media or {}
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE tutorials
+            SET media_type = ?, media_file_id = ?, media_file_unique_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (media.get("media_type") or None, media.get("media_file_id") or None, media.get("media_file_unique_id") or None, now_iso(), int(tutorial_id)),
+        )
+        conn.commit()
+
+
+def delete_tutorial(tutorial_id: int) -> None:
+    with closing(db.connect()) as conn:
+        conn.execute("DELETE FROM tutorials WHERE id = ?", (int(tutorial_id),))
+        conn.commit()
+
+
+def extract_tutorial_media(message: Message) -> dict[str, str]:
+    if message.photo:
+        photo = message.photo[-1]
+        return {"media_type": "photo", "media_file_id": photo.file_id, "media_file_unique_id": photo.file_unique_id}
+    if message.video:
+        return {"media_type": "video", "media_file_id": message.video.file_id, "media_file_unique_id": message.video.file_unique_id}
+    if message.voice:
+        return {"media_type": "voice", "media_file_id": message.voice.file_id, "media_file_unique_id": message.voice.file_unique_id}
+    if message.audio:
+        return {"media_type": "audio", "media_file_id": message.audio.file_id, "media_file_unique_id": message.audio.file_unique_id}
+    if message.document:
+        return {"media_type": "document", "media_file_id": message.document.file_id, "media_file_unique_id": message.document.file_unique_id}
+    return {}
+
+
+def tutorials_user_text(category_id: int | None = None) -> str:
+    if category_id is not None:
+        cat = get_tutorial_category(category_id)
+        rows = list_tutorials(active_only=True, category_id=category_id)
+        if not cat or int(cat["is_active"] or 0) != 1:
+            return header("📚 آموزش‌ها") + "این دسته‌بندی در حال حاضر فعال نیست."
+        text = header("📚 آموزش‌ها", str(cat["title"]))
+        if cat["description"]:
+            text += f"{h(cat['description'])}\n\n"
+        if not rows:
+            text += "در این دسته‌بندی هنوز آموزشی برای نمایش وجود ندارد."
+            return text
+        for idx, row in enumerate(rows, start=1):
+            text += f"{idx}. <b>{h(row['title'])}</b>\n"
+        return text
+
+    categories = [c for c in list_tutorial_categories(active_only=True, include_counts=True) if int(c["active_tutorials_count"] or 0) > 0]
+    if not categories:
+        return header("📚 آموزش‌ها") + "در حال حاضر آموزشی برای نمایش وجود ندارد."
+    text = header("📚 آموزش‌ها", "راهنمای مرحله‌به‌مرحله استفاده از ربات و سرویس‌ها")
+    text += "اول دسته موردنظرتان را انتخاب کنید؛ بعد آموزش‌های همان دسته نمایش داده می‌شود.\n\n"
+    for idx, cat in enumerate(categories, start=1):
+        text += f"{idx}. <b>📂 {h(cat['title'])}</b>"
+        if cat["description"]:
+            text += f" — {h(cat['description'])}"
+        text += f"\n   تعداد آموزش‌ها: <code>{int(cat['active_tutorials_count'] or 0)}</code>\n"
+    return text.rstrip()
+
+
+def tutorials_user_kb(back_callback: str = "home", category_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if category_id is None:
+        cats = [c for c in list_tutorial_categories(active_only=True, include_counts=True) if int(c["active_tutorials_count"] or 0) > 0]
+        for cat in cats[:30]:
+            rows.append([(f"📂 {str(cat['title'])[:35]} ({int(cat['active_tutorials_count'] or 0)})", f"tutorial_cat:{cat['id']}")])
+    else:
+        for row in list_tutorials(active_only=True, category_id=category_id)[:50]:
+            rows.append([(f"📘 {str(row['title'])[:45]}", f"tutorial:{row['id']}")])
+        rows.append([("⬅️ همه آموزش‌ها", "tutorials")])
+    rows.append([("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
+def tutorial_detail_kb(category_id: int | None = None) -> InlineKeyboardMarkup:
+    back = f"tutorial_cat:{category_id}" if category_id else "tutorials"
+    return inline([[("⬅️ لیست آموزش‌ها", back), ("🏠 منوی اصلی", "home")]])
+
+
+def tutorial_text(row: sqlite3.Row) -> str:
+    cat = str(row["category_title"] or "آموزش") if _row_has_col(row, "category_title") else "آموزش"
+    return header("📚 آموزش", f"{cat} / {row['title']}") + str(row["body"] or "")
+
+
+async def send_tutorial_content(bot: Bot, chat_id: int, row: sqlite3.Row) -> None:
+    text = tutorial_text(row)
+    media_type = str(row["media_type"] or "") if "media_type" in row.keys() else ""
+    file_id = str(row["media_file_id"] or "") if "media_file_id" in row.keys() else ""
+    if file_id and media_type:
+        caption = f"📚 <b>{h(row['title'])}</b>"
+        try:
+            if media_type == "photo":
+                await bot.send_photo(chat_id, file_id, caption=caption)
+            elif media_type == "video":
+                await bot.send_video(chat_id, file_id, caption=caption)
+            elif media_type == "voice":
+                await bot.send_voice(chat_id, file_id, caption=caption)
+            elif media_type == "audio":
+                await bot.send_audio(chat_id, file_id, caption=caption)
+            elif media_type == "document":
+                await bot.send_document(chat_id, file_id, caption=caption)
+        except Exception:
+            logger.exception("failed to send tutorial media tutorial_id=%s", row["id"])
+            text += "\n\n⚠️ فایل این آموزش در حال حاضر قابل ارسال نیست."
+    await bot.send_message(chat_id, text, reply_markup=tutorial_detail_kb(int(row["category_id"] or 0) if _row_has_col(row, "category_id") else None), disable_web_page_preview=True)
+
+
+def admin_tutorials_text() -> str:
+    total = len(list_tutorials(active_only=False))
+    active = tutorial_count_active()
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
+    text = header("📚 مدیریت آموزش‌ها")
+    text += "مدیریت این بخش کاملاً مرحله‌ای است و نیازی به جداکننده | ندارد. آموزش‌ها دسته‌بندی، فایل، متن، وضعیت و ترتیب نمایش جداگانه دارند.\n\n"
+    text += f"📂 دسته‌ها: <b>{fmt_number(len(cats))}</b>\n📘 آموزش‌ها: <b>{fmt_number(total)}</b>\n✅ آموزش فعال قابل نمایش: <b>{fmt_number(active)}</b>\n\n"
+    if not cats:
+        text += "هنوز دسته‌بندی ثبت نشده است. ابتدا یک دسته بسازید."
+    else:
+        text += "دسته‌بندی‌ها:\n"
+        for cat in cats[:12]:
+            status = "✅" if int(cat["is_active"] or 0) else "⛔"
+            text += f"{status} #{cat['id']} | <b>{h(cat['title'])}</b> — آموزش فعال: <code>{int(cat['active_tutorials_count'] or 0)}</code> — ترتیب: <code>{cat['sort_order']}</code>\n"
+    return text
+
+
+def admin_tutorials_kb() -> InlineKeyboardMarkup:
+    return inline([
+        [("📘 لیست آموزش‌ها", "adm_tut_list"), ("📂 دسته‌بندی‌ها", "adm_tut_cats")],
+        [("➕ افزودن آموزش", "adm_tut_add"), ("➕ افزودن دسته", "adm_tut_cat_add")],
+        [("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_tutorial_list_text(category_id: int | None = None) -> str:
+    cat = get_tutorial_category(category_id) if category_id else None
+    rows = list_tutorials(active_only=False, category_id=category_id)
+    title = "📘 آموزش‌ها" if not cat else f"📘 آموزش‌های {cat['title']}"
+    text = header(title)
+    if not rows:
+        text += "هنوز آموزشی ثبت نشده است."
+        return text
+    for row in rows:
+        status = "فعال ✅" if int(row["is_active"] or 0) else "غیرفعال ⛔"
+        media = " + فایل" if row["media_file_id"] else ""
+        cat_label = f"📂 {h(row['category_title'] or 'بدون دسته')} — " if not category_id else ""
+        text += f"#{row['id']} | {cat_label}<b>{h(row['title'])}</b> — {status}{media} — ترتیب: <code>{row['sort_order']}</code>\n"
+    return text
+
+
+def admin_tutorial_list_kb(category_id: int | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("➕ افزودن آموزش", "adm_tut_add")]]
+    for row in list_tutorials(active_only=False, category_id=category_id)[:40]:
+        status = "✅" if int(row["is_active"] or 0) else "⛔"
+        rows.append([(f"{status} #{row['id']} | {str(row['title'])[:35]}", f"adm_tut_view:{row['id']}")])
+    rows.append([("⬅️ مدیریت آموزش‌ها", "adm_tutorials"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_tutorial_categories_text() -> str:
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
+    text = header("📂 دسته‌بندی آموزش‌ها")
+    text += "هر دسته می‌تواند فعال/غیرفعال باشد و ترتیب خودش را داشته باشد. دسته غیرفعال و آموزش‌های داخلش برای کاربر نمایش داده نمی‌شوند.\n\n"
+    if not cats:
+        text += "هنوز دسته‌ای ثبت نشده است."
+        return text
+    for cat in cats:
+        status = "فعال ✅" if int(cat["is_active"] or 0) else "غیرفعال ⛔"
+        desc = f" — {h(cat['description'])}" if cat["description"] else ""
+        text += f"#{cat['id']} | <b>{h(cat['title'])}</b>{desc}\nوضعیت: {status} | ترتیب: <code>{cat['sort_order']}</code> | آموزش‌ها: <code>{int(cat['tutorials_count'] or 0)}</code> | فعال: <code>{int(cat['active_tutorials_count'] or 0)}</code>\n\n"
+    return text.rstrip()
+
+
+def admin_tutorial_categories_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = [[("➕ افزودن دسته", "adm_tut_cat_add")]]
+    for cat in list_tutorial_categories(active_only=False, include_counts=True)[:30]:
+        status = "✅" if int(cat["is_active"] or 0) else "⛔"
+        rows.append([(f"{status} #{cat['id']} | {str(cat['title'])[:35]}", f"adm_tut_cat_view:{cat['id']}")])
+    rows.append([("⬅️ مدیریت آموزش‌ها", "adm_tutorials"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_tutorial_category_view_text(cat: sqlite3.Row) -> str:
+    status = "فعال ✅" if int(cat["is_active"] or 0) else "غیرفعال ⛔"
+    rows = list_tutorials(active_only=False, category_id=int(cat["id"]))
+    desc = str(cat["description"] or "-")
+    text = header("📂 جزئیات دسته آموزش", f"#{cat['id']}")
+    text += f"عنوان: <b>{h(cat['title'])}</b>\n"
+    text += f"توضیح: {h(desc)}\n"
+    text += f"وضعیت: <b>{status}</b>\n"
+    text += f"ترتیب نمایش: <code>{cat['sort_order']}</code>\n"
+    text += f"تعداد آموزش: <b>{fmt_number(len(rows))}</b>\n"
+    return text
+
+
+def admin_tutorial_category_view_kb(cat: sqlite3.Row) -> InlineKeyboardMarkup:
+    cid = int(cat["id"])
+    toggle = "⛔ غیرفعال کردن" if int(cat["is_active"] or 0) else "✅ فعال کردن"
+    return inline([
+        [(toggle, f"adm_tut_cat_toggle:{cid}"), ("📘 آموزش‌های این دسته", f"adm_tut_list_cat:{cid}")],
+        [("✏️ ویرایش عنوان", f"adm_tut_cat_edit_title:{cid}"), ("📝 ویرایش توضیح", f"adm_tut_cat_edit_desc:{cid}")],
+        [("🔢 تغییر ترتیب", f"adm_tut_cat_edit_sort:{cid}"), ("🗑 حذف دسته", f"adm_tut_cat_delete:{cid}")],
+        [("⬅️ دسته‌بندی‌ها", "adm_tut_cats"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def tutorial_category_select_kb(prefix: str, back: str = "adm_tutorials") -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    cats = list_tutorial_categories(active_only=False, include_counts=True)
+    for cat in cats[:40]:
+        status = "✅" if int(cat["is_active"] or 0) else "⛔"
+        rows.append([(f"{status} {str(cat['title'])[:35]}", f"{prefix}:{cat['id']}")])
+    rows.append([("➕ ساخت دسته جدید", "adm_tut_cat_add")])
+    rows.append([("⬅️ بازگشت", back), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_tutorial_view_text(row: sqlite3.Row) -> str:
+    status = "فعال ✅" if int(row["is_active"] or 0) else "غیرفعال ⛔"
+    cat_status = "فعال" if int(row["category_is_active"] or 1) else "غیرفعال"
+    media = f"{row['media_type']} ✅" if row["media_file_id"] else "ندارد"
+    body = str(row["body"] or "")
+    if len(body) > 1200:
+        body = body[:1200] + "…"
+    return (
+        header("📚 جزئیات آموزش", f"#{row['id']}")
+        + f"دسته: <b>{h(row['category_title'] or 'بدون دسته')}</b> ({cat_status})\n"
+        + f"عنوان: <b>{h(row['title'])}</b>\n"
+        + f"وضعیت آموزش: <b>{status}</b>\n"
+        + f"ترتیب نمایش در دسته: <code>{row['sort_order']}</code>\n"
+        + f"فایل/مدیا: <b>{h(media)}</b>\n\n"
+        + f"متن:\n{h(body)}"
+    )
+
+
+def admin_tutorial_view_kb(row: sqlite3.Row) -> InlineKeyboardMarkup:
+    tid = int(row["id"])
+    cid = int(row["category_id"] or 0)
+    toggle = "⛔ غیرفعال کردن" if int(row["is_active"] or 0) else "✅ فعال کردن"
+    return inline([
+        [(toggle, f"adm_tut_toggle:{tid}"), ("👁 پیش‌نمایش", f"adm_tut_preview:{tid}")],
+        [("📂 تغییر دسته", f"adm_tut_edit_cat:{tid}"), ("🔢 تغییر ترتیب", f"adm_tut_edit_sort:{tid}")],
+        [("✏️ ویرایش عنوان", f"adm_tut_edit_title:{tid}"), ("📝 ویرایش متن", f"adm_tut_edit_body:{tid}")],
+        [("📎 تغییر/حذف فایل", f"adm_tut_edit_media:{tid}"), ("🗑 حذف", f"adm_tut_delete:{tid}")],
+        [("⬅️ لیست این دسته", f"adm_tut_list_cat:{cid}"), ("📚 مدیریت آموزش‌ها", "adm_tutorials")],
+    ])
 
 # -----------------------------
 # Keyboards
@@ -2708,8 +3308,10 @@ def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🎁 سرویس رایگان")],
         [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
-        [KeyboardButton(text="🎫 پشتیبانی / تیکت‌ها")],
     ]
+    if tutorial_count_active() > 0:
+        rows.append([KeyboardButton(text="📚 آموزش‌ها")])
+    rows.append([KeyboardButton(text="🎫 پشتیبانی / تیکت‌ها")])
     if is_admin_id(telegram_id):
         rows.append([KeyboardButton(text="👑 پنل مدیریت")])
     return ReplyKeyboardMarkup(
@@ -2882,9 +3484,13 @@ def service_details_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
         keyboard.append([InlineKeyboardButton(text="🌐 پنل اشتراکی", url=link)])
     if service["is_test"]:
         keyboard.append([InlineKeyboardButton(text="🔗 لینک کامل اشتراک", callback_data=f"sub_link:{sid}")])
+        if tutorial_count_active() > 0:
+            keyboard.append([InlineKeyboardButton(text="📚 آموزش‌ها", callback_data="tutorials")])
         keyboard.append([InlineKeyboardButton(text="⬅️ سرویس‌های من", callback_data="my_services"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="home")])
         return InlineKeyboardMarkup(inline_keyboard=keyboard)
     keyboard.append([InlineKeyboardButton(text="🔗 لینک کامل اشتراک", callback_data=f"sub_link:{sid}"), InlineKeyboardButton(text="🔄 تغییر لینک", callback_data=f"revoke:{sid}")])
+    if tutorial_count_active() > 0:
+        keyboard.append([InlineKeyboardButton(text="📚 آموزش‌ها", callback_data="tutorials")])
     keyboard.append([InlineKeyboardButton(text="♻️ تمدید سرویس", callback_data=f"renew_warn:{sid}"), InlineKeyboardButton(text="📈 افزایش حجم", callback_data=f"addon_menu:{sid}")])
     keyboard.append([InlineKeyboardButton(text="⚙️ تنظیمات اشتراک", callback_data=f"svc_settings:{sid}")])
     keyboard.append([InlineKeyboardButton(text="⬅️ سرویس‌های من", callback_data="my_services"), InlineKeyboardButton(text="🏠 منوی اصلی", callback_data="home")])
@@ -2916,12 +3522,17 @@ def renew_plans_kb(service_id: int, category: str) -> InlineKeyboardMarkup:
 
 def service_settings_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     service_id = int(service["id"])
-    return inline([
+    rows = [
         [("✏️ تغییر نام اشتراک", f"rename:{service_id}")],
+    ]
+    if tutorial_count_active() > 0:
+        rows.append([("📚 آموزش‌ها", "tutorials")])
+    rows.extend([
         [("↩️ عودت سرویس", f"refund_ask:{service_id}")],
         [("🗑 حذف سرویس", f"delete_ask:{service_id}")],
         [("⬅️ جزئیات سرویس", f"service:{service_id}"), ("🏠 منوی اصلی", "home")],
     ])
+    return inline(rows)
 
 
 def delete_confirm_kb(service_id: int) -> InlineKeyboardMarkup:
@@ -2982,6 +3593,7 @@ def admin_home_kb(admin_id: int) -> InlineKeyboardMarkup:
     if appearance_row:
         rows.append(appearance_row)
     if admin_has(admin_id, "*"):
+        rows.append([("📚 مدیریت آموزش‌ها", "adm_tutorials")])
         rows.append([("⏱ مدیریت Jobها", "adm_jobs"), ("👮 مدیریت ادمین‌ها", "adm_admins")])
         rows.append([("📜 لاگ ادمین‌ها", "adm_logs")])
     rows.append([("🏠 منوی اصلی کاربر", "home")])
@@ -3128,7 +3740,9 @@ def admin_service_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
 def admin_orders_kb() -> InlineKeyboardMarkup:
     return inline([
         [("⏳ در انتظار پرداخت", "adm_orders_pending"), ("🧾 رسیدهای در انتظار", "adm_orders_receipts")],
-        [("✅ پرداخت‌شده", "adm_orders_paid"), ("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
+        [("✅ پرداخت‌شده", "adm_orders_paid"), ("⌛ منقضی‌شده‌ها", "adm_orders_expired")],
+        [("🧹 اسکن کل رسیدها/سفارش‌ها", "adm_orders_expire_scan")],
+        [("🧾 آخرین سفارش‌ها", "adm_orders_latest")],
         [("👑 منوی ادمین", "adm_home")],
     ])
 
@@ -3391,6 +4005,14 @@ def free_service_text() -> str:
 def free_package_text(service_type: str) -> str:
     item = FREE_SERVICE_TYPES.get(service_type, FREE_SERVICE_TYPES["standard"])
     return header("🎁 انتخاب پکیج رایگان", item["title"]) + f"{h(item['subtitle'])}\n\nپکیج موردنظر را انتخاب کنید:"
+
+
+async def refresh_catalog_cache_silent() -> None:
+    """Refresh legacy in-memory catalogs from PostgreSQL without breaking user flow."""
+    try:
+        await sync_legacy_catalog_from_db(sys.modules[__name__])
+    except Exception:
+        logger.exception("legacy catalog refresh failed")
 
 
 def plan_summary_text(plan: Plan, user: sqlite3.Row) -> tuple[str, int, int, int, int]:
@@ -4540,6 +5162,12 @@ async def custom_name(message: Message, state: FSMContext) -> None:
     if not ok:
         await message.answer("❌ نام واردشده معتبر نیست.\n\n" + error + "\n\nلطفاً دوباره وارد کنید یا از دکمه ساخت خودکار استفاده کنید.")
         return
+    if service_name_taken(name):
+        await message.answer(
+            "❌ این نام قبلاً برای یک سرویس یا سفارش فعال استفاده شده است.\n\n"
+            "لطفاً یک نام دیگر وارد کنید یا از دکمه ساخت خودکار استفاده کنید."
+        )
+        return
     await create_pending_order_and_show_payment(message, state, name)
 
 
@@ -4547,6 +5175,8 @@ async def create_pending_order_and_show_payment(target: Message | CallbackQuery,
     data = await state.get_data()
     plan = PLANS[data["plan_key"]]
     tg_id = target.from_user.id
+    if service_name_taken(service_name):
+        service_name = make_service_name(int(tg_id))
     user = db.get_user(tg_id) or db.ensure_user(tg_id, target.from_user.username, target.from_user.first_name)
     amount = int(data.get("amount", plan.price))
     referral_discount = int(data.get("referral_discount", 0))
@@ -5345,6 +5975,7 @@ async def free_test_menu_cb(callback: CallbackQuery) -> None:
 
 
 async def show_free_service_menu(message: Message, telegram_id: int, edit_callback: Optional[CallbackQuery] = None) -> None:
+    await refresh_catalog_cache_silent()
     user = db.get_user(telegram_id)
     if user and user["free_test_used"]:
         text = header("🎁 سرویس رایگان") + "شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.\n\nبرای ادامه استفاده، یکی از پلن‌های اصلی را انتخاب کنید."
@@ -5370,6 +6001,10 @@ async def free_type_selected(callback: CallbackQuery) -> None:
     if service_type not in FREE_SERVICE_TYPES:
         await callback.answer("نوع سرویس پیدا نشد.", show_alert=True)
         return
+    await refresh_catalog_cache_silent()
+    if not any(p.category == f"free:{service_type}" for p in FREE_TEST_PLANS.values()):
+        await callback.answer("در حال حاضر پکیج رایگان فعالی برای این بخش وجود ندارد.", show_alert=True)
+        return
     await edit_or_answer(callback, free_package_text(service_type), free_packages_kb(service_type))
 
 
@@ -5381,7 +6016,14 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
         await callback.answer("شما قبلاً سرویس رایگان خود را دریافت کرده‌اید.", show_alert=True)
         return
     plan_key = callback.data.split(":", 1)[1]
+    if not await is_free_test_plan_active_for_user(plan_key):
+        FREE_TEST_PLANS.pop(plan_key, None)
+        await callback.answer("این پکیج رایگان غیرفعال شده است.", show_alert=True)
+        return
     test_plan = FREE_TEST_PLANS.get(plan_key)
+    if not test_plan:
+        await refresh_catalog_cache_silent()
+        test_plan = FREE_TEST_PLANS.get(plan_key)
     if not test_plan:
         await callback.answer("پکیج رایگان پیدا نشد.", show_alert=True)
         return
@@ -5420,6 +6062,7 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
                 "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
                 "receipt_pending": "رسید در انتظار تأیید 🧾",
                 "payment_rejected": "رسید رد شد ❌",
+                "payment_expired": "منقضی شده ⏳",
                 "expired": "منقضی شده ⏳",
                 "rejected": "رد شده ❌",
             }
@@ -6261,7 +6904,27 @@ async def admin_orders(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("🧾 مدیریت سفارش‌ها") + "یک دسته را انتخاب کنید.", admin_orders_kb())
 
 
-@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_latest"}))
+@router.callback_query(F.data == "adm_orders_expire_scan")
+async def admin_orders_expire_scan(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    await callback.answer("اسکن کل دیتابیس در حال اجراست…", show_alert=False)
+    try:
+        result = expire_sqlite_payment_deadlines()
+        admin_log(callback.from_user.id, "PAYMENT_DEADLINE_FULL_SCAN", "orders", "all", str(result))
+        text = header("✅ اسکن کل رسیدها/سفارش‌ها انجام شد")
+        text += "این عملیات هیچ رسیدی را حذف نمی‌کند؛ فقط وضعیت‌های منقضی‌شده را ثبت می‌کند.\n\n"
+        text += f"🧾 رسیدهای منقضی‌شده: <b>{fmt_number(int(result.get('receipts_expired', 0)))}</b>\n"
+        text += f"⌛ سفارش‌های منقضی‌شده: <b>{fmt_number(int(result.get('orders_payment_expired', result.get('orders_expired', 0))))}</b>\n"
+        text += f"📎 فایل‌های حفظ‌شده: <b>{fmt_number(int(result.get('files_preserved', 0)))}</b>\n"
+        await edit_or_answer(callback, text, admin_orders_kb())
+    except Exception as exc:
+        logger.exception("manual payment deadline full scan failed")
+        await edit_or_answer(callback, header("❌ اسکن ناموفق بود") + f"خطا: <code>{h(exc)}</code>", admin_back_kb("adm_orders"))
+
+
+@router.callback_query(F.data.in_({"adm_orders_pending", "adm_orders_receipts", "adm_orders_paid", "adm_orders_expired", "adm_orders_latest"}))
 async def admin_orders_list(callback: CallbackQuery) -> None:
     if not require_admin_id(callback.from_user.id, "orders") and not require_admin_id(callback.from_user.id, "payment_receipts"):
         await callback.answer("دسترسی ندارید.", show_alert=True)
@@ -6277,6 +6940,9 @@ async def admin_orders_list(callback: CallbackQuery) -> None:
     elif callback.data == "adm_orders_receipts":
         status = "receipt_pending"
         title = "رسیدهای در انتظار تأیید"
+    elif callback.data == "adm_orders_expired":
+        status = "payment_expired"
+        title = "سفارش‌های منقضی‌شده"
     orders = list_orders_admin(20, status)
     await edit_or_answer(callback, header("🧾 " + title) + ("سفارشی پیدا نشد." if not orders else "برای جزئیات انتخاب کنید."), admin_order_list_kb(orders, "adm_orders"))
 
@@ -6584,6 +7250,635 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
     admin_log(admin_id, "PAYMENT_RECEIPT_APPROVE", "receipt", receipt_id, f"provisioning_ok={provisioning_ok}; note={note}")
     await state.clear()
     await message.answer(header("✅ رسید بررسی شد") + admin_order_text(refreshed), reply_markup=admin_order_kb(refreshed))
+
+
+
+@router.message(F.text == "📚 آموزش‌ها")
+async def tutorials_msg(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    ensure_from_message(message)
+    if tutorial_count_active() <= 0:
+        await message.answer("در حال حاضر آموزشی برای نمایش وجود ندارد.", reply_markup=main_menu_kb(message.from_user.id if message.from_user else None))
+        return
+    await message.answer(tutorials_user_text(), reply_markup=tutorials_user_kb("home"))
+
+
+@router.callback_query(F.data == "tutorials")
+async def tutorials_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    ensure_from_callback(callback)
+    if tutorial_count_active() <= 0:
+        await callback.answer("در حال حاضر آموزشی برای نمایش وجود ندارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, tutorials_user_text(), tutorials_user_kb("home"))
+
+
+@router.callback_query(F.data.startswith("tutorial_cat:"))
+async def tutorial_category_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    ensure_from_callback(callback)
+    category_id = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(category_id)
+    if not cat or int(cat["is_active"] or 0) != 1:
+        await callback.answer("این دسته‌بندی در حال حاضر فعال نیست.", show_alert=True)
+        return
+    if not list_tutorials(active_only=True, category_id=category_id):
+        await callback.answer("در این دسته‌بندی آموزشی برای نمایش وجود ندارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, tutorials_user_text(category_id), tutorials_user_kb("tutorials", category_id))
+
+
+@router.callback_query(F.data.startswith("tutorial:"))
+async def tutorial_view_cb(callback: CallbackQuery) -> None:
+    ensure_from_callback(callback)
+    tutorial_id = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tutorial_id)
+    if not row or int(row["is_active"] or 0) != 1 or int(row["category_is_active"] or 0) != 1:
+        await callback.answer("این آموزش در حال حاضر فعال نیست.", show_alert=True)
+        return
+    media_file_id = str(row["media_file_id"] or "") if "media_file_id" in row.keys() else ""
+    if media_file_id:
+        await callback.answer("آموزش ارسال شد.")
+        await send_tutorial_content(callback.bot, callback.from_user.id, row)
+    else:
+        await edit_or_answer(callback, tutorial_text(row), tutorial_detail_kb(int(row["category_id"] or 0)))
+
+
+@router.callback_query(F.data == "adm_tutorials")
+async def admin_tutorials(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی می‌تواند آموزش‌ها را مدیریت کند.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorials_text(), admin_tutorials_kb())
+
+
+@router.callback_query(F.data == "adm_tut_list")
+async def admin_tutorial_list_all(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_list_text(), admin_tutorial_list_kb())
+
+
+@router.callback_query(F.data.startswith("adm_tut_list_cat:"))
+async def admin_tutorial_list_by_category(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    await edit_or_answer(callback, admin_tutorial_list_text(cid), admin_tutorial_list_kb(cid))
+
+
+@router.callback_query(F.data == "adm_tut_cats")
+async def admin_tutorial_categories(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_categories_text(), admin_tutorial_categories_kb())
+
+
+@router.callback_query(F.data == "adm_tut_cat_add")
+async def admin_tutorial_category_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_title)
+    await edit_or_answer(callback, header("➕ افزودن دسته آموزش", "مرحله ۱ از ۳") + "عنوان دسته را بفرستید. مثال: <code>آموزش اتصال</code>", admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_title)
+async def admin_tutorial_category_add_title(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان دسته باید بین ۲ تا ۸۰ کاراکتر باشد.", reply_markup=admin_back_kb("adm_tut_cats"))
+        return
+    await state.update_data(tutorial_category_title=title)
+    await state.set_state(AdminStates.waiting_tutorial_category_description)
+    await message.answer(header("➕ افزودن دسته آموزش", "مرحله ۲ از ۳") + "توضیح کوتاه دسته را بفرستید. اگر توضیح نمی‌خواهید بنویسید: <code>-</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_description)
+async def admin_tutorial_category_add_description(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = (message.html_text or message.text or "").strip()
+    description = "" if normalize_digits(raw) in {"-", "ندارد", "بدون توضیح"} else raw
+    await state.update_data(tutorial_category_description=description)
+    await state.set_state(AdminStates.waiting_tutorial_category_sort)
+    await message.answer(header("➕ افزودن دسته آموزش", "مرحله ۳ از ۳") + f"عدد ترتیب نمایش دسته را بفرستید. عدد کمتر زودتر نمایش داده می‌شود. پیشنهاد: <code>{next_tutorial_category_sort_order()}</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_sort)
+async def admin_tutorial_category_add_sort(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید. مثال: <code>10</code>", reply_markup=admin_back_kb("adm_tut_cats"))
+        return
+    data = await state.get_data()
+    cid = create_tutorial_category(str(data.get("tutorial_category_title") or ""), str(data.get("tutorial_category_description") or ""), int(raw), int(message.from_user.id))
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_CREATE", "tutorial_category", cid, str(data.get("tutorial_category_title") or ""))
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ دسته ساخته شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_view:"))
+async def admin_tutorial_category_view(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_category_view_text(cat), admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_toggle:"))
+async def admin_tutorial_category_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    new_value = 0 if int(cat["is_active"] or 0) else 1
+    update_tutorial_category_field(cid, "is_active", new_value)
+    admin_log(callback.from_user.id, "TUTORIAL_CATEGORY_TOGGLE", "tutorial_category", cid, f"is_active={new_value}")
+    cat = get_tutorial_category(cid)
+    await edit_or_answer(callback, admin_tutorial_category_view_text(cat), admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_title:"))
+async def admin_tutorial_category_edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial_category(cid):
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_title)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("✏️ ویرایش عنوان دسته") + "عنوان جدید دسته را بفرستید.", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_title)
+async def admin_tutorial_category_edit_title_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان باید بین ۲ تا ۸۰ کاراکتر باشد.", reply_markup=admin_back_kb(f"adm_tut_cat_view:{cid}"))
+        return
+    update_tutorial_category_field(cid, "title", title)
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_TITLE", "tutorial_category", cid, title)
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ عنوان دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_desc:"))
+async def admin_tutorial_category_edit_desc_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial_category(cid):
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_description)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("📝 ویرایش توضیح دسته") + "توضیح جدید را بفرستید. برای حذف توضیح بنویسید: <code>-</code>", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_description)
+async def admin_tutorial_category_edit_desc_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    raw = (message.html_text or message.text or "").strip()
+    description = "" if normalize_digits(raw) in {"-", "ندارد", "بدون توضیح"} else raw
+    update_tutorial_category_field(cid, "description", description or None)
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_DESC", "tutorial_category", cid, "")
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ توضیح دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_edit_sort:"))
+async def admin_tutorial_category_edit_sort_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_category_edit_sort)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("🔢 تغییر ترتیب دسته") + f"ترتیب فعلی: <code>{cat['sort_order']}</code>\nعدد جدید را بفرستید.", admin_back_kb(f"adm_tut_cat_view:{cid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_category_edit_sort)
+async def admin_tutorial_category_edit_sort_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id", 0))
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید.", reply_markup=admin_back_kb(f"adm_tut_cat_view:{cid}"))
+        return
+    update_tutorial_category_field(cid, "sort_order", int(raw))
+    admin_log(int(message.from_user.id), "TUTORIAL_CATEGORY_EDIT_SORT", "tutorial_category", cid, raw)
+    await state.clear()
+    cat = get_tutorial_category(cid)
+    await message.answer(header("✅ ترتیب دسته ذخیره شد") + admin_tutorial_category_view_text(cat), reply_markup=admin_tutorial_category_view_kb(cat))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_delete:"))
+async def admin_tutorial_category_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    rows = list_tutorials(active_only=False, category_id=cid)
+    if rows:
+        await callback.answer("این دسته آموزش دارد؛ اول آموزش‌های داخلش را حذف یا به دسته دیگری منتقل کن.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("🗑 حذف دسته") + f"آیا دسته <b>{h(cat['title'])}</b> حذف شود؟", inline([[('✅ حذف دسته', f'adm_tut_cat_delete_yes:{cid}')], [('❌ انصراف', f'adm_tut_cat_view:{cid}')]]))
+
+
+@router.callback_query(F.data.startswith("adm_tut_cat_delete_yes:"))
+async def admin_tutorial_category_delete_do(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    ok = delete_tutorial_category(cid)
+    if not ok:
+        await callback.answer("این دسته هنوز آموزش دارد و حذف نشد.", show_alert=True)
+        return
+    admin_log(callback.from_user.id, "TUTORIAL_CATEGORY_DELETE", "tutorial_category", cid, "")
+    await edit_or_answer(callback, header("✅ دسته حذف شد") + admin_tutorial_categories_text(), admin_tutorial_categories_kb())
+
+
+@router.callback_query(F.data == "adm_tut_add")
+async def admin_tutorial_add_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    if not list_tutorial_categories(active_only=False):
+        default_tutorial_category_id()
+    await state.clear()
+    await edit_or_answer(callback, header("➕ افزودن آموزش", "مرحله ۱ از ۵") + "اول دسته‌بندی آموزش را انتخاب کنید.", tutorial_category_select_kb("adm_tut_add_cat", "adm_tutorials"))
+
+
+@router.callback_query(F.data.startswith("adm_tut_add_cat:"))
+async def admin_tutorial_add_category_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    cid = int(callback.data.split(":", 1)[1])
+    cat = get_tutorial_category(cid)
+    if not cat:
+        await callback.answer("دسته پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_title)
+    await state.update_data(tutorial_category_id=cid)
+    await edit_or_answer(callback, header("➕ افزودن آموزش", "مرحله ۲ از ۵") + f"دسته انتخابی: <b>{h(cat['title'])}</b>\n\nعنوان آموزش را بفرستید. مثال: <code>آموزش اتصال در Android</code>", admin_back_kb("adm_tutorials"))
+
+
+@router.message(AdminStates.waiting_tutorial_title)
+async def admin_tutorial_add_title(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان باید بین ۲ تا ۸۰ کاراکتر باشد. دوباره بفرستید.", reply_markup=admin_back_kb("adm_tutorials"))
+        return
+    await state.update_data(tutorial_title=title)
+    await state.set_state(AdminStates.waiting_tutorial_body)
+    await message.answer(header("➕ افزودن آموزش", "مرحله ۳ از ۵") + "متن کامل آموزش را بفرستید. می‌توانید چندخطی بنویسید. نیازی به | نیست.", reply_markup=admin_back_kb("adm_tutorials"))
+
+
+@router.message(AdminStates.waiting_tutorial_body)
+async def admin_tutorial_add_body(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    body = (message.html_text or message.text or "").strip()
+    if len(body) < 2:
+        await message.answer("متن آموزش خالی است. دوباره متن را بفرستید.", reply_markup=admin_back_kb("adm_tutorials"))
+        return
+    data = await state.get_data()
+    cid = int(data.get("tutorial_category_id") or default_tutorial_category_id())
+    await state.update_data(tutorial_body=body)
+    await state.set_state(AdminStates.waiting_tutorial_sort)
+    await message.answer(header("➕ افزودن آموزش", "مرحله ۴ از ۵") + f"عدد ترتیب نمایش این آموزش در دسته را بفرستید. عدد کمتر زودتر نمایش داده می‌شود. پیشنهاد فعلی: <code>{next_tutorial_sort_order(cid)}</code>", reply_markup=admin_back_kb("adm_tutorials"))
+
+
+@router.message(AdminStates.waiting_tutorial_sort)
+async def admin_tutorial_add_sort(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد ترتیب را بفرستید. مثال: <code>10</code>", reply_markup=admin_back_kb("adm_tutorials"))
+        return
+    await state.update_data(tutorial_sort=int(raw))
+    await state.set_state(AdminStates.waiting_tutorial_media)
+    await message.answer(
+        header("➕ افزودن آموزش", "مرحله ۵ از ۵")
+        + "اگر این آموزش عکس، ویدیو، ویس، فایل یا صوت دارد همین حالا ارسال کنید. اگر فایل ندارد، فقط بنویسید: <code>-</code>",
+        reply_markup=admin_back_kb("adm_tutorials"),
+    )
+
+
+@router.message(AdminStates.waiting_tutorial_media)
+async def admin_tutorial_add_media(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    raw = normalize_digits((message.text or "").strip())
+    media = extract_tutorial_media(message)
+    if not media and raw not in {"-", "رد", "skip", "بدون فایل"}:
+        await message.answer("فایل معتبر ارسال نشد. عکس/ویدیو/ویس/فایل بفرستید یا برای رد کردن بنویسید: <code>-</code>", reply_markup=admin_back_kb("adm_tutorials"))
+        return
+    cid = int(data.get("tutorial_category_id") or default_tutorial_category_id())
+    tid = create_tutorial(cid, str(data.get("tutorial_title") or ""), str(data.get("tutorial_body") or ""), int(data.get("tutorial_sort") or 100), int(message.from_user.id), media)
+    admin_log(int(message.from_user.id), "TUTORIAL_CREATE", "tutorial", tid, str(data.get("tutorial_title") or ""))
+    await state.clear()
+    row = get_tutorial(tid)
+    await message.answer(header("✅ آموزش ساخته شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_view:"))
+async def admin_tutorial_view(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, admin_tutorial_view_text(row), admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_toggle:"))
+async def admin_tutorial_toggle(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    new_value = 0 if int(row["is_active"] or 0) else 1
+    update_tutorial_field(tid, "is_active", new_value)
+    admin_log(callback.from_user.id, "TUTORIAL_TOGGLE", "tutorial", tid, f"is_active={new_value}")
+    row = get_tutorial(tid)
+    await edit_or_answer(callback, admin_tutorial_view_text(row), admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_preview:"))
+async def admin_tutorial_preview(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await callback.answer("پیش‌نمایش ارسال شد.")
+    await send_tutorial_content(callback.bot, callback.from_user.id, row)
+
+
+@router.callback_query(F.data.startswith("adm_tut_edit_cat:"))
+async def admin_tutorial_edit_category_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial(tid):
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await edit_or_answer(callback, header("📂 تغییر دسته آموزش") + "دسته جدید را انتخاب کنید.", tutorial_category_select_kb(f"adm_tut_set_cat:{tid}", f"adm_tut_view:{tid}"))
+
+
+@router.callback_query(F.data.startswith("adm_tut_set_cat:"))
+async def admin_tutorial_edit_category_finish(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    _, tid_s, cid_s = callback.data.split(":")
+    tid = int(tid_s)
+    cid = int(cid_s)
+    if not get_tutorial(tid) or not get_tutorial_category(cid):
+        await callback.answer("آموزش یا دسته پیدا نشد.", show_alert=True)
+        return
+    update_tutorial_field(tid, "category_id", cid)
+    admin_log(callback.from_user.id, "TUTORIAL_EDIT_CATEGORY", "tutorial", tid, f"category_id={cid}")
+    row = get_tutorial(tid)
+    await edit_or_answer(callback, header("✅ دسته آموزش ذخیره شد") + admin_tutorial_view_text(row), admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_edit_title:"))
+async def admin_tutorial_edit_title_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial(tid):
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_edit_title)
+    await state.update_data(tutorial_id=tid)
+    await edit_or_answer(callback, header("✏️ ویرایش عنوان") + "عنوان جدید را بفرستید.", admin_back_kb(f"adm_tut_view:{tid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_edit_title)
+async def admin_tutorial_edit_title_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    tid = int(data.get("tutorial_id", 0))
+    title = (message.text or "").strip()
+    if len(title) < 2 or len(title) > 80:
+        await message.answer("عنوان باید بین ۲ تا ۸۰ کاراکتر باشد.", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
+        return
+    update_tutorial_field(tid, "title", title)
+    admin_log(int(message.from_user.id), "TUTORIAL_EDIT_TITLE", "tutorial", tid, title)
+    await state.clear()
+    row = get_tutorial(tid)
+    await message.answer(header("✅ عنوان ذخیره شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_edit_body:"))
+async def admin_tutorial_edit_body_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial(tid):
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_edit_body)
+    await state.update_data(tutorial_id=tid)
+    await edit_or_answer(callback, header("📝 ویرایش متن آموزش") + "متن جدید آموزش را بفرستید. چندخطی و بدون | قابل قبول است.", admin_back_kb(f"adm_tut_view:{tid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_edit_body)
+async def admin_tutorial_edit_body_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    tid = int(data.get("tutorial_id", 0))
+    body = (message.html_text or message.text or "").strip()
+    if len(body) < 2:
+        await message.answer("متن آموزش خالی است.", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
+        return
+    update_tutorial_field(tid, "body", body)
+    admin_log(int(message.from_user.id), "TUTORIAL_EDIT_BODY", "tutorial", tid, "")
+    await state.clear()
+    row = get_tutorial(tid)
+    await message.answer(header("✅ متن ذخیره شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_edit_sort:"))
+async def admin_tutorial_edit_sort_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_edit_sort)
+    await state.update_data(tutorial_id=tid)
+    await edit_or_answer(callback, header("🔢 تغییر ترتیب نمایش") + f"ترتیب فعلی: <code>{row['sort_order']}</code>\nعدد جدید را بفرستید. عدد کمتر زودتر نمایش داده می‌شود.", admin_back_kb(f"adm_tut_view:{tid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_edit_sort)
+async def admin_tutorial_edit_sort_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    tid = int(data.get("tutorial_id", 0))
+    raw = normalize_digits((message.text or "").strip())
+    if not raw.lstrip("-").isdigit():
+        await message.answer("لطفاً فقط عدد بفرستید.", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
+        return
+    update_tutorial_field(tid, "sort_order", int(raw))
+    admin_log(int(message.from_user.id), "TUTORIAL_EDIT_SORT", "tutorial", tid, raw)
+    await state.clear()
+    row = get_tutorial(tid)
+    await message.answer(header("✅ ترتیب ذخیره شد") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_edit_media:"))
+async def admin_tutorial_edit_media_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    if not get_tutorial(tid):
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_tutorial_edit_media)
+    await state.update_data(tutorial_id=tid)
+    await edit_or_answer(callback, header("📎 تغییر فایل آموزش") + "فایل جدید را بفرستید. برای حذف فایل فعلی بنویسید: <code>-</code>", admin_back_kb(f"adm_tut_view:{tid}"))
+
+
+@router.message(AdminStates.waiting_tutorial_edit_media)
+async def admin_tutorial_edit_media_finish(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "*"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    tid = int(data.get("tutorial_id", 0))
+    raw = normalize_digits((message.text or "").strip())
+    media = extract_tutorial_media(message)
+    if raw in {"-", "حذف", "delete", "بدون فایل"}:
+        update_tutorial_media(tid, None)
+        action = "حذف شد"
+    elif media:
+        update_tutorial_media(tid, media)
+        action = "ذخیره شد"
+    else:
+        await message.answer("فایل معتبر ارسال نشد. عکس/ویدیو/ویس/فایل بفرستید یا برای حذف فایل بنویسید: <code>-</code>", reply_markup=admin_back_kb(f"adm_tut_view:{tid}"))
+        return
+    admin_log(int(message.from_user.id), "TUTORIAL_EDIT_MEDIA", "tutorial", tid, action)
+    await state.clear()
+    row = get_tutorial(tid)
+    await message.answer(header(f"✅ فایل آموزش {action}") + admin_tutorial_view_text(row), reply_markup=admin_tutorial_view_kb(row))
+
+
+@router.callback_query(F.data.startswith("adm_tut_delete:"))
+async def admin_tutorial_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("🗑 حذف آموزش") + f"آیا آموزش <b>{h(row['title'])}</b> حذف شود؟", inline([[('✅ حذف کن', f'adm_tut_delete_yes:{tid}')], [('❌ انصراف', f'adm_tut_view:{tid}')]]))
+
+
+@router.callback_query(F.data.startswith("adm_tut_delete_yes:"))
+async def admin_tutorial_delete_do(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "*"):
+        await callback.answer("فقط مدیر اصلی دسترسی دارد.", show_alert=True)
+        return
+    tid = int(callback.data.split(":", 1)[1])
+    row = get_tutorial(tid)
+    if not row:
+        await callback.answer("آموزش پیدا نشد.", show_alert=True)
+        return
+    delete_tutorial(tid)
+    admin_log(callback.from_user.id, "TUTORIAL_DELETE", "tutorial", tid, str(row['title']))
+    await edit_or_answer(callback, header("✅ آموزش حذف شد") + admin_tutorial_list_text(), admin_tutorial_list_kb())
 
 
 @router.callback_query(F.data == "adm_broadcast")
@@ -8871,10 +10166,6 @@ if __name__ == "__main__":
     print(f"🔍 شروع اسکن پوشه: {target_dir}")
     print(f"📄 فایل خروجی: {output_path}")
     merge_folder(target_dir, output_path)
-
-
-
-
 
 
 
@@ -12131,7 +13422,8 @@ def _deadline_summary(sqlite_data: dict[str, list[dict[str, Any]]], pg_data: dic
         "receipts_waiting": sum(1 for r in receipts if r.get("status") == "waiting_receipt"),
         "receipts_pending_review": sum(1 for r in receipts if r.get("status") == "receipt_pending"),
         "receipts_expired": sum(1 for r in receipts if r.get("status") == "expired"),
-        "orders_expired": sum(1 for r in orders if r.get("status") == "expired"),
+        "orders_payment_expired": sum(1 for r in orders if r.get("status") in {"payment_expired", "expired"}),
+        "orders_expired": sum(1 for r in orders if r.get("status") in {"payment_expired", "expired"}),
         "admin_confirmations_total": len(confirmations),
         "admin_confirmations_unused": sum(1 for r in confirmations if not r.get("used_at")),
     }
@@ -12174,6 +13466,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         "orders_paid": len(paid_orders),
         "orders_receipt_pending": sum(1 for row in orders_rows if row.get("status") == "receipt_pending"),
         "orders_payment_rejected": sum(1 for row in orders_rows if row.get("status") == "payment_rejected"),
+        "orders_payment_expired": sum(1 for row in orders_rows if row.get("status") in {"payment_expired", "expired"}),
         "gross_paid": sum(int(row.get("amount") or 0) for row in paid_orders),
         "discount_paid": sum(int(row.get("discount_amount") or 0) for row in paid_orders),
         "net_paid": sum(int(row.get("amount") or 0) - int(row.get("discount_amount") or 0) for row in paid_orders),
@@ -12181,6 +13474,7 @@ async def create_complete_backup(admin_id: int | None = None, output_dir: str | 
         "receipts_pending": sum(1 for row in receipts_rows if row.get("status") == "receipt_pending"),
         "receipts_approved": sum(1 for row in receipts_rows if row.get("status") == "approved"),
         "receipts_rejected": sum(1 for row in receipts_rows if row.get("status") == "rejected"),
+        "receipts_expired": sum(1 for row in receipts_rows if row.get("status") == "expired"),
         "wallet_transactions_total": len(wallet_rows),
         "wallet_positive_total": sum(int(row.get("amount") or 0) for row in wallet_rows if int(row.get("amount") or 0) > 0),
         "wallet_negative_total_abs": sum(abs(int(row.get("amount") or 0)) for row in wallet_rows if int(row.get("amount") or 0) < 0),
@@ -12292,7 +13586,7 @@ def render_backup_summary(manifest: dict[str, Any]) -> str:
         f"🗄 جدول‌های SQLite: {len(sqlite_counts)} | جدول‌های PostgreSQL: {len(pg_counts)}\n\n"
         f"👥 کاربران: {usage.get('users_total', sqlite_counts.get('users', 0))}\n"
         f"📦 سرویس‌های فعال: {usage.get('services_active', 0)}\n"
-        f"🧾 سفارش‌ها: کل {finance.get('orders_total', sqlite_counts.get('orders', 0))} | پرداخت‌شده {finance.get('orders_paid', 0)} | رسید در انتظار {finance.get('orders_receipt_pending', 0)}\n"
+        f"🧾 سفارش‌ها: کل {finance.get('orders_total', sqlite_counts.get('orders', 0))} | پرداخت‌شده {finance.get('orders_paid', 0)} | رسید در انتظار {finance.get('orders_receipt_pending', 0)} | منقضی‌شده {finance.get('orders_payment_expired', 0)}\n"
         f"💰 مبلغ پرداخت‌شده خالص: {finance.get('net_paid', 0)} تومان\n\n"
         f"🎫 تیکت‌ها: {pg_counts.get('tickets', 0)} | فایل تیکت: {ticket_files.get('active_files_backed_up', 0)} موفق / {ticket_files.get('active_files_failed', 0)} ناموفق\n"
         f"🧾 فایل رسید: {receipt_files.get('files_backed_up', 0)} موفق / {receipt_files.get('files_failed', 0)} ناموفق\n"
@@ -12526,6 +13820,19 @@ class PendingConfirmation:
     expires_at: datetime
 
 
+
+def _aware_tehran(value: datetime) -> datetime:
+    """Return a timezone-aware datetime in Tehran time.
+
+    SQLAlchemy/asyncpg may return naive datetimes for columns that were
+    inserted with timezone info depending on DB column type. Confirmation
+    expiry checks must handle both naive and aware values safely.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=TEHRAN_TZ)
+    return value.astimezone(TEHRAN_TZ)
+
+
 def _hash_code(code: str) -> str:
     return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
@@ -12620,7 +13927,9 @@ from app.models import AdminConfirmation
 logger = logging.getLogger("howtosee-deadlines")
 
 DEADLINE_CLEANUP_INTERVAL_SECONDS = int(os.getenv("DEADLINE_CLEANUP_INTERVAL_SECONDS", "60"))
-RECEIPT_UPLOAD_WINDOW_MINUTES = int(os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "30"))
+RECEIPT_UPLOAD_WINDOW_MINUTES = int(
+    os.getenv("PAYMENT_RECEIPT_TTL_MINUTES", os.getenv("RECEIPT_UPLOAD_WINDOW_MINUTES", "30"))
+)
 CONFIRMATION_RETENTION_HOURS = int(os.getenv("CONFIRMATION_RETENTION_HOURS", "24"))
 
 
@@ -12702,31 +14011,23 @@ def _expire_receipt(conn: sqlite3.Connection, receipt: sqlite3.Row, *, now_iso: 
         """
         UPDATE payment_receipts
         SET status = 'expired',
-            receipt_file_id = NULL,
-            receipt_file_unique_id = NULL,
-            receipt_file_type = NULL,
-            receipt_message_id = NULL,
-            receipt_chat_id = NULL,
             updated_at = ?
         WHERE id = ? AND status = 'waiting_receipt'
         """,
         (now_iso, receipt_id),
     )
-    # Files that were uploaded but not submitted before the deadline must not be
-    # treated as a real transaction. Removing the DB references also keeps future
-    # backups from downloading stale receipt media.
-    if _table_exists(conn, "payment_receipt_files"):
-        conn.execute("DELETE FROM payment_receipt_files WHERE receipt_id = ?", (receipt_id,))
+    # Important: do NOT delete receipt rows, file references, or receipt files.
+    # Expired receipts are accounting/audit evidence and must stay reportable.
     conn.execute(
         """
         UPDATE orders
-        SET status = 'expired', admin_note = COALESCE(admin_note, 'مهلت ارسال رسید تمام شد.')
+        SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت ارسال رسید تمام شد.')
         WHERE id = ? AND status IN ('pending', 'payment_rejected')
         """,
         (order_id,),
     )
     _record_event(conn, "payment_receipt", receipt_id, "expired", f"order_id={order_id}")
-    _record_event(conn, "order", order_id, "expired", f"receipt_id={receipt_id}")
+    _record_event(conn, "order", order_id, "payment_expired", f"receipt_id={receipt_id}")
     return True
 
 
@@ -12738,19 +14039,29 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
     """
     path = _sqlite_path()
     if not path.exists():
-        return {"receipts_expired": 0, "orders_expired": 0, "files_removed": 0}
+        return {"receipts_expired": 0, "orders_payment_expired": 0, "orders_expired": 0, "files_preserved": 0}
 
     now_dt = (now or _now()).astimezone(TEHRAN_TZ)
     now_iso = now_dt.isoformat(timespec="seconds")
     receipts_expired = 0
     orders_expired = 0
-    files_removed = 0
+    files_preserved = 0
 
     with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
         if not _table_exists(conn, "orders"):
-            return {"receipts_expired": 0, "orders_expired": 0, "files_removed": 0}
+            return {"receipts_expired": 0, "orders_payment_expired": 0, "orders_expired": 0, "files_preserved": 0}
         _ensure_deadline_schema(conn)
+        # Backward compatibility for older code that used orders.status='expired'.
+        # From now on order status is payment_expired, while receipt status remains expired.
+        order_cols = _columns(conn, "orders")
+        if {"id", "status"}.issubset(order_cols):
+            migrated = conn.execute(
+                "UPDATE orders SET status = 'payment_expired' WHERE status = 'expired'"
+            ).rowcount or 0
+            if migrated:
+                for row in conn.execute("SELECT id FROM orders WHERE status = 'payment_expired'").fetchall():
+                    _record_event(conn, "order", int(row["id"]), "migrated_to_payment_expired", "old_status=expired")
 
         if _table_exists(conn, "payment_receipts"):
             receipt_cols = _columns(conn, "payment_receipts")
@@ -12768,18 +14079,16 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
                         if _expire_receipt(conn, receipt, now_iso=now_iso):
                             receipts_expired += 1
                             orders_expired += 1
-                            files_removed += before
+                            files_preserved += before
 
-        # Wallet top-up orders that never reached the receipt page should not live
-        # forever in the user's transaction list. They are checkout attempts, not
-        # completed wallet transactions.
+        # Any checkout/order that never submitted a receipt must not stay pending forever.
+        # Manual full-scan and the periodic job both use this path and scan the whole DB.
         order_cols = _columns(conn, "orders")
-        if {"id", "status", "plan_key", "created_at"}.issubset(order_cols):
+        if {"id", "status", "created_at"}.issubset(order_cols):
             rows = conn.execute(
                 """
                 SELECT * FROM orders
                 WHERE status IN ('pending', 'payment_rejected')
-                  AND plan_key LIKE 'wallet_topup:%'
                 """
             ).fetchall()
             for order in rows:
@@ -12801,18 +14110,18 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
                     cur = conn.execute(
                         """
                         UPDATE orders
-                        SET status = 'expired', admin_note = COALESCE(admin_note, 'مهلت تکمیل پرداخت تمام شد.')
+                        SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت تکمیل پرداخت تمام شد.')
                         WHERE id = ? AND status IN ('pending', 'payment_rejected')
                         """,
                         (int(order["id"]),),
                     )
                     if cur.rowcount:
                         orders_expired += int(cur.rowcount)
-                        _record_event(conn, "order", int(order["id"]), "expired", "wallet_topup_without_active_receipt")
+                        _record_event(conn, "order", int(order["id"]), "payment_expired", "order_without_active_receipt")
 
         conn.commit()
 
-    return {"receipts_expired": receipts_expired, "orders_expired": orders_expired, "files_removed": files_removed}
+    return {"receipts_expired": receipts_expired, "orders_payment_expired": orders_expired, "orders_expired": orders_expired, "files_preserved": files_preserved}
 
 
 async def cleanup_expired_admin_confirmations(now: datetime | None = None) -> dict[str, int]:
@@ -13035,6 +14344,7 @@ def _financial_summary_rows() -> list[dict[str, Any]]:
         {"section": "orders", "metric": "orders_pending", "title": "سفارش‌های در انتظار پرداخت", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'pending'"), "created_at": created_at},
         {"section": "orders", "metric": "orders_receipt_pending", "title": "رسیدهای در انتظار بررسی", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'receipt_pending'"), "created_at": created_at},
         {"section": "orders", "metric": "orders_rejected", "title": "پرداخت‌های ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status = 'payment_rejected'"), "created_at": created_at},
+        {"section": "orders", "metric": "orders_payment_expired", "title": "سفارش‌های پرداخت منقضی‌شده", "value": _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status IN ('payment_expired', 'expired')"), "created_at": created_at},
         {"section": "orders", "metric": "gross_paid", "title": "مبلغ خام سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
         {"section": "orders", "metric": "discount_paid", "title": "جمع تخفیف سفارش‌های پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
         {"section": "orders", "metric": "net_paid", "title": "خالص فروش پرداخت‌شده", "value": _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'"), "created_at": created_at},
@@ -13044,6 +14354,7 @@ def _financial_summary_rows() -> list[dict[str, Any]]:
         {"section": "receipts", "metric": "receipts_pending", "title": "رسیدهای در انتظار", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'"), "created_at": created_at},
         {"section": "receipts", "metric": "receipts_approved", "title": "رسیدهای تأییدشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'"), "created_at": created_at},
         {"section": "receipts", "metric": "receipts_rejected", "title": "رسیدهای ردشده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'rejected'"), "created_at": created_at},
+        {"section": "receipts", "metric": "receipts_expired", "title": "رسیدهای منقضی‌شده", "value": _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'expired'"), "created_at": created_at},
     ]
     for row in _sqlite_group_rows("SELECT COALESCE(payment_method, 'unknown') AS method, COUNT(*) AS count, COALESCE(SUM(amount - discount_amount), 0) AS net_amount FROM orders WHERE status = 'paid' GROUP BY COALESCE(payment_method, 'unknown') ORDER BY net_amount DESC"):
         rows.append({"section": "paid_by_method", "metric": row.get("method"), "title": f"فروش پرداخت‌شده با {row.get('method')}", "value": row.get("net_amount"), "count": row.get("count"), "created_at": created_at})
@@ -13123,6 +14434,8 @@ async def usage_summary_rows() -> list[dict[str, Any]]:
         ("sales_total", "فروش کل پرداخت‌شده", _sqlite_scalar("SELECT COALESCE(SUM(amount - discount_amount), 0) FROM orders WHERE status = 'paid'")),
         ("receipts_pending", "رسیدهای کارت‌به‌کارت در انتظار", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'receipt_pending'")),
         ("receipts_approved", "رسیدهای تأییدشده", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'approved'")),
+        ("receipts_expired", "رسیدهای منقضی‌شده", _sqlite_scalar("SELECT COUNT(*) FROM payment_receipts WHERE status = 'expired'")),
+        ("orders_payment_expired", "سفارش‌های پرداخت منقضی‌شده", _sqlite_scalar("SELECT COUNT(*) FROM orders WHERE status IN ('payment_expired', 'expired')")),
         ("wallet_balance_total", "جمع موجودی کیف پول کاربران", _sqlite_scalar("SELECT COALESCE(SUM(wallet_balance), 0) FROM users")),
     ]
     pg_metrics: list[tuple[str, str, Any]] = []
@@ -13280,8 +14593,8 @@ class JobSpec:
 DEFAULT_JOBS: dict[str, JobSpec] = {
     "receipt_deadline_cleanup": JobSpec(
         key="receipt_deadline_cleanup",
-        title="پاکسازی رسیدهای منقضی",
-        description="سفارش‌ها و رسیدهای کارت‌به‌کارت که مهلت ارسال رسیدشان گذشته را از حالت pending خارج می‌کند تا دیگر در تراکنش‌های کاربر نمایش داده نشوند.",
+        title="منقضی‌سازی رسیدها",
+        description="کل دیتابیس را اسکن می‌کند و سفارش‌ها/رسیدهایی را که مهلت ارسال رسیدشان گذشته، بدون حذف‌کردن داده یا فایل، به وضعیت منقضی‌شده تبدیل می‌کند.",
         default_interval_minutes=1,
     ),
     "closed_ticket_cleanup": JobSpec(
@@ -16155,13 +17468,68 @@ async def upsert_addon_from_line(line: str, admin_id: int) -> tuple[bool, str]:
     return True, f"بسته حجم <code>{key}</code> ذخیره شد."
 
 
+async def list_active_free_test_plans_for_user() -> list[FreeTestPlanDB]:
+    """Return free-test plans that are active in both free and catalog tables.
+
+    The public free-service menu is backed by FreeTestPlanDB, while admins may
+    disable the same key from the main CatalogPlan list because free plans also
+    need Pasarguard templates. If either side is inactive, the user must not see
+    or activate that plan.
+    """
+    async with session_scope() as session:
+        free_plans = list(
+            (
+                await session.execute(
+                    select(FreeTestPlanDB)
+                    .where(FreeTestPlanDB.is_active.is_(True))
+                    .order_by(FreeTestPlanDB.sort_order)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        keys = [p.key for p in free_plans]
+        if not keys:
+            return []
+        catalog_rows = list(
+            (await session.execute(select(CatalogPlan).where(CatalogPlan.key.in_(keys))))
+            .scalars()
+            .all()
+        )
+        catalog_active = {row.key: bool(row.is_active) for row in catalog_rows}
+        return [p for p in free_plans if catalog_active.get(p.key, True)]
+
+
+async def is_free_test_plan_active_for_user(key: str) -> bool:
+    """Check whether a free-test plan is currently visible/usable by users."""
+    key = (key or "").strip()
+    if not key:
+        return False
+    async with session_scope() as session:
+        free_plan = (
+            await session.execute(
+                select(FreeTestPlanDB).where(
+                    FreeTestPlanDB.key == key,
+                    FreeTestPlanDB.is_active.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if free_plan is None:
+            return False
+        catalog_plan = (
+            await session.execute(select(CatalogPlan).where(CatalogPlan.key == key))
+        ).scalar_one_or_none()
+        if catalog_plan is not None and not bool(catalog_plan.is_active):
+            return False
+        return True
+
+
 async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
     """Push DB catalog into the old legacy dictionaries until all buy flow is refactored."""
     plans = await list_plans(active_only=True)
     addons = await list_addons(active_only=True)
     categories = await list_categories(active_only=True)
-    async with session_scope() as session:
-        free_plans = list((await session.execute(select(FreeTestPlanDB).where(FreeTestPlanDB.is_active.is_(True)).order_by(FreeTestPlanDB.sort_order))).scalars().all())
+    free_plans = await list_active_free_test_plans_for_user()
     if hasattr(legacy_module, "PLAN_CATEGORIES"):
         legacy_module.PLAN_CATEGORIES.clear()
         for c in categories:
@@ -17257,11 +18625,13 @@ PASARGUARD_USERNAME_SUFFIX=
 SALES_ADMIN_CHAT_IDS=483137754
 
 
+
 ================================================================================
 # فایل: informations/admin_ids
 ================================================================================
 
 6413811117
+
 
 
 ================================================================================
@@ -17271,6 +18641,7 @@ SALES_ADMIN_CHAT_IDS=483137754
 JwyCssFTB6D3XSk@
 
 pasarguard_telegram_bot
+
 
 
 ================================================================================
@@ -17286,12 +18657,12 @@ GRANT ALL PRIVILEGES ON DATABASE pasarguard_telegram_bot TO pasarguard_telegram_
 
 
 
-
 ================================================================================
 # فایل: informations/cards
 ================================================================================
 
 6063731291146117 | امیر صادقی | بانک قرض الحسنه مهر ایران | پرداخت سرویس | 1
+
 
 
 ================================================================================
@@ -17323,8 +18694,6 @@ psql "$DB_URL" -c "GRANT ALL ON SCHEMA public TO CURRENT_USER;"
 
 cd /home/PasarguardTelegramBot
 rm -f bot.db
-
-
 
 
 
@@ -42565,11 +43934,13 @@ rm -f bot.db
 }
 
 
+
 ================================================================================
 # فایل: informations/token
 ================================================================================
 
 8930264914:AAGOwZowZoxrUugR7UhVLyaLgLQluFfnBWs
+
 
 
 ================================================================================
@@ -42815,10 +44186,6 @@ if __name__ == "__main__":
 
 
 
-
-
-
-
 ================================================================================
 # فایل: pasarguardtelegrambot.service
 ================================================================================
@@ -42880,6 +44247,1692 @@ fi
 systemctl daemon-reload
 systemctl restart "$SERVICE_NAME"
 systemctl --no-pager --full status "$SERVICE_NAME" || true
+
+
+
+================================================================================
+# فایل: scripts/01_seed_initial_tutorials.py
+================================================================================
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+01_seed_initial_tutorials.py
+
+این اسکریپت آموزش‌های اولیه HowTooSee را مستقیم داخل دیتابیس SQLite ربات اضافه/آپدیت می‌کند.
+
+کجا اجرا شود؟
+    /home/PasarguardTelegramBot
+
+روش اجرا:
+    cd /home/PasarguardTelegramBot
+    source .venv/bin/activate
+    python scripts/01_seed_initial_tutorials.py
+
+نکته:
+    این اسکریپت idempotent است؛ یعنی اگر دوباره اجرا شود، آموزش‌های هم‌نام را آپدیت می‌کند
+    و تا حد ممکن آموزش تکراری نمی‌سازد.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sqlite3
+import sys
+from contextlib import closing
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any
+
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def now_iso() -> str:
+    return datetime.now(TEHRAN_TZ).isoformat(timespec="seconds")
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+
+        env[key] = value
+
+    return env
+
+
+def parse_first_admin_id(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    for part in re.split(r"[,\s]+", raw):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            return int(part)
+    return None
+
+
+def resolve_db_path(project_dir: Path, db_arg: str | None) -> Path:
+    if db_arg:
+        db_path = Path(db_arg)
+    else:
+        env = read_dotenv(project_dir / ".env")
+        raw = env.get("DATABASE_PATH") or os.getenv("DATABASE_PATH") or "bot.db"
+        db_path = Path(raw)
+
+    if not db_path.is_absolute():
+        db_path = project_dir / db_path
+
+    return db_path
+
+
+def column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tutorial_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 100,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tutorials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            media_type TEXT,
+            media_file_id TEXT,
+            media_file_unique_id TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 100,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+
+    category_cols = column_names(conn, "tutorial_categories")
+    for col, ddl in [
+        ("description", "ALTER TABLE tutorial_categories ADD COLUMN description TEXT"),
+        ("sort_order", "ALTER TABLE tutorial_categories ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 100"),
+        ("is_active", "ALTER TABLE tutorial_categories ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"),
+        ("created_by", "ALTER TABLE tutorial_categories ADD COLUMN created_by INTEGER"),
+        ("created_at", "ALTER TABLE tutorial_categories ADD COLUMN created_at TEXT"),
+        ("updated_at", "ALTER TABLE tutorial_categories ADD COLUMN updated_at TEXT"),
+    ]:
+        if col not in category_cols:
+            conn.execute(ddl)
+
+    tutorial_cols = column_names(conn, "tutorials")
+    for col, ddl in [
+        ("category_id", "ALTER TABLE tutorials ADD COLUMN category_id INTEGER"),
+        ("media_type", "ALTER TABLE tutorials ADD COLUMN media_type TEXT"),
+        ("media_file_id", "ALTER TABLE tutorials ADD COLUMN media_file_id TEXT"),
+        ("media_file_unique_id", "ALTER TABLE tutorials ADD COLUMN media_file_unique_id TEXT"),
+        ("sort_order", "ALTER TABLE tutorials ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 100"),
+        ("is_active", "ALTER TABLE tutorials ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"),
+        ("created_by", "ALTER TABLE tutorials ADD COLUMN created_by INTEGER"),
+        ("created_at", "ALTER TABLE tutorials ADD COLUMN created_at TEXT"),
+        ("updated_at", "ALTER TABLE tutorials ADD COLUMN updated_at TEXT"),
+    ]:
+        if col not in tutorial_cols:
+            conn.execute(ddl)
+
+    ts = now_iso()
+    conn.execute("UPDATE tutorial_categories SET created_at = COALESCE(created_at, ?), updated_at = COALESCE(updated_at, ?)", (ts, ts))
+    conn.execute("UPDATE tutorials SET created_at = COALESCE(created_at, ?), updated_at = COALESCE(updated_at, ?)", (ts, ts))
+    conn.commit()
+
+
+CATEGORIES = [
+    {
+        "key": "buy_activation",
+        "title": "🛒 خرید و فعال‌سازی سرویس",
+        "description": "آموزش خرید سرویس، پرداخت، ارسال رسید و دریافت لینک اشتراک.",
+        "sort_order": 10,
+    },
+    {
+        "key": "subscription_management",
+        "title": "🔗 استفاده از ساب و مدیریت سرویس",
+        "description": "آموزش کپی کردن لینک ساب، دیدن حجم، تاریخ انقضا، تمدید و افزایش حجم.",
+        "sort_order": 20,
+    },
+    {
+        "key": "android",
+        "title": "📱 اتصال در اندروید",
+        "description": "آموزش نصب برنامه، وارد کردن لینک اشتراک و وصل شدن در گوشی‌های Android.",
+        "sort_order": 30,
+    },
+    {
+        "key": "windows",
+        "title": "💻 اتصال در ویندوز",
+        "description": "آموزش اتصال در لپ‌تاپ و کامپیوترهای Windows.",
+        "sort_order": 40,
+    },
+    {
+        "key": "packages",
+        "title": "🎁 پکیج‌های اختصاصی",
+        "description": "آموزش دریافت، مشاهده و استفاده از پکیج‌هایی که توسط ادمین برای کاربر فعال می‌شوند.",
+        "sort_order": 50,
+    },
+    {
+        "key": "payment_wallet",
+        "title": "💳 پرداخت و کیف پول",
+        "description": "آموزش پرداخت کارت‌به‌کارت، ارسال رسید، شارژ کیف پول و پیگیری پرداخت.",
+        "sort_order": 60,
+    },
+    {
+        "key": "tickets",
+        "title": "🎫 تیکت و پشتیبانی",
+        "description": "آموزش ثبت تیکت، ارسال عکس یا فایل مشکل و پیگیری پاسخ پشتیبانی.",
+        "sort_order": 70,
+    },
+    {
+        "key": "troubleshooting",
+        "title": "🛠 خطاهای رایج و رفع مشکل",
+        "description": "راهنمای حل مشکلات رایج اتصال، آپدیت ساب، کندی، خطای برنامه و قطع شدن سرویس.",
+        "sort_order": 80,
+    },
+    {
+        "key": "rules_security",
+        "title": "🔐 قوانین و نکات مهم",
+        "description": "نکات مهم درباره استفاده درست از سرویس، نگهداری لینک اشتراک و ارتباط با پشتیبانی.",
+        "sort_order": 90,
+    },
+]
+
+
+TUTORIALS = [
+    {
+        "category": "buy_activation",
+        "title": "چطور سرویس جدید بخریم؟",
+        "sort_order": 10,
+        "body": """اگر برای اولین بار می‌خواهید سرویس بگیرید، از این آموزش شروع کنید.
+
+مراحل خرید سرویس:
+
+1. وارد ربات شوید و از منوی اصلی روی «خرید سرویس» بزنید.
+2. دسته پلن‌ها را انتخاب کنید.
+3. پلنی را انتخاب کنید که با مصرف شما مناسب‌تر است.
+4. اگر ربات از شما نام سرویس خواست، می‌توانید یک نام ساده انگلیسی وارد کنید یا از ساخت خودکار استفاده کنید.
+5. بعد از انتخاب پلن، وارد مرحله پرداخت می‌شوید.
+6. مبلغ را دقیقاً همان عددی که ربات نمایش می‌دهد کارت‌به‌کارت کنید.
+7. رسید پرداخت را در همان بخش برای ربات ارسال کنید.
+8. بعد از تأیید رسید توسط ادمین فروش، سرویس شما ساخته و لینک اشتراک نمایش داده می‌شود.
+
+نکته مهم:
+تا وقتی رسید شما تأیید نشود، سرویس فعال نمی‌شود. پس بعد از پرداخت، حتماً رسید را ارسال کنید.
+
+اگر اشتباهی از مرحله پرداخت خارج شدید:
+از بخش سفارش‌ها یا پرداخت‌ها وضعیت سفارش خود را بررسی کنید. اگر نیاز بود، برای پشتیبانی تیکت بزنید.""",
+    },
+    {
+        "category": "buy_activation",
+        "title": "چطور پلن مناسب انتخاب کنیم؟",
+        "sort_order": 20,
+        "body": """برای انتخاب پلن، اول ببینید مصرف شما چقدر است.
+
+اگر فقط برای پیام‌رسان‌ها، وب‌گردی سبک و کارهای روزمره استفاده می‌کنید:
+پلن‌های کم‌حجم‌تر برای شما مناسب‌تر هستند.
+
+اگر زیاد ویدیو می‌بینید، فایل دانلود می‌کنید یا استفاده روزانه سنگین دارید:
+بهتر است پلن‌های حجیم‌تر انتخاب کنید.
+
+اگر نمی‌خواهید هر ماه درگیر تمدید باشید:
+پلن‌های چندماهه انتخاب بهتری هستند.
+
+تفاوت کلی پلن‌ها:
+
+پلن اقتصادی:
+برای مصرف سبک و قیمت پایین‌تر مناسب است.
+
+پلن محبوب:
+برای استفاده معمولی و روزانه پیشنهاد می‌شود.
+
+پلن حجیم:
+برای مصرف زیاد، چند دستگاه یا استفاده طولانی‌تر مناسب است.
+
+نکته مهم:
+پلنی را انتخاب کنید که کمی بیشتر از مصرف واقعی شما باشد. این کار باعث می‌شود وسط دوره مجبور به خرید حجم اضافه نشوید.""",
+    },
+    {
+        "category": "buy_activation",
+        "title": "بعد از پرداخت چه اتفاقی می‌افتد؟",
+        "sort_order": 30,
+        "body": """بعد از اینکه پرداخت را انجام دادید، باید رسید را برای ربات بفرستید.
+
+مراحل بعد از پرداخت:
+
+1. ربات اطلاعات کارت و مبلغ دقیق را نمایش می‌دهد.
+2. مبلغ را دقیقاً همان مقدار پرداخت کنید.
+3. رسید پرداخت را به‌صورت عکس یا فایل برای ربات ارسال کنید.
+4. سفارش شما در وضعیت «در انتظار بررسی رسید» قرار می‌گیرد.
+5. ادمین فروش رسید را بررسی می‌کند.
+6. اگر رسید درست باشد، پرداخت تأیید می‌شود.
+7. بعد از تأیید، سرویس ساخته می‌شود.
+8. لینک اشتراک یا همان ساب برای شما نمایش داده می‌شود.
+
+اگر رسید رد شود:
+دلیل رد شدن برای شما نمایش داده می‌شود. بعد از آن می‌توانید مشکل را بررسی کنید و در صورت نیاز با پشتیبانی ارتباط بگیرید.
+
+اگر رسید منقضی شود:
+یعنی در مهلت تعیین‌شده رسید ارسال نشده یا پیگیری نشده است. در این حالت باید دوباره پرداخت یا پیگیری را از مسیر درست انجام دهید.
+
+نکته مهم:
+رسید را در همان مرحله پرداخت ارسال کنید. ارسال رسید در جای اشتباه ممکن است باعث تأخیر در بررسی شود.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "لینک اشتراک یا ساب چیست؟",
+        "sort_order": 10,
+        "body": """ساب یا لینک اشتراک، لینکی است که بعد از فعال شدن سرویس به شما داده می‌شود.
+
+شما این لینک را داخل برنامه‌هایی مثل v2rayNG در اندروید یا v2rayN در ویندوز وارد می‌کنید. بعد از وارد کردن ساب، برنامه به‌صورت خودکار سرورها را دریافت می‌کند.
+
+ساب چه فایده‌ای دارد؟
+
+1. لازم نیست کانفیگ‌ها را دستی وارد کنید.
+2. اگر سرورها تغییر کنند، با بروزرسانی ساب اطلاعات جدید دریافت می‌شود.
+3. مدیریت اتصال راحت‌تر می‌شود.
+4. برای تمدید یا افزایش حجم، معمولاً نیازی به ساخت کانفیگ جدید ندارید.
+
+نکته مهم:
+لینک ساب شخصی است. آن را برای دیگران نفرستید و داخل کانال‌ها، سایت‌ها یا گروه‌ها منتشر نکنید.
+
+اگر لینک ساب را گم کردید:
+از بخش «سرویس‌های من» وارد سرویس خود شوید و دوباره لینک اشتراک را دریافت کنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "چطور لینک ساب را کپی کنیم؟",
+        "sort_order": 20,
+        "body": """برای اتصال به سرویس، اول باید لینک ساب خود را کپی کنید.
+
+مراحل دریافت لینک ساب:
+
+1. وارد ربات شوید.
+2. از منوی اصلی روی «سرویس‌های من» بزنید.
+3. سرویس موردنظر خود را انتخاب کنید.
+4. در صفحه سرویس، دنبال بخش «لینک اشتراک» یا «پنل اشتراکی» بگردید.
+5. روی دکمه مربوط به لینک اشتراک بزنید.
+6. لینک را کپی کنید.
+7. حالا لینک را داخل برنامه اتصال وارد کنید.
+
+نکته مهم:
+اگر لینک اشتراک آماده نبود، ممکن است سرویس هنوز در حال فعال‌سازی باشد. چند لحظه صبر کنید و دوباره بررسی کنید.
+
+اگر بعد از چند دقیقه لینک نمایش داده نشد:
+از بخش تیکت‌ها با پشتیبانی ارتباط بگیرید و شماره سفارش یا نام سرویس را ارسال کنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "چطور وضعیت حجم و تاریخ سرویس را ببینیم؟",
+        "sort_order": 30,
+        "body": """برای اینکه بدانید سرویس شما چقدر حجم دارد یا چه زمانی تمام می‌شود، از بخش سرویس‌های من استفاده کنید.
+
+مراحل بررسی وضعیت سرویس:
+
+1. وارد ربات شوید.
+2. روی «سرویس‌های من» بزنید.
+3. سرویس موردنظر را انتخاب کنید.
+4. اطلاعات سرویس را ببینید.
+
+در صفحه سرویس معمولاً این اطلاعات نمایش داده می‌شود:
+
+نام سرویس
+نوع پلن
+حجم کل سرویس
+حجم مصرف‌شده
+تاریخ پایان سرویس
+وضعیت سرویس
+لینک اشتراک
+
+اگر حجم شما تمام شده باشد:
+می‌توانید از بخش «افزایش حجم» بسته حجم اضافه تهیه کنید.
+
+اگر زمان سرویس تمام شده باشد:
+باید سرویس را تمدید کنید.
+
+نکته مهم:
+افزایش حجم با تمدید فرق دارد. افزایش حجم فقط حجم سرویس را بیشتر می‌کند، اما تمدید زمان سرویس را افزایش می‌دهد.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "تمدید سرویس و افزایش حجم چه فرقی دارند؟",
+        "sort_order": 40,
+        "body": """این دو گزینه شبیه هم نیستند و هر کدام کاربرد جداگانه دارند.
+
+تمدید سرویس:
+زمان سرویس شما را بیشتر می‌کند. معمولاً وقتی تاریخ پایان سرویس نزدیک است، باید تمدید انجام دهید.
+
+افزایش حجم:
+فقط حجم سرویس را بیشتر می‌کند. افزایش حجم معمولاً زمان سرویس را بیشتر نمی‌کند.
+
+مثال ساده:
+
+اگر سرویس شما هنوز ۱۵ روز زمان دارد ولی حجم آن تمام شده:
+باید «افزایش حجم» بگیرید.
+
+اگر حجم دارید ولی تاریخ سرویس تمام شده:
+باید «تمدید» انجام دهید.
+
+اگر هم حجم تمام شده و هم زمان سرویس گذشته:
+بهتر است سرویس را تمدید کنید یا از پشتیبانی راهنمایی بگیرید.
+
+نکته مهم:
+بعد از تمدید یا افزایش حجم، داخل برنامه اتصال یک بار ساب را بروزرسانی کنید.""",
+    },
+    {
+        "category": "android",
+        "title": "دانلود و نصب v2rayNG برای اندروید",
+        "sort_order": 10,
+        "body": """برای اتصال در گوشی‌های Android می‌توانید از برنامه v2rayNG استفاده کنید.
+
+لینک پیشنهادی دانلود:
+https://github.com/2dust/v2rayNG/releases
+
+روش کلی نصب:
+
+1. وارد لینک بالا شوید.
+2. آخرین نسخه برنامه را پیدا کنید.
+3. فایل APK مناسب گوشی خود را دانلود کنید.
+4. اگر گوشی اجازه نصب نداد، نصب از منابع ناشناس را برای مرورگر یا فایل منیجر فعال کنید.
+5. برنامه را نصب و اجرا کنید.
+
+نکته مهم:
+برنامه را از منبع نامعتبر دانلود نکنید. نسخه‌های دستکاری‌شده ممکن است امن نباشند.
+
+اگر نمی‌دانید کدام فایل را دانلود کنید:
+معمولاً نسخه universal یا arm64-v8a برای اکثر گوشی‌های جدید مناسب است. اگر مطمئن نیستید، از پشتیبانی راهنمایی بگیرید.""",
+    },
+    {
+        "category": "android",
+        "title": "اتصال در اندروید با v2rayNG",
+        "sort_order": 20,
+        "body": """برای اتصال در گوشی Android، بعد از نصب v2rayNG این مراحل را انجام دهید.
+
+مراحل اتصال:
+
+1. از ربات، لینک اشتراک یا ساب خود را کپی کنید.
+2. وارد برنامه v2rayNG شوید.
+3. منوی برنامه را باز کنید.
+4. وارد بخش Subscription یا اشتراک شوید.
+5. گزینه افزودن subscription را بزنید.
+6. یک نام دلخواه بنویسید؛ مثلاً HowTooSee.
+7. لینک ساب را در بخش آدرس وارد کنید.
+8. ذخیره کنید.
+9. گزینه Update subscription یا بروزرسانی اشتراک را بزنید.
+10. بعد از نمایش سرورها، یکی از آن‌ها را انتخاب کنید.
+11. روی دکمه اتصال بزنید.
+
+اگر وصل نشدید:
+یک سرور دیگر را انتخاب کنید و دوباره امتحان کنید.
+
+اگر باز هم مشکل داشتید:
+از بخش تیکت‌ها پیام بدهید و اسکرین‌شات خطا را ارسال کنید.""",
+    },
+    {
+        "category": "android",
+        "title": "بروزرسانی ساب در v2rayNG",
+        "sort_order": 30,
+        "body": """گاهی لازم است ساب خود را بروزرسانی کنید تا آخرین سرورها و تغییرات برای شما نمایش داده شود.
+
+چه زمانی باید ساب را بروزرسانی کنیم؟
+
+اگر سرورها وصل نمی‌شوند
+اگر سرویس را تمدید کرده‌اید
+اگر حجم اضافه خریده‌اید
+اگر پشتیبانی گفته ساب را آپدیت کنید
+اگر سرورها قدیمی یا خالی نمایش داده می‌شوند
+
+مراحل بروزرسانی:
+
+1. وارد برنامه v2rayNG شوید.
+2. منوی برنامه را باز کنید.
+3. وارد بخش Subscription شوید.
+4. گزینه Update subscription یا بروزرسانی اشتراک را بزنید.
+5. چند لحظه صبر کنید.
+6. بعد از بروزرسانی، یکی از سرورها را انتخاب کنید و وصل شوید.
+
+اگر بروزرسانی خطا داد:
+اینترنت گوشی روشن باشد.
+لینک ساب را درست وارد کرده باشید.
+برنامه به اینترنت دسترسی داشته باشد.
+اگر فیلترشکن دیگری روشن است، آن را خاموش کنید و دوباره امتحان کنید.""",
+    },
+    {
+        "category": "windows",
+        "title": "دانلود و نصب v2rayN برای ویندوز",
+        "sort_order": 10,
+        "body": """برای اتصال در Windows می‌توانید از برنامه v2rayN استفاده کنید.
+
+لینک پیشنهادی دانلود:
+https://github.com/2dust/v2rayN/releases
+
+روش کلی نصب:
+
+1. وارد لینک بالا شوید.
+2. آخرین نسخه v2rayN را دانلود کنید.
+3. برای ویندوز معمولاً فایل windows-64 مناسب است.
+4. فایل zip را از حالت فشرده خارج کنید.
+5. برنامه v2rayN را اجرا کنید.
+
+نکته مهم:
+برنامه v2rayN معمولاً به نصب پیچیده نیاز ندارد. فایل را Extract کنید و برنامه را اجرا کنید.
+
+اگر Windows Defender یا آنتی‌ویروس هشدار داد:
+از دانلود بودن فایل از منبع رسمی مطمئن شوید. اگر از جای دیگری دانلود کرده‌اید، فایل را پاک کنید و از لینک رسمی استفاده کنید.""",
+    },
+    {
+        "category": "windows",
+        "title": "اتصال در ویندوز با v2rayN",
+        "sort_order": 20,
+        "body": """برای اتصال در Windows بعد از اجرای v2rayN این مراحل را انجام دهید.
+
+مراحل اتصال:
+
+1. از ربات، لینک اشتراک یا ساب خود را کپی کنید.
+2. وارد برنامه v2rayN شوید.
+3. بخش Subscription یا Subscriptions را باز کنید.
+4. یک subscription جدید اضافه کنید.
+5. لینک ساب را وارد کنید.
+6. گزینه Update subscription را بزنید.
+7. بعد از نمایش سرورها، یکی از سرورها را انتخاب کنید.
+8. گزینه System Proxy را فعال کنید.
+9. مرورگر را باز کنید و اتصال را تست کنید.
+
+نکته مهم:
+در ویندوز فقط انتخاب سرور کافی نیست. معمولاً باید System Proxy هم فعال باشد تا مرورگر و برنامه‌ها از اتصال استفاده کنند.
+
+اگر اینترنت قطع شد:
+System Proxy را خاموش کنید، یک سرور دیگر انتخاب کنید و دوباره وصل شوید.""",
+    },
+    {
+        "category": "packages",
+        "title": "پکیج اختصاصی چیست؟",
+        "sort_order": 10,
+        "body": """پکیج اختصاصی یعنی بسته‌ای که برای همه کاربران نمایش داده نمی‌شود و فقط ادمین آن را برای یک کاربر مشخص فعال می‌کند.
+
+پکیج اختصاصی چه زمانی استفاده می‌شود؟
+
+وقتی کاربر نیاز خاصی دارد
+وقتی چند سرویس یا چند زیرمجموعه لازم دارد
+وقتی قیمت یا شرایط متفاوت است
+وقتی ادمین با کاربر هماهنگ کرده است
+
+نکته مهم:
+پکیج‌های اختصاصی مثل پلن‌های عمومی نیستند. اگر برای شما پکیج تعریف نشده باشد، چیزی در این بخش نمی‌بینید.
+
+برای دریافت پکیج اختصاصی:
+باید با ادمین یا پشتیبانی هماهنگ کنید. بعد از فعال شدن پکیج، می‌توانید آن را از ربات مشاهده و استفاده کنید.""",
+    },
+    {
+        "category": "packages",
+        "title": "چطور پکیج اختصاصی را استفاده کنیم؟",
+        "sort_order": 20,
+        "body": """اگر ادمین برای شما پکیج اختصاصی فعال کرده باشد، از داخل ربات می‌توانید آن را ببینید.
+
+مراحل استفاده:
+
+1. وارد ربات شوید.
+2. بخش مربوط به پکیج‌ها یا سرویس‌های اختصاصی را باز کنید.
+3. پکیج فعال خود را انتخاب کنید.
+4. شرایط و توضیحات پکیج را کامل بخوانید.
+5. اگر نیاز به پرداخت داشت، پرداخت را انجام دهید.
+6. بعد از تأیید، سرویس‌های مربوط به پکیج برای شما فعال می‌شوند.
+
+نکته مهم:
+اگر پکیج را نمی‌بینید، یعنی هنوز برای شما فعال نشده یا مهلت/شرایط آن تغییر کرده است.
+
+در این حالت:
+از بخش تیکت‌ها پیام بدهید و موضوع را با پشتیبانی مطرح کنید.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "پرداخت کارت‌به‌کارت و ارسال رسید",
+        "sort_order": 10,
+        "body": """برای خرید سرویس یا شارژ کیف پول، ممکن است پرداخت کارت‌به‌کارت انجام دهید.
+
+مراحل پرداخت:
+
+1. مبلغ دقیق را از ربات ببینید.
+2. شماره کارت نمایش داده‌شده را کپی کنید.
+3. دقیقاً همان مبلغ را کارت‌به‌کارت کنید.
+4. رسید پرداخت را به‌صورت عکس یا فایل ذخیره کنید.
+5. رسید را در همان بخش پرداخت برای ربات ارسال کنید.
+6. منتظر بررسی ادمین فروش بمانید.
+
+نکات مهم:
+
+مبلغ را کم یا زیاد نکنید.
+رسید را در جای اشتباه نفرستید.
+از پایا یا پل استفاده نکنید مگر پشتیبانی گفته باشد.
+اگر برنامه پرداخت خطای محدودیت کارت داد، از موبایل‌بانک یا اینترنت‌بانک استفاده کنید.
+
+تا وقتی رسید تأیید نشود، پرداخت نهایی نیست.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "رسید منقضی یا رد شده یعنی چه؟",
+        "sort_order": 20,
+        "body": """گاهی سفارش یا رسید شما ممکن است رد یا منقضی شود.
+
+رسید رد شده:
+یعنی ادمین فروش رسید را بررسی کرده ولی مشکلی وجود داشته است. مثلاً مبلغ اشتباه بوده، رسید واضح نبوده یا اطلاعات پرداخت با سفارش هماهنگ نبوده است.
+
+رسید منقضی شده:
+یعنی مهلت ارسال یا پیگیری رسید تمام شده است.
+
+در این حالت چه کار کنم؟
+
+1. پیام ربات را کامل بخوانید.
+2. اگر دلیل رد شدن نوشته شده، همان مورد را بررسی کنید.
+3. اگر نیاز به راهنمایی دارید، تیکت بزنید.
+4. شماره سفارش را برای پشتیبانی ارسال کنید.
+
+نکته مهم:
+برای جلوگیری از رد شدن رسید، همیشه مبلغ دقیق را پرداخت کنید و رسید واضح ارسال کنید.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "کیف پول چیست و چطور شارژ می‌شود؟",
+        "sort_order": 30,
+        "body": """کیف پول یعنی موجودی داخلی شما در ربات.
+
+با کیف پول می‌توانید بعداً سریع‌تر خرید انجام دهید، بدون اینکه برای هر خرید دوباره پرداخت جداگانه انجام دهید.
+
+مراحل شارژ کیف پول:
+
+1. وارد بخش کیف پول شوید.
+2. گزینه افزایش موجودی را انتخاب کنید.
+3. مبلغ موردنظر را وارد کنید.
+4. پرداخت کارت‌به‌کارت انجام دهید.
+5. رسید را ارسال کنید.
+6. بعد از تأیید رسید، مبلغ به کیف پول شما اضافه می‌شود.
+
+نکته مهم:
+شارژ کیف پول هم نیاز به تأیید رسید دارد. یعنی تا وقتی ادمین فروش رسید را تأیید نکند، موجودی اضافه نمی‌شود.""",
+    },
+    {
+        "category": "tickets",
+        "title": "چطور تیکت پشتیبانی بزنیم؟",
+        "sort_order": 10,
+        "body": """اگر مشکلی دارید که با آموزش‌ها حل نمی‌شود، از بخش تیکت‌ها با پشتیبانی ارتباط بگیرید.
+
+مراحل ثبت تیکت:
+
+1. وارد ربات شوید.
+2. روی «تیکت» یا «پشتیبانی» بزنید.
+3. موضوع مناسب را انتخاب کنید.
+4. عنوان کوتاه و واضح بنویسید.
+5. مشکل را کامل توضیح دهید.
+6. اگر عکس، ویدیو یا فایل لازم است، همان‌جا ارسال کنید.
+7. منتظر پاسخ پشتیبانی بمانید.
+
+برای اینکه سریع‌تر جواب بگیرید، این اطلاعات را بفرستید:
+
+نام سرویس
+نوع گوشی یا ویندوز
+نام برنامه اتصال
+اسکرین‌شات خطا
+زمان شروع مشکل
+کاری که قبل از مشکل انجام داده‌اید
+
+نکته مهم:
+پیام‌های کوتاه مثل «وصل نمیشه» کافی نیستند. هرچه توضیح کامل‌تر باشد، مشکل سریع‌تر حل می‌شود.""",
+    },
+    {
+        "category": "troubleshooting",
+        "title": "اگر سرویس وصل نشد چه کار کنیم؟",
+        "sort_order": 10,
+        "body": """اگر سرویس وصل نشد، قبل از ارسال تیکت این مراحل را انجام دهید.
+
+مرحله 1:
+اینترنت اصلی خود را بررسی کنید. بدون سرویس هم باید اینترنت داشته باشید.
+
+مرحله 2:
+یک سرور دیگر را انتخاب کنید و دوباره وصل شوید.
+
+مرحله 3:
+ساب را بروزرسانی کنید.
+
+مرحله 4:
+برنامه را کامل ببندید و دوباره باز کنید.
+
+مرحله 5:
+اگر در اندروید هستید، یک بار اینترنت گوشی را خاموش و روشن کنید.
+
+مرحله 6:
+اگر در ویندوز هستید، System Proxy را خاموش و دوباره روشن کنید.
+
+مرحله 7:
+تاریخ انقضا و حجم سرویس را در ربات بررسی کنید.
+
+اگر هنوز مشکل حل نشد:
+از بخش تیکت‌ها پیام بدهید و این موارد را ارسال کنید:
+
+نام سرویس
+نوع گوشی یا ویندوز
+نام برنامه‌ای که استفاده می‌کنید
+اسکرین‌شات خطا
+اینکه مشکل از چه زمانی شروع شده است""",
+    },
+    {
+        "category": "troubleshooting",
+        "title": "سرورها نمایش داده نمی‌شوند یا ساب آپدیت نمی‌شود",
+        "sort_order": 20,
+        "body": """اگر لینک ساب را وارد کردید ولی سرورها نمایش داده نشدند، این موارد را بررسی کنید:
+
+1. لینک ساب را دوباره از ربات کپی کنید.
+2. مطمئن شوید لینک را کامل کپی کرده‌اید.
+3. داخل برنامه گزینه Update subscription را بزنید.
+4. اینترنت اصلی گوشی یا سیستم را بررسی کنید.
+5. اگر فیلترشکن یا پروکسی دیگری روشن است، خاموش کنید.
+6. برنامه را ببندید و دوباره باز کنید.
+7. یک بار لینک ساب قبلی را حذف و دوباره اضافه کنید.
+
+اگر هنوز مشکل حل نشد:
+از بخش تیکت‌ها پیام بدهید و اسکرین‌شات خطا را ارسال کنید.
+
+نکته مهم:
+بعد از تمدید، افزایش حجم یا تغییر سرویس، بهتر است ساب را یک بار بروزرسانی کنید.""",
+    },
+    {
+        "category": "rules_security",
+        "title": "لینک ساب خود را برای دیگران نفرستید",
+        "sort_order": 10,
+        "body": """لینک ساب شما شخصی است و مخصوص سرویس خودتان ساخته شده است.
+
+چرا نباید لینک ساب را منتشر کنم؟
+
+1. ممکن است دیگران از حجم شما استفاده کنند.
+2. ممکن است سرویس شما دچار اختلال شود.
+3. ممکن است امنیت حساب شما پایین بیاید.
+4. ممکن است مدیریت سرویس برای پشتیبانی سخت‌تر شود.
+
+لینک ساب را کجا نفرستیم؟
+
+داخل گروه‌ها
+داخل کانال‌ها
+برای افراد ناشناس
+در سایت‌ها
+در کامنت‌ها یا پیام‌های عمومی
+
+اگر فکر می‌کنید لینک شما دست کسی افتاده:
+از بخش سرویس‌های من، سرویس را بررسی کنید و اگر گزینه ریست لینک یا بروزرسانی لینک دارید از آن استفاده کنید. اگر مطمئن نیستید، تیکت بزنید.""",
+    },
+]
+
+
+def upsert_category(conn: sqlite3.Connection, data: dict[str, Any], admin_id: int | None) -> int:
+    ts = now_iso()
+    row = conn.execute("SELECT id FROM tutorial_categories WHERE title = ?", (data["title"],)).fetchone()
+
+    if row:
+        category_id = int(row["id"])
+        conn.execute(
+            """
+            UPDATE tutorial_categories
+            SET description = ?, sort_order = ?, is_active = 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (data["description"], int(data["sort_order"]), ts, category_id),
+        )
+        return category_id
+
+    cur = conn.execute(
+        """
+        INSERT INTO tutorial_categories
+        (title, description, sort_order, is_active, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?, ?)
+        """,
+        (data["title"], data["description"], int(data["sort_order"]), admin_id, ts, ts),
+    )
+    return int(cur.lastrowid)
+
+
+def upsert_tutorial(conn: sqlite3.Connection, category_id: int, data: dict[str, Any], admin_id: int | None) -> tuple[int, str]:
+    ts = now_iso()
+
+    # اول سعی می‌کنیم آموزش هم‌نام را داخل همین دسته پیدا کنیم.
+    row = conn.execute(
+        "SELECT id FROM tutorials WHERE title = ? AND category_id = ?",
+        (data["title"], category_id),
+    ).fetchone()
+
+    # اگر قبلاً قبل از دسته‌بندی ساخته شده بود، با عنوان پیدا می‌کنیم و به دسته درست منتقل می‌کنیم.
+    if not row:
+        row = conn.execute("SELECT id FROM tutorials WHERE title = ? ORDER BY id ASC LIMIT 1", (data["title"],)).fetchone()
+
+    if row:
+        tutorial_id = int(row["id"])
+        conn.execute(
+            """
+            UPDATE tutorials
+            SET category_id = ?, body = ?, sort_order = ?, is_active = 1, updated_at = ?
+            WHERE id = ?
+            """,
+            (category_id, data["body"].strip(), int(data["sort_order"]), ts, tutorial_id),
+        )
+        return tutorial_id, "updated"
+
+    cur = conn.execute(
+        """
+        INSERT INTO tutorials
+        (category_id, title, body, media_type, media_file_id, media_file_unique_id,
+         sort_order, is_active, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, NULL, NULL, NULL, ?, 1, ?, ?, ?)
+        """,
+        (category_id, data["title"], data["body"].strip(), int(data["sort_order"]), admin_id, ts, ts),
+    )
+    return int(cur.lastrowid), "created"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Seed HowTooSee initial tutorial categories and tutorials.")
+    parser.add_argument("--project-dir", default="/home/PasarguardTelegramBot", help="مسیر پروژه. پیش‌فرض: /home/PasarguardTelegramBot")
+    parser.add_argument("--db", default=None, help="مسیر bot.db. اگر ندهید از .env یا bot.db استفاده می‌شود.")
+    parser.add_argument("--admin-id", type=int, default=None, help="chat id ادمین ثبت‌کننده. اگر ندهید از ADMIN_CHAT_IDS داخل .env برداشته می‌شود.")
+    parser.add_argument("--no-backup", action="store_true", help="قبل از تغییرات بک‌آپ نگیرد.")
+    parser.add_argument("--dry-run", action="store_true", help="فقط تست کند و چیزی ذخیره نکند.")
+    args = parser.parse_args()
+
+    project_dir = Path(args.project_dir).resolve()
+    if not project_dir.exists():
+        print(f"❌ مسیر پروژه پیدا نشد: {project_dir}")
+        return 2
+
+    dotenv = read_dotenv(project_dir / ".env")
+    admin_id = args.admin_id or parse_first_admin_id(dotenv.get("ADMIN_CHAT_IDS") or os.getenv("ADMIN_CHAT_IDS"))
+
+    db_path = resolve_db_path(project_dir, args.db)
+    if not db_path.exists():
+        print(f"⚠️ دیتابیس پیدا نشد و ساخته می‌شود: {db_path}")
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if db_path.exists() and not args.no_backup and not args.dry_run:
+        backup_path = db_path.with_suffix(db_path.suffix + f".tutorial_seed_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        shutil.copy2(db_path, backup_path)
+        print(f"✅ بک‌آپ دیتابیس ساخته شد: {backup_path}")
+
+    print(f"📍 project_dir = {project_dir}")
+    print(f"📍 db_path     = {db_path}")
+    print(f"📍 admin_id    = {admin_id or '-'}")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        with closing(conn):
+            ensure_schema(conn)
+
+            category_ids: dict[str, int] = {}
+            for cat in CATEGORIES:
+                category_ids[cat["key"]] = upsert_category(conn, cat, admin_id)
+
+            created = 0
+            updated = 0
+            for tutorial in TUTORIALS:
+                category_id = category_ids[tutorial["category"]]
+                _, action = upsert_tutorial(conn, category_id, tutorial, admin_id)
+                if action == "created":
+                    created += 1
+                else:
+                    updated += 1
+
+            if args.dry_run:
+                conn.rollback()
+                print("🧪 dry-run انجام شد؛ چیزی ذخیره نشد.")
+            else:
+                conn.commit()
+
+            total_cats = conn.execute("SELECT COUNT(*) AS c FROM tutorial_categories").fetchone()["c"]
+            total_tuts = conn.execute("SELECT COUNT(*) AS c FROM tutorials").fetchone()["c"]
+
+            print("✅ عملیات تمام شد.")
+            print(f"📂 دسته‌ها: {total_cats}")
+            print(f"📘 آموزش جدید: {created}")
+            print(f"🔄 آموزش آپدیت‌شده: {updated}")
+            print(f"📚 کل آموزش‌ها: {total_tuts}")
+
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"❌ خطا: {exc}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+
+================================================================================
+# فایل: scripts/02_reseed_tutorials.py
+================================================================================
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+02_reseed_tutorials.py
+
+این اسکریپت همه دسته‌ها و آموزش‌های فعلی بخش آموزش‌ها را پاک می‌کند
+و نسخه کامل‌تر آموزش‌های اولیه HowTooSee را دوباره می‌چیند.
+
+محل اجرا:
+    /home/PasarguardTelegramBot
+
+روش اجرا:
+    cd /home/PasarguardTelegramBot
+    source .venv/bin/activate
+    python scripts/02_reseed_tutorials.py
+
+نکته مهم:
+    هر بار این اسکریپت را اجرا کنید، جدول tutorials و tutorial_categories پاک
+    و دوباره ساخته می‌شود. فایل/ویس/ویدئوهایی که بعداً دستی به آموزش‌ها وصل کرده‌اید
+    هم از رکورد آموزش جدا می‌شوند؛ چون هدف این اسکریپت چیدن متن‌های اولیه از صفر است.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sqlite3
+from contextlib import closing
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Any
+
+TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
+
+
+def now_iso() -> str:
+    return datetime.now(TEHRAN_TZ).isoformat(timespec="seconds")
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
+    env: dict[str, str] = {}
+    if not path.exists():
+        return env
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+
+def parse_first_admin_id(raw: str | None) -> int | None:
+    if not raw:
+        return None
+    for part in re.split(r"[,\s]+", raw):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            return int(part)
+    return None
+
+
+def resolve_db_path(project_dir: Path, db_arg: str | None) -> Path:
+    if db_arg:
+        db_path = Path(db_arg)
+    else:
+        env = read_dotenv(project_dir / ".env")
+        raw = env.get("DATABASE_PATH") or os.getenv("DATABASE_PATH") or "bot.db"
+        db_path = Path(raw)
+    if not db_path.is_absolute():
+        db_path = project_dir / db_path
+    return db_path
+
+
+def column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tutorial_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 100,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tutorials (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            category_id INTEGER,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            media_type TEXT,
+            media_file_id TEXT,
+            media_file_unique_id TEXT,
+            sort_order INTEGER NOT NULL DEFAULT 100,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        """
+    )
+
+    category_cols = column_names(conn, "tutorial_categories")
+    for col, ddl in [
+        ("description", "ALTER TABLE tutorial_categories ADD COLUMN description TEXT"),
+        ("sort_order", "ALTER TABLE tutorial_categories ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 100"),
+        ("is_active", "ALTER TABLE tutorial_categories ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"),
+        ("created_by", "ALTER TABLE tutorial_categories ADD COLUMN created_by INTEGER"),
+        ("created_at", "ALTER TABLE tutorial_categories ADD COLUMN created_at TEXT"),
+        ("updated_at", "ALTER TABLE tutorial_categories ADD COLUMN updated_at TEXT"),
+    ]:
+        if col not in category_cols:
+            conn.execute(ddl)
+
+    tutorial_cols = column_names(conn, "tutorials")
+    for col, ddl in [
+        ("category_id", "ALTER TABLE tutorials ADD COLUMN category_id INTEGER"),
+        ("media_type", "ALTER TABLE tutorials ADD COLUMN media_type TEXT"),
+        ("media_file_id", "ALTER TABLE tutorials ADD COLUMN media_file_id TEXT"),
+        ("media_file_unique_id", "ALTER TABLE tutorials ADD COLUMN media_file_unique_id TEXT"),
+        ("sort_order", "ALTER TABLE tutorials ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 100"),
+        ("is_active", "ALTER TABLE tutorials ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"),
+        ("created_by", "ALTER TABLE tutorials ADD COLUMN created_by INTEGER"),
+        ("created_at", "ALTER TABLE tutorials ADD COLUMN created_at TEXT"),
+        ("updated_at", "ALTER TABLE tutorials ADD COLUMN updated_at TEXT"),
+    ]:
+        if col not in tutorial_cols:
+            conn.execute(ddl)
+    conn.commit()
+
+
+CATEGORIES = [
+    {"key": "buy_activation", "title": "🛒 خرید و فعال‌سازی سرویس", "description": "از انتخاب پلن تا پرداخت، ارسال رسید و دریافت ساب.", "sort_order": 10},
+    {"key": "subscription_management", "title": "🔗 استفاده از ساب و مدیریت سرویس", "description": "کپی ساب، وضعیت سرویس، تمدید، افزایش حجم و نکات مهم جایگزینی سرویس.", "sort_order": 20},
+    {"key": "android", "title": "📱 اتصال در اندروید", "description": "دانلود v2rayNG، وارد کردن ساب، تست Real delay، Sort و اتصال.", "sort_order": 30},
+    {"key": "windows", "title": "💻 اتصال در ویندوز", "description": "دانلود v2rayN، اضافه کردن ساب، تست پینگ، انتخاب سرور و System Proxy.", "sort_order": 40},
+    {"key": "packages", "title": "🎁 پکیج‌های اختصاصی", "description": "پکیج‌هایی که فقط با هماهنگی ادمین برای کاربر فعال می‌شوند.", "sort_order": 50},
+    {"key": "payment_wallet", "title": "💳 پرداخت و کیف پول", "description": "کارت‌به‌کارت، رسید، مهلت رسید، شارژ کیف پول و پیگیری پرداخت.", "sort_order": 60},
+    {"key": "tickets", "title": "🎫 تیکت و پشتیبانی", "description": "روش درست ثبت تیکت و ارسال اطلاعات لازم برای حل سریع مشکل.", "sort_order": 70},
+    {"key": "troubleshooting", "title": "🛠 خطاهای رایج و رفع مشکل", "description": "وقتی وصل نمی‌شود، ساب آپدیت نمی‌شود، کند است یا برنامه خطا می‌دهد.", "sort_order": 80},
+    {"key": "rules_security", "title": "🔐 قوانین و نکات مهم", "description": "نگهداری لینک ساب، استفاده درست و نکات امنیتی.", "sort_order": 90},
+]
+
+
+TUTORIALS = [
+    {
+        "category": "buy_activation",
+        "title": "چطور سرویس جدید بخریم؟",
+        "sort_order": 10,
+        "body": """اگر برای اولین بار می‌خواهید سرویس بگیرید، این آموزش را بخوانید.
+
+مراحل خرید:
+
+1. وارد ربات شوید.
+2. از منوی اصلی روی «🛒 خرید سرویس» بزنید.
+3. دسته پلن‌ها را انتخاب کنید.
+4. پلنی را انتخاب کنید که با مصرف شما مناسب است.
+5. اگر ربات نام سرویس خواست، می‌توانید نام انگلیسی ساده وارد کنید یا ساخت خودکار را بزنید.
+6. بعد از انتخاب پلن وارد مرحله پرداخت می‌شوید.
+7. مبلغ را دقیقاً همان عددی که ربات نمایش می‌دهد کارت‌به‌کارت کنید.
+8. رسید را همان‌جا برای ربات بفرستید.
+9. بعد از تأیید رسید توسط ادمین فروش، سرویس ساخته می‌شود.
+10. لینک اشتراک یا همان ساب برای شما نمایش داده می‌شود.
+
+نکته مهم:
+تا وقتی رسید تأیید نشود، سرویس فعال نمی‌شود.
+
+اگر از صفحه پرداخت خارج شدید:
+از بخش «💳 تراکنش‌ها» وضعیت سفارش را بررسی کنید. اگر نیاز بود، تیکت بزنید.""",
+    },
+    {
+        "category": "buy_activation",
+        "title": "چطور پلن مناسب انتخاب کنیم؟",
+        "sort_order": 20,
+        "body": """برای انتخاب پلن، اول مصرف خودتان را بسنجید.
+
+اگر استفاده شما سبک است:
+وب‌گردی، پیام‌رسان، کارهای روزمره و استفاده کم؛ پلن‌های اقتصادی مناسب‌ترند.
+
+اگر استفاده شما معمولی است:
+استفاده روزانه، شبکه‌های اجتماعی، چند ساعت اتصال در روز؛ پلن‌های محبوب انتخاب بهتری هستند.
+
+اگر استفاده شما سنگین است:
+دانلود، ویدیو، چند دستگاه یا استفاده زیاد؛ پلن‌های حجیم‌تر بگیرید.
+
+نکته:
+بهتر است کمی بیشتر از مصرف واقعی خود پلن بگیرید تا وسط دوره مجبور به خرید حجم اضافه نشوید.""",
+    },
+    {
+        "category": "buy_activation",
+        "title": "بعد از پرداخت چه اتفاقی می‌افتد؟",
+        "sort_order": 30,
+        "body": """بعد از پرداخت، سفارش شما مستقیم فعال نمی‌شود؛ اول رسید بررسی می‌شود.
+
+مراحل بعد از پرداخت:
+
+1. ربات مبلغ و کارت مقصد را نمایش می‌دهد.
+2. شما مبلغ دقیق را پرداخت می‌کنید.
+3. رسید را به‌صورت عکس یا فایل در همان بخش می‌فرستید.
+4. سفارش در وضعیت «در انتظار بررسی رسید» قرار می‌گیرد.
+5. ادمین فروش رسید را بررسی می‌کند.
+6. اگر درست باشد، پرداخت تأیید می‌شود.
+7. بعد از تأیید، سرویس ساخته و لینک ساب ارسال می‌شود.
+
+اگر رسید رد شد:
+دلیل رد شدن را بخوانید و اگر نیاز بود تیکت بزنید.
+
+اگر رسید منقضی شد:
+یعنی مهلت ارسال یا پیگیری رسید تمام شده است. در این حالت باید از مسیر درست دوباره اقدام کنید یا با پشتیبانی هماهنگ کنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "لینک اشتراک یا ساب چیست؟",
+        "sort_order": 10,
+        "body": """ساب یا لینک اشتراک همان لینکی است که بعد از فعال شدن سرویس دریافت می‌کنید.
+
+این لینک را داخل برنامه‌هایی مثل v2rayNG در اندروید یا v2rayN در ویندوز وارد می‌کنید. برنامه با این لینک، سرورها و اطلاعات اتصال را دریافت می‌کند.
+
+چرا ساب مهم است؟
+
+1. لازم نیست کانفیگ‌ها را یکی‌یکی وارد کنید.
+2. اگر سرورها تغییر کنند، با آپدیت ساب اطلاعات جدید دریافت می‌شود.
+3. بعد از تمدید یا افزایش حجم، معمولاً کافی است ساب را آپدیت کنید.
+4. مدیریت اتصال راحت‌تر می‌شود.
+
+نکته امنیتی:
+لینک ساب شخصی است. آن را برای دیگران نفرستید و در گروه، کانال یا سایت منتشر نکنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "چطور لینک ساب را کپی کنیم؟",
+        "sort_order": 20,
+        "body": """برای اتصال به سرویس، اول باید لینک ساب را از ربات بگیرید.
+
+مراحل:
+
+1. وارد ربات شوید.
+2. روی «📦 سرویس‌های من» بزنید.
+3. سرویس موردنظر را انتخاب کنید.
+4. در صفحه سرویس، دکمه «🔗 لینک کامل اشتراک» یا «🌐 پنل اشتراکی» را پیدا کنید.
+5. لینک را کپی کنید.
+6. حالا به برنامه اتصال بروید و لینک را از Clipboard اضافه کنید.
+
+روش راحت‌تر:
+لینک را از ربات کپی کنید، بعد داخل برنامه اتصال گزینه‌هایی مثل «Import from Clipboard» یا «اضافه کردن از کلیپ‌بورد» را بزنید.
+
+اگر لینک نمایش داده نشد:
+ممکن است سرویس هنوز در حال فعال‌سازی باشد. چند لحظه صبر کنید و دوباره بررسی کنید. اگر درست نشد، تیکت بزنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "تمدید سرویس و افزایش حجم چه فرقی دارند؟",
+        "sort_order": 30,
+        "body": """این دو گزینه کاربرد متفاوت دارند و خیلی مهم است اشتباه انتخاب نشوند.
+
+تمدید سرویس:
+در سیستم ما تمدید یعنی سرویس فعلی با پلن/سرویس جدید جایگزین می‌شود. یعنی اطلاعات سرویس قبلی روی همان سرویس آپدیت می‌شود و عملاً سرویس قبلی از بین می‌رود یا با نسخه جدید جایگزین می‌شود.
+
+پس اگر می‌خواهید سرویس قبلی را نگه دارید و یک سرویس جداگانه داشته باشید، به‌جای تمدید، باید «خرید سرویس جدید» انجام دهید.
+
+افزایش حجم:
+فقط حجم سرویس فعلی را بیشتر می‌کند و معمولاً زمان سرویس را بیشتر نمی‌کند.
+
+مثال ساده:
+
+اگر سرویس شما هنوز ۱۵ روز زمان دارد ولی حجم آن تمام شده:
+«افزایش حجم» بگیرید.
+
+اگر می‌خواهید پلن جدید بگیرید و سرویس فعلی با پلن جدید جایگزین شود:
+«تمدید سرویس» بزنید.
+
+اگر می‌خواهید یک سرویس جدا از سرویس قبلی داشته باشید:
+«خرید سرویس جدید» بزنید، نه تمدید.
+
+بعد از تمدید یا افزایش حجم:
+داخل برنامه اتصال، ساب را یک بار آپدیت کنید.""",
+    },
+    {
+        "category": "subscription_management",
+        "title": "چطور وضعیت حجم و تاریخ سرویس را ببینیم؟",
+        "sort_order": 40,
+        "body": """برای دیدن وضعیت سرویس:
+
+1. وارد ربات شوید.
+2. روی «📦 سرویس‌های من» بزنید.
+3. سرویس موردنظر را انتخاب کنید.
+4. اطلاعات سرویس را ببینید.
+
+معمولاً این موارد نمایش داده می‌شود:
+
+نام سرویس
+نوع پلن
+حجم کل
+حجم مصرف‌شده
+تاریخ پایان
+وضعیت سرویس
+لینک اشتراک
+
+اگر حجم تمام شده:
+بسته افزایش حجم بگیرید.
+
+اگر زمان سرویس تمام شده یا می‌خواهید پلن جایگزین شود:
+تمدید سرویس انجام دهید.
+
+اگر می‌خواهید سرویس جداگانه داشته باشید:
+خرید سرویس جدید انجام دهید.""",
+    },
+    {
+        "category": "android",
+        "title": "دانلود و نصب v2rayNG برای اندروید",
+        "sort_order": 10,
+        "body": """برای اتصال در گوشی Android، برنامه پیشنهادی v2rayNG است.
+
+لینک دانلود:
+https://github.com/2dust/v2rayNG/releases
+
+مراحل دانلود:
+
+1. لینک بالا را باز کنید.
+2. وارد صفحه نسخه‌ها یا Releases می‌شوید.
+3. آخرین نسخه را انتخاب کنید.
+4. کمی پایین‌تر بروید تا بخش «Assets» را ببینید.
+5. اگر متن‌های صفحه چینی بود، نگران نباشید؛ بخش Assets معمولاً پایین همان نسخه است.
+6. از بخش Assets فایل APK مناسب گوشی را دانلود کنید.
+
+کدام فایل را دانلود کنم؟
+
+برای بیشتر گوشی‌های جدید، معمولاً فایل arm64-v8a یا universal مناسب است.
+اگر مطمئن نیستید، نسخه universal را امتحان کنید یا از پشتیبانی بپرسید.
+
+بعد از دانلود:
+
+1. فایل APK را باز کنید.
+2. اگر گوشی اجازه نصب نداد، اجازه نصب از مرورگر یا فایل منیجر را فعال کنید.
+3. برنامه را نصب کنید.
+4. بعد از نصب، برنامه v2rayNG را باز کنید.
+
+نکته امنیتی:
+برنامه را از کانال‌ها و سایت‌های ناشناس دانلود نکنید. نسخه‌های دستکاری‌شده ممکن است امن نباشند.""",
+    },
+    {
+        "category": "android",
+        "title": "اضافه کردن ساب در v2rayNG با کلیپ‌بورد",
+        "sort_order": 20,
+        "body": """این روش برای بیشتر کاربران راحت‌تر از وارد کردن دستی لینک است.
+
+قبل از شروع:
+از ربات، لینک ساب سرویس خود را کپی کنید.
+
+مراحل اضافه کردن در v2rayNG:
+
+1. وارد برنامه v2rayNG شوید.
+2. اگر اولین بار است وارد برنامه می‌شوید، صفحه اصلی خالی یا دارای چند کانفیگ است.
+3. از بالای صفحه یا پایین صفحه، علامت «+» یا گزینه اضافه کردن را بزنید.
+4. گزینه‌ای شبیه «Import from Clipboard» یا «Import config from Clipboard» یا «اضافه کردن از کلیپ‌بورد» را انتخاب کنید.
+5. برنامه لینک کپی‌شده را می‌خواند و یک گروه یا لیست سرور اضافه می‌کند.
+6. اگر گروهی به نام import_sub ساخته شد، وارد همان گروه شوید.
+7. می‌توانید بعداً اسم گروه را به شماره سرویس خودتان تغییر دهید تا راحت‌تر پیدایش کنید.
+
+نام پیشنهادی گروه:
+به‌جای نوشتن HowTooSee، بهتر است شماره سرویس یا نام سرویس خودتان را بزنید. مثلاً:
+
+سرویس 24
+یا
+howtosee_12345
+
+آیا می‌شود کاری کرد اسم گروه import_sub نشود؟
+در بعضی برنامه‌ها بله، اگر موقع اضافه کردن subscription فیلد Name یا Remark داشته باشد، همان‌جا اسم دلخواه بزنید. اما اگر از Import from Clipboard استفاده کنید، بعضی نسخه‌ها خودشان اسم import_sub می‌گذارند و از سمت لینک همیشه قابل کنترل نیست. بهترین کار این است که بعد از اضافه شدن، داخل برنامه اسم گروه را تغییر دهید یا هنگام اضافه کردن دستی، Name را شماره سرویس بگذارید.""",
+    },
+    {
+        "category": "android",
+        "title": "اتصال در v2rayNG با Real delay و Sort",
+        "sort_order": 30,
+        "body": """برای اینکه اتصال بهتر و سریع‌تری داشته باشید، قبل از وصل شدن ساب را آپدیت کنید و بعد سرورها را با Real delay تست کنید.
+
+مرحله 1: آپدیت ساب
+
+1. وارد v2rayNG شوید.
+2. وارد گروه ساب خود شوید؛ اگر اسمش import_sub است، همان گروه را باز کنید.
+3. منوی سه‌نقطه یا گزینه‌های بالای صفحه را باز کنید.
+4. گزینه Update subscription یا Update current group را بزنید.
+5. صبر کنید تا سرورها بروزرسانی شوند.
+
+مرحله 2: تست Real delay
+
+1. در همان صفحه‌ای که سرورها را می‌بینید، منوی سه‌نقطه بالای صفحه را باز کنید.
+2. گزینه‌ای شبیه «Real delay» یا «Test all configurations real delay» را بزنید.
+3. چند ثانیه صبر کنید تا کنار سرورها عدد پینگ یا delay نمایش داده شود.
+4. عدد کمتر بهتر است. مثلاً 80ms معمولاً بهتر از 400ms است.
+
+مرحله 3: مرتب‌سازی یا Sort
+
+1. بعد از Real delay، از منوی بالای صفحه گزینه Sort یا مرتب‌سازی را بزنید.
+2. سرورها را بر اساس delay مرتب کنید.
+3. سروری که بالاتر آمده و delay کمتری دارد را انتخاب کنید.
+
+مرحله 4: اتصال
+
+1. روی سرور اول یا سروری که پینگ خوبی دارد بزنید تا انتخاب شود.
+2. پایین صفحه، دکمه اتصال را بزنید؛ معمولاً پایین سمت راست است.
+3. در بعضی نسخه‌ها این دکمه کنار آیکون مربع یا به شکل دکمه روشن/خاموش نمایش داده می‌شود.
+4. اگر برای اولین بار پیام اجازه VPN آمد، Allow یا OK را بزنید.
+5. وقتی علامت اتصال فعال شد، مرورگر یا تلگرام را تست کنید.
+
+نکته مهم برای سرعت بیشتر:
+قبل از هر بار اتصال، مخصوصاً وقتی چند روز گذشته یا سرویس را تمدید کرده‌اید، ساب را آپدیت کنید. این کار باعث می‌شود همیشه سرورهای جدیدتر و سالم‌تر را داشته باشید.
+
+اگر وصل نشد:
+یک سرور دیگر را انتخاب کنید، دوباره Real delay بزنید و سروری با پینگ بهتر انتخاب کنید.""",
+    },
+    {
+        "category": "windows",
+        "title": "دانلود و نصب v2rayN برای ویندوز",
+        "sort_order": 10,
+        "body": """برای اتصال در Windows، برنامه پیشنهادی v2rayN است.
+
+لینک دانلود:
+https://github.com/2dust/v2rayN/releases
+
+مراحل دانلود:
+
+1. لینک بالا را باز کنید.
+2. وارد صفحه Releases شوید.
+3. آخرین نسخه را انتخاب کنید.
+4. پایین همان نسخه، بخش Assets را پیدا کنید.
+5. اگر متن‌های صفحه چینی یا انگلیسی بود، نگران نباشید؛ فقط دنبال Assets بگردید.
+6. فایل مناسب ویندوز 64bit را دانلود کنید.
+7. فایل zip را Extract کنید.
+8. برنامه v2rayN را اجرا کنید.
+
+نکته:
+معمولاً v2rayN نیاز به نصب مرحله‌ای ندارد. فایل را از حالت فشرده خارج کنید و اجرا کنید.
+
+اگر برنامه باز نشد:
+ممکن است نیاز باشد .NET Desktop Runtime نصب کنید. اگر خطا دیدید، اسکرین‌شات خطا را برای پشتیبانی بفرستید.""",
+    },
+    {
+        "category": "windows",
+        "title": "اضافه کردن ساب و اتصال در v2rayN ویندوز",
+        "sort_order": 20,
+        "body": """قبل از شروع، لینک ساب را از ربات کپی کنید.
+
+روش راحت با کلیپ‌بورد:
+
+1. وارد v2rayN شوید.
+2. از منوی Subscription یا Subscriptions وارد بخش مدیریت اشتراک شوید.
+3. گزینه Add یا افزودن را بزنید.
+4. در قسمت Remarks یا Name یک اسم بزنید؛ بهتر است شماره سرویس خودتان را بنویسید.
+5. در قسمت URL، لینک ساب را Paste کنید.
+6. ذخیره کنید.
+7. حالا گزینه Update subscription را بزنید.
+8. سرورها داخل لیست نمایش داده می‌شوند.
+
+اگر گزینه Import from Clipboard داشت:
+می‌توانید لینک را کپی کنید و از گزینه Import from Clipboard استفاده کنید، ولی بهتر است روش Subscription را انجام دهید تا اسم گروه import_sub نشود.
+
+تست پینگ و انتخاب سرور:
+
+1. همه سرورها را انتخاب کنید یا روی لیست سرورها کلیک کنید.
+2. از منو یا راست‌کلیک، گزینه Test servers real delay یا Real delay را بزنید.
+3. صبر کنید تا عدد delay نمایش داده شود.
+4. ستون delay را Sort کنید تا کمترین عدد بالا بیاید.
+5. روی سروری که delay کمتر و وضعیت بهتر دارد کلیک کنید.
+6. آن سرور را به‌عنوان سرور فعال انتخاب کنید.
+
+فعال کردن اتصال در ویندوز:
+
+1. از پایین برنامه یا منوی System Proxy، حالت Set system proxy را فعال کنید.
+2. بعضی نسخه‌ها در کنار ساعت ویندوز آیکون v2rayN دارند. اگر برنامه را نمی‌بینید، کنار ساعت ویندوز را بررسی کنید.
+3. بعد از فعال کردن System Proxy، مرورگر را باز کنید و اتصال را تست کنید.
+
+اگر اینترنت قطع شد:
+System Proxy را خاموش کنید، یک سرور دیگر انتخاب کنید، Real delay بزنید و دوباره فعال کنید.""",
+    },
+    {
+        "category": "packages",
+        "title": "پکیج اختصاصی چیست؟",
+        "sort_order": 10,
+        "body": """پکیج اختصاصی بسته‌ای است که برای همه کاربران نمایش داده نمی‌شود.
+
+این پکیج‌ها فقط وقتی نمایش داده می‌شوند که ادمین برای شما فعال کرده باشد.
+
+چه زمانی پکیج اختصاصی می‌گیرید؟
+
+وقتی با ادمین هماهنگ کرده‌اید
+وقتی چند سرویس یا چند زیرمجموعه می‌خواهید
+وقتی شرایط یا قیمت خاص دارید
+وقتی برای شما بسته ویژه تعریف شده است
+
+اگر پکیج نمی‌بینید:
+یعنی هنوز برای شما فعال نشده یا شرایط آن تغییر کرده است. در این حالت باید با پشتیبانی هماهنگ کنید.""",
+    },
+    {
+        "category": "packages",
+        "title": "چطور پکیج اختصاصی را استفاده کنیم؟",
+        "sort_order": 20,
+        "body": """اگر ادمین برای شما پکیج اختصاصی فعال کرده باشد، می‌توانید آن را از ربات ببینید.
+
+مراحل:
+
+1. وارد ربات شوید.
+2. اگر برای شما پکیج فعال باشد، دکمه «🎁 پکیج‌های من» نمایش داده می‌شود.
+3. وارد پکیج شوید.
+4. توضیحات و شرایط پکیج را کامل بخوانید.
+5. اگر نیاز به پرداخت دارد، پرداخت را انجام دهید.
+6. بعد از تأیید، سرویس‌های مربوط به پکیج فعال می‌شوند.
+
+نکته:
+پکیج‌ها عمومی نیستند. اگر دکمه پکیج‌های من را نمی‌بینید، یعنی پکیج فعالی برای شما ثبت نشده است.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "پرداخت کارت‌به‌کارت و ارسال رسید",
+        "sort_order": 10,
+        "body": """برای خرید سرویس یا شارژ کیف پول، پرداخت کارت‌به‌کارت انجام می‌شود.
+
+مراحل:
+
+1. مبلغ دقیق را از ربات ببینید.
+2. شماره کارت نمایش داده‌شده را کپی کنید.
+3. دقیقاً همان مبلغ را کارت‌به‌کارت کنید.
+4. رسید را به‌صورت عکس یا فایل نگه دارید.
+5. رسید را در همان بخش پرداخت برای ربات ارسال کنید.
+6. منتظر بررسی ادمین فروش بمانید.
+
+نکات مهم:
+
+مبلغ را کم یا زیاد نکنید.
+رسید را جای دیگری نفرستید.
+از پایا یا پل استفاده نکنید مگر پشتیبانی گفته باشد.
+اگر برنامه پرداخت خطای محدودیت کارت داد، از موبایل‌بانک یا اینترنت‌بانک استفاده کنید.
+
+تا وقتی رسید تأیید نشود، پرداخت نهایی نیست.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "رسید منقضی یا رد شده یعنی چه؟",
+        "sort_order": 20,
+        "body": """رسید رد شده:
+یعنی ادمین فروش رسید را بررسی کرده ولی مشکلی وجود داشته است. مثلاً مبلغ اشتباه بوده، رسید واضح نبوده یا اطلاعات پرداخت با سفارش هماهنگ نبوده است.
+
+رسید منقضی شده:
+یعنی مهلت ارسال یا پیگیری رسید تمام شده است.
+
+چه کار کنم؟
+
+1. پیام ربات را کامل بخوانید.
+2. اگر دلیل رد شدن نوشته شده، همان را بررسی کنید.
+3. اگر نیاز به راهنمایی دارید، تیکت بزنید.
+4. شماره سفارش را برای پشتیبانی بفرستید.
+
+برای جلوگیری از مشکل:
+همیشه مبلغ دقیق را پرداخت کنید و رسید واضح بفرستید.""",
+    },
+    {
+        "category": "payment_wallet",
+        "title": "کیف پول چیست و چطور شارژ می‌شود؟",
+        "sort_order": 30,
+        "body": """کیف پول یعنی موجودی داخلی شما در ربات.
+
+با کیف پول می‌توانید بعداً سریع‌تر خرید انجام دهید.
+
+مراحل شارژ کیف پول:
+
+1. وارد بخش کیف پول شوید.
+2. گزینه افزایش موجودی را انتخاب کنید.
+3. مبلغ موردنظر را وارد کنید.
+4. پرداخت کارت‌به‌کارت انجام دهید.
+5. رسید را ارسال کنید.
+6. بعد از تأیید رسید، مبلغ به کیف پول اضافه می‌شود.
+
+نکته:
+شارژ کیف پول هم نیاز به تأیید رسید دارد. تا وقتی رسید تأیید نشود، موجودی اضافه نمی‌شود.""",
+    },
+    {
+        "category": "tickets",
+        "title": "چطور تیکت پشتیبانی بزنیم؟",
+        "sort_order": 10,
+        "body": """اگر مشکلی دارید که با آموزش‌ها حل نمی‌شود، تیکت بزنید.
+
+مراحل ثبت تیکت:
+
+1. وارد ربات شوید.
+2. روی «🎫 پشتیبانی / تیکت‌ها» بزنید.
+3. تیکت جدید را انتخاب کنید.
+4. موضوع مناسب را انتخاب کنید.
+5. عنوان کوتاه و واضح بنویسید.
+6. مشکل را کامل توضیح دهید.
+7. اگر عکس، ویدیو یا فایل لازم است، همان‌جا ارسال کنید.
+8. منتظر پاسخ پشتیبانی بمانید.
+
+برای پاسخ سریع‌تر این اطلاعات را بفرستید:
+
+نام سرویس
+نوع گوشی یا ویندوز
+نام برنامه اتصال
+اسکرین‌شات خطا
+زمان شروع مشکل
+کاری که قبل از مشکل انجام داده‌اید
+
+پیام‌هایی مثل «وصل نمیشه» کافی نیستند. هرچه توضیح کامل‌تر باشد، مشکل سریع‌تر حل می‌شود.""",
+    },
+    {
+        "category": "troubleshooting",
+        "title": "اگر سرویس وصل نشد چه کار کنیم؟",
+        "sort_order": 10,
+        "body": """اگر سرویس وصل نشد، قبل از تیکت زدن این مراحل را انجام دهید.
+
+1. اینترنت اصلی خود را بررسی کنید.
+2. ساب را آپدیت کنید.
+3. Real delay بزنید.
+4. سرورها را Sort کنید.
+5. سروری با delay کمتر انتخاب کنید.
+6. اتصال را خاموش و روشن کنید.
+7. یک سرور دیگر را امتحان کنید.
+8. تاریخ و حجم سرویس را در ربات بررسی کنید.
+
+در اندروید:
+برنامه را ببندید، اینترنت گوشی را خاموش و روشن کنید، بعد دوباره وصل شوید.
+
+در ویندوز:
+System Proxy را خاموش و روشن کنید و اگر لازم بود سرور دیگری انتخاب کنید.
+
+اگر هنوز مشکل حل نشد:
+تیکت بزنید و نام سرویس، نوع دستگاه، نام برنامه و اسکرین‌شات خطا را بفرستید.""",
+    },
+    {
+        "category": "troubleshooting",
+        "title": "سرورها نمایش داده نمی‌شوند یا ساب آپدیت نمی‌شود",
+        "sort_order": 20,
+        "body": """اگر لینک ساب را وارد کردید ولی سرورها نمایش داده نشدند:
+
+1. لینک ساب را دوباره از ربات کپی کنید.
+2. مطمئن شوید لینک را کامل کپی کرده‌اید.
+3. داخل برنامه گزینه Update subscription را بزنید.
+4. اینترنت اصلی دستگاه را بررسی کنید.
+5. اگر VPN یا proxy دیگری روشن است، خاموش کنید.
+6. برنامه را کامل ببندید و دوباره باز کنید.
+7. اگر نشد، لینک ساب قبلی را حذف و دوباره اضافه کنید.
+
+بعد از تمدید یا افزایش حجم:
+حتماً ساب را آپدیت کنید.
+
+اگر باز هم مشکل بود:
+اسکرین‌شات خطا را در تیکت بفرستید.""",
+    },
+    {
+        "category": "rules_security",
+        "title": "لینک ساب خود را برای دیگران نفرستید",
+        "sort_order": 10,
+        "body": """لینک ساب شما شخصی است.
+
+چرا نباید لینک ساب را منتشر کنید؟
+
+1. ممکن است دیگران از حجم شما استفاده کنند.
+2. ممکن است سرویس شما دچار اختلال شود.
+3. ممکن است امنیت حساب شما پایین بیاید.
+4. پیگیری مشکل برای پشتیبانی سخت‌تر می‌شود.
+
+لینک ساب را اینجاها نفرستید:
+
+گروه‌ها
+کانال‌ها
+سایت‌ها
+کامنت‌ها
+برای افراد ناشناس
+
+اگر فکر می‌کنید لینک شما دست کسی افتاده:
+از بخش سرویس‌های من بررسی کنید و اگر گزینه تغییر لینک دارید، لینک را تغییر دهید. اگر مطمئن نیستید، تیکت بزنید.""",
+    },
+]
+
+
+def reset_tutorials(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM tutorials")
+    conn.execute("DELETE FROM tutorial_categories")
+    try:
+        conn.execute("DELETE FROM sqlite_sequence WHERE name IN ('tutorials', 'tutorial_categories')")
+    except Exception:
+        pass
+
+
+def insert_category(conn: sqlite3.Connection, data: dict[str, Any], admin_id: int | None) -> int:
+    ts = now_iso()
+    cur = conn.execute(
+        """
+        INSERT INTO tutorial_categories
+        (title, description, sort_order, is_active, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?, ?)
+        """,
+        (data["title"], data["description"], int(data["sort_order"]), admin_id, ts, ts),
+    )
+    return int(cur.lastrowid)
+
+
+def insert_tutorial(conn: sqlite3.Connection, category_id: int, data: dict[str, Any], admin_id: int | None) -> int:
+    ts = now_iso()
+    cur = conn.execute(
+        """
+        INSERT INTO tutorials
+        (category_id, title, body, media_type, media_file_id, media_file_unique_id,
+         sort_order, is_active, created_by, created_at, updated_at)
+        VALUES (?, ?, ?, NULL, NULL, NULL, ?, 1, ?, ?, ?)
+        """,
+        (category_id, data["title"], data["body"].strip(), int(data["sort_order"]), admin_id, ts, ts),
+    )
+    return int(cur.lastrowid)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Reset and seed HowTooSee tutorial categories/tutorials.")
+    parser.add_argument("--project-dir", default="/home/PasarguardTelegramBot")
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--admin-id", type=int, default=None)
+    parser.add_argument("--no-backup", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args()
+
+    project_dir = Path(args.project_dir).resolve()
+    dotenv = read_dotenv(project_dir / ".env")
+    admin_id = args.admin_id or parse_first_admin_id(dotenv.get("ADMIN_CHAT_IDS") or os.getenv("ADMIN_CHAT_IDS"))
+    db_path = resolve_db_path(project_dir, args.db)
+
+    if not db_path.exists():
+        print(f"❌ دیتابیس پیدا نشد: {db_path}")
+        return 2
+
+    if not args.no_backup and not args.dry_run:
+        backup_path = db_path.with_suffix(db_path.suffix + f".tutorial_reseed_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        shutil.copy2(db_path, backup_path)
+        print(f"✅ بک‌آپ ساخته شد: {backup_path}")
+
+    print(f"📍 project_dir = {project_dir}")
+    print(f"📍 db_path     = {db_path}")
+    print(f"📍 admin_id    = {admin_id or '-'}")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    try:
+        with closing(conn):
+            ensure_schema(conn)
+            reset_tutorials(conn)
+
+            category_ids: dict[str, int] = {}
+            for cat in CATEGORIES:
+                category_ids[cat["key"]] = insert_category(conn, cat, admin_id)
+
+            for tut in TUTORIALS:
+                insert_tutorial(conn, category_ids[tut["category"]], tut, admin_id)
+
+            if args.dry_run:
+                conn.rollback()
+                print("🧪 dry-run انجام شد؛ چیزی ذخیره نشد.")
+            else:
+                conn.commit()
+
+            print("✅ آموزش‌ها از صفر چیده شدند.")
+            print(f"📂 دسته‌ها: {len(CATEGORIES)}")
+            print(f"📘 آموزش‌ها: {len(TUTORIALS)}")
+
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"❌ خطا: {exc}")
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 

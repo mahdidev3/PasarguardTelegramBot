@@ -718,3 +718,5 @@ async def admin_ticket_file_send(callback: CallbackQuery) -> None:
         await callback.answer("فایل ارسال شد.")
     except Exception:
         await callback.answer("ارسال فایل ناموفق بود. شاید فایل از سمت تلگرام در دسترس نباشد.", show_alert=True)
+
+

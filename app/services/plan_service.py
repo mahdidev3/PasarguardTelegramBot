@@ -40,14 +40,16 @@ DEFAULT_CATEGORIES: list[tuple[str, str, str, int]] = [
 ]
 
 DEFAULT_PLANS: list[SeedPlan] = [
-    SeedPlan("m_10", "۱۰ گیگابایت | یک‌ماهه", 10, 31, 100_000, "monthly", "اقتصادی"),
-    SeedPlan("m_20", "۲۰ گیگابایت | یک‌ماهه", 20, 31, 190_000, "monthly", "محبوب"),
-    SeedPlan("m_30", "۳۰ گیگابایت | یک‌ماهه", 30, 31, 270_000, "monthly", "متعادل"),
-    SeedPlan("m_40", "۴۰ گیگابایت | یک‌ماهه", 40, 31, 340_000, "monthly", "حرفه‌ای"),
-    SeedPlan("m_50", "۵۰ گیگابایت | یک‌ماهه", 50, 31, 400_000, "monthly", "پرفروش"),
-    SeedPlan("q_60", "۶۰ گیگابایت | سه‌ماهه", 60, 93, 540_000, "quarterly", "سه‌ماهه"),
-    SeedPlan("q_100", "۱۰۰ گیگابایت | سه‌ماهه", 100, 93, 850_000, "quarterly", "پیشنهادی"),
-    SeedPlan("q_150", "۱۵۰ گیگابایت | سه‌ماهه", 150, 93, 1_180_000, "quarterly", "حجیم"),
+    # قیمت‌های پیش‌فرض طبق لیست جدید ارسالی.
+    SeedPlan("m_10", "۱۰ گیگابایت | یک‌ماهه", 10, 31, 79_000, "monthly", "اقتصادی"),
+    SeedPlan("m_20", "۲۰ گیگابایت | یک‌ماهه", 20, 31, 139_000, "monthly", "محبوب"),
+    SeedPlan("m_30", "۳۰ گیگابایت | یک‌ماهه", 30, 31, 189_000, "monthly", "متعادل"),
+    SeedPlan("m_40", "۴۰ گیگابایت | یک‌ماهه", 40, 31, 239_000, "monthly", "حرفه‌ای"),
+    SeedPlan("m_50", "۵۰ گیگابایت | یک‌ماهه", 50, 31, 279_000, "monthly", "پرفروش"),
+    SeedPlan("m_80", "۸۰ گیگابایت | یک‌ماهه", 80, 31, 399_000, "monthly", "حجیم"),
+    SeedPlan("q_60", "۶۰ گیگابایت | سه‌ماهه", 60, 93, 489_000, "quarterly", "سه‌ماهه"),
+    SeedPlan("q_100", "۱۰۰ گیگابایت | سه‌ماهه", 100, 93, 749_000, "quarterly", "پیشنهادی"),
+    SeedPlan("q_150", "۱۵۰ گیگابایت | سه‌ماهه", 150, 93, 999_000, "quarterly", "حجیم"),
 ]
 
 DEFAULT_ADDONS: list[SeedAddon] = [
@@ -351,3 +353,5 @@ async def sync_legacy_catalog_from_db(legacy_module: Any) -> None:
         legacy_module.DATA_ADDON_PACKAGES.clear()
         for a in addons:
             legacy_module.DATA_ADDON_PACKAGES[a.key] = legacy_module.DataAddon(a.key, a.title, a.data_gb, a.price, a.badge or "")
+
+

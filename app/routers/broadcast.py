@@ -243,3 +243,5 @@ async def admin_broadcast_send_confirmed(message: Message, state: FSMContext) ->
     await audit_log(message.from_user.id, "BROADCAST_SEND", "broadcast", campaign_id, str(result))
     stats = await campaign_stats(campaign_id)
     await message.answer(header("✅ ارسال همگانی تمام شد", f"#{campaign_id}") + f"موفق: <b>{result.get('sent', 0)}</b>\nناموفق: <b>{result.get('failed', 0)}</b>\nجزئیات وضعیت: <code>{h(stats)}</code>", reply_markup=broadcast_home_kb())
+
+

@@ -21,3 +21,5 @@ SyslogIdentifier=pasarguardtelegrambot
 
 [Install]
 WantedBy=multi-user.target
+
+

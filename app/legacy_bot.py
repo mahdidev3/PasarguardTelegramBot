@@ -104,6 +104,7 @@ def parse_id_set(value: str) -> set[int]:
 
 BOOTSTRAP_SUPER_ADMIN_IDS = parse_id_set(ADMIN_CHAT_IDS_RAW)
 SALES_ADMIN_CHAT_IDS = parse_id_set(SALES_ADMIN_CHAT_IDS_RAW)
+DEFAULT_SALES_ADMIN_DISPLAY_NAMES: dict[int, str] = {483137754: "امیر صادقی"}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Create .env from .env.example and set your bot token.")
@@ -920,13 +921,20 @@ def ensure_admin_schema() -> None:
                 (admin_id, str(admin_id), now_iso()),
             )
         for admin_id in SALES_ADMIN_CHAT_IDS:
+            sales_display_name = DEFAULT_SALES_ADMIN_DISPLAY_NAMES.get(admin_id, str(admin_id))
             conn.execute(
                 """
                 INSERT INTO admins (telegram_id, role, display_name, added_by, is_active, created_at)
                 VALUES (?, 'sales', ?, NULL, 1, ?)
-                ON CONFLICT(telegram_id) DO UPDATE SET role = CASE WHEN role = 'super' THEN role ELSE 'sales' END, is_active = 1, display_name = COALESCE(admins.display_name, excluded.display_name)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    role = CASE WHEN role = 'super' THEN role ELSE 'sales' END,
+                    is_active = 1,
+                    display_name = CASE
+                        WHEN admins.display_name IS NULL OR admins.display_name = CAST(admins.telegram_id AS TEXT) THEN excluded.display_name
+                        ELSE admins.display_name
+                    END
                 """,
-                (admin_id, str(admin_id), now_iso()),
+                (admin_id, sales_display_name, now_iso()),
             )
         defaults = {
             "bot_locked": "0",
@@ -1412,6 +1420,50 @@ def coupon_usage_generic_error() -> str:
     return "این کد منقضی شده، برای شما نیست یا قابل استفاده نیست."
 
 
+COUPON_OPERATION_LABELS: dict[str, str] = {
+    "service_purchase": "خرید سرویس",
+    "addon": "افزایش حجم",
+    "renewal": "تمدید سرویس",
+    "package_purchase": "خرید پک",
+    "package_sub": "ساخت ساب از پک",
+}
+
+
+def order_coupon_operation(order_or_plan_key: sqlite3.Row | str | None) -> str | None:
+    """Return where a coupon is allowed to be used.
+
+    مهم: شارژ کیف پول عمداً اینجا None برمی‌گرداند؛ کد تخفیف برای خرج‌کردن
+    از کیف پول است، نه برای شارژ کیف پول.
+    """
+    if order_or_plan_key is None:
+        return None
+    try:
+        plan_key = str(order_or_plan_key["plan_key"])  # type: ignore[index]
+    except Exception:
+        plan_key = str(order_or_plan_key)
+    if plan_key.startswith("wallet_topup:"):
+        return None
+    if plan_key.startswith("addon:"):
+        return "addon"
+    if plan_key.startswith("renew:"):
+        return "renewal"
+    if plan_key.startswith("pkg_assign:"):
+        return "package_purchase"
+    if plan_key.startswith("pkg_sub:"):
+        return "package_sub"
+    if plan_key in PLANS and is_public_paid_plan(PLANS[plan_key]):
+        return "service_purchase"
+    return None
+
+
+def coupon_order_applicable(order_or_plan_key: sqlite3.Row | str | None) -> bool:
+    return order_coupon_operation(order_or_plan_key) is not None
+
+
+def coupon_operation_label(value: str | None) -> str:
+    return COUPON_OPERATION_LABELS.get(str(value or ""), "نامشخص")
+
+
 def safe_json_loads(value: Any, default: Any) -> Any:
     try:
         if not value:
@@ -1450,6 +1502,9 @@ def coupon_clause_label(clause: dict[str, Any]) -> str:
     elif ctype == "admin_roles":
         roles = ", ".join(clause.get("roles") or [])
         label = f"ادمین با نقش‌های: {roles or 'نامشخص'}"
+    elif ctype == "order_operations":
+        ops = [coupon_operation_label(op) for op in (clause.get("operations") or [])]
+        label = "محل مصرف: " + ("، ".join(ops) if ops else "نامشخص")
     else:
         label = "شرط ناشناخته"
     return f"نه ({label})" if clause.get("negate") else label
@@ -1496,12 +1551,24 @@ def coupon_condition_builder_kb() -> InlineKeyboardMarkup:
 
 def coupon_condition_type_kb() -> InlineKeyboardMarkup:
     return inline([
+        [("🧾 محل مصرف کد", "adm_coupon_cond_type:order_operations")],
         [("🆕 خرید اول", "adm_coupon_cond_type:first_purchase")],
         [("📣 عضو یک کانال خاص", "adm_coupon_cond_type:channel_member")],
         [("👥 داخل لیست چت‌آیدی", "adm_coupon_cond_type:user_ids")],
         [("👮 نوع ادمین", "adm_coupon_cond_type:admin_roles")],
         [("⬅️ شرایط کد", "adm_coupon_condition_builder"), ("👑 منوی ادمین", "adm_home")],
     ])
+
+
+def coupon_order_operations_kb(selected: list[str] | None = None) -> InlineKeyboardMarkup:
+    selected_set = set(selected or [])
+    rows: list[list[tuple[str, str]]] = []
+    for op, label in COUPON_OPERATION_LABELS.items():
+        icon = "✅" if op in selected_set else "☐"
+        rows.append([(f"{icon} {label}", f"adm_coupon_cond_op_toggle:{op}")])
+    rows.append([("✅ ثبت محل‌های مصرف", "adm_coupon_cond_op_done")])
+    rows.append([("⬅️ انتخاب نوع شرط", "adm_coupon_cond_type_back"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
 
 
 def coupon_condition_channel_select_kb() -> InlineKeyboardMarkup:
@@ -1523,7 +1590,7 @@ def coupon_condition_admin_roles_kb(selected: list[str] | None = None) -> Inline
     return inline(rows)
 
 
-async def coupon_clause_matches(clause: dict[str, Any], telegram_id: int, bot: Bot | None) -> bool:
+async def coupon_clause_matches(clause: dict[str, Any], telegram_id: int, bot: Bot | None, order: sqlite3.Row | None = None) -> bool:
     ctype = str(clause.get("type") or "")
     result = False
     if ctype == "first_purchase":
@@ -1536,19 +1603,22 @@ async def coupon_clause_matches(clause: dict[str, Any], telegram_id: int, bot: B
     elif ctype == "admin_roles":
         role = admin_role(telegram_id)
         result = bool(role and role in set(clause.get("roles") or []))
+    elif ctype == "order_operations":
+        allowed = {str(x) for x in (clause.get("operations") or [])}
+        result = bool(order and order_coupon_operation(order) in allowed)
     if clause.get("negate"):
         return not result
     return result
 
 
-async def coupon_conditions_match(condition: dict[str, Any] | None, telegram_id: int, bot: Bot | None) -> bool:
+async def coupon_conditions_match(condition: dict[str, Any] | None, telegram_id: int, bot: Bot | None, order: sqlite3.Row | None = None) -> bool:
     groups = coupon_condition_groups(condition)
     if not groups:
         return True
     for group in groups:
         ok = True
         for clause in group:
-            if not await coupon_clause_matches(clause, telegram_id, bot):
+            if not await coupon_clause_matches(clause, telegram_id, bot, order):
                 ok = False
                 break
         if ok:
@@ -1559,6 +1629,8 @@ async def coupon_conditions_match(condition: dict[str, Any] | None, telegram_id:
 async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row, bot: Bot | None = None) -> tuple[Optional[sqlite3.Row], str]:
     if setting_get("coupon_enabled", "1") != "1":
         return None, coupon_usage_generic_error()
+    if not coupon_order_applicable(order):
+        return None, "کد تخفیف برای شارژ کیف پول نیست؛ فقط هنگام خرج‌کردن از کیف پول برای خرید/تمدید/افزایش حجم/پکیج قابل استفاده است."
     code = (code or "").strip().upper()
     row = coupon_row(code)
     if not row or not int(row["active"]):
@@ -1580,7 +1652,7 @@ async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.
 
     condition = safe_json_loads(row["condition_json"] if row_has(row, "condition_json") else None, None)
     if condition:
-        if not await coupon_conditions_match(condition, telegram_id, bot):
+        if not await coupon_conditions_match(condition, telegram_id, bot, order):
             return None, coupon_usage_generic_error()
     else:
         # Backward compatibility for old coupons created before this hotfix.
@@ -2868,12 +2940,16 @@ def wallet_shortfall(payable: int, wallet_balance: int) -> int:
     return max(payable - wallet_balance, WALLET_MIN_TOPUP)
 
 
-def insufficient_wallet_kb(order_id: int, suggested_amount: int, back_callback: str) -> InlineKeyboardMarkup:
-    return inline([
+def insufficient_wallet_kb(order_id: int, suggested_amount: int, back_callback: str, *, allow_coupon: bool = True) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if allow_coupon:
+        rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
+    rows.extend([
         [(f"➕ شارژ پیشنهادی کیف پول: {fmt_money(suggested_amount)}", f"wallet_topup_for:{order_id}:{suggested_amount}")],
         [("💰 ورود به کیف پول", "wallet")],
         [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")],
     ])
+    return inline(rows)
 
 
 def transactions_kb(orders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
@@ -3202,9 +3278,50 @@ def admin_order_kb(order: sqlite3.Row) -> InlineKeyboardMarkup:
 def admin_coupon_kb() -> InlineKeyboardMarkup:
     return inline([
         [("➕ ساخت/ویرایش کد", "adm_coupon_add"), ("🧩 ویرایش شرایط کد", "adm_coupon_edit_conditions")],
-        [("⛔ غیرفعال کردن کد", "adm_coupon_disable"), ("📋 کدهای فعال", "adm_coupon_list")],
+        [("📣 اشتراک کد تخفیف", "adm_coupon_share"), ("📋 کدهای فعال", "adm_coupon_list")],
+        [("⛔ غیرفعال کردن کد", "adm_coupon_disable")],
         [("👑 منوی ادمین", "adm_home")],
     ])
+
+
+
+
+def active_coupon_rows(limit: int = 30) -> list[sqlite3.Row]:
+    with closing(db.connect()) as conn:
+        return list(conn.execute("SELECT * FROM coupons WHERE active = 1 ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall())
+
+
+def admin_coupon_share_list_kb() -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for c in active_coupon_rows(30):
+        rows.append([(f"🎟 {c['code']} — {c['percent']}٪", f"adm_coupon_share:{c['code']}")])
+    rows.append([("⬅️ کدهای تخفیف", "adm_coupons"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def coupon_share_message(row: sqlite3.Row) -> str:
+    condition = row["condition_label"] if row_has(row, "condition_label") and row["condition_label"] else render_coupon_condition_label(safe_json_loads(row["condition_json"] if row_has(row, "condition_json") else None, None))
+    limit = row["usage_limit"] if row["usage_limit"] is not None else "نامحدود"
+    expires = "بدون تاریخ انقضا" if not row["expires_at"] else fmt_jalali_datetime(row["expires_at"])
+    min_order = int(row["min_order_amount"] if row_has(row, "min_order_amount") and row["min_order_amount"] is not None else 0)
+    min_line = f"\n💳 حداقل مبلغ سفارش: {fmt_money(min_order)}" if min_order else ""
+    max_amount = row["max_discount_amount"] if row_has(row, "max_discount_amount") else None
+    max_line = f"\n🔒 سقف مبلغ تخفیف: {fmt_money(int(max_amount))}" if max_amount is not None else ""
+    return (
+        "🎁 <b>هدیه ویژه HowTooSee</b>\n\n"
+        f"با کد زیر می‌توانید <b>{fmt_number(int(row['percent']))}٪ تخفیف</b> بگیرید:\n"
+        f"<code>{h(row['code'])}</code>\n\n"
+        "روش استفاده:\n"
+        "1️⃣ سرویس/تمدید/افزایش حجم/پکیج موردنظر را انتخاب کنید.\n"
+        "2️⃣ قبل از پرداخت از کیف پول، گزینه «کد تخفیف دارم» را بزنید.\n"
+        "3️⃣ کد را وارد کنید و بعد از کیف پول پرداخت کنید.\n\n"
+        f"📌 شرایط: {h(condition)}\n"
+        f"👤 سقف مصرف هر کاربر: {fmt_number(int(row['per_user_limit'] or 1))} بار\n"
+        f"🔢 سقف مصرف کل: {h(limit)}\n"
+        f"⏳ اعتبار: {h(expires)}"
+        f"{min_line}{max_line}\n\n"
+        f"{h(BRAND_NAME)}"
+    )
 
 
 def admin_bot_lock_kb() -> InlineKeyboardMarkup:
@@ -3520,7 +3637,7 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
         text += f"💰 مبلغ شارژ کیف پول: <b>{fmt_money(amount)}</b>\n"
         text += discount_lines(details)
         text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n\n"
-        text += "اگر کد تخفیف دارید، ابتدا آن را اعمال کنید. سپس دکمه پرداخت را بزنید و در مرحله بعد روش پرداخت را انتخاب کنید."
+        text += "کد تخفیف برای شارژ کیف پول اعمال نمی‌شود. کد تخفیف زمانی استفاده می‌شود که بخواهید از کیف پول برای خرید، تمدید، افزایش حجم یا پکیج خرج کنید."
         return text, "wallet", payable
 
     if plan_key.startswith("pkg_assign:"):
@@ -3531,7 +3648,7 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
             text += user_package_text(user_package) + "\n"
         text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
         text += f"💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\n"
-        text += "این سفارش کد تخفیف ندارد و فقط از کیف پول پرداخت می‌شود."
+        text += "اگر برای خرید پکیج کد تخفیف دارید، قبل از پرداخت آن را اعمال کنید. پرداخت نهایی فقط از کیف پول انجام می‌شود."
         return text, f"pkg_view:{user_package_id}", payable
 
     if plan_key.startswith("pkg_sub:"):
@@ -3545,7 +3662,7 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
             text += f"⏳ اعتبار: <b>{fmt_number(int(item['days']))} روز</b>\n"
         text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
         text += f"💼 موجودی کیف پول: <b>{fmt_money(int(user['wallet_balance']))}</b>\n\n"
-        text += "این سفارش کد تخفیف ندارد و فقط از کیف پول پرداخت می‌شود."
+        text += "اگر برای ساخت ساب از پکیج کد تخفیف دارید، قبل از پرداخت آن را اعمال کنید. پرداخت نهایی فقط از کیف پول انجام می‌شود."
         return text, f"pkg_view:{user_package_id}", payable
 
     if plan_key.startswith("addon:"):
@@ -4379,6 +4496,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
     ok, reason = await order_activation_preflight(order, telegram_id)
     plan_key = str(order["plan_key"])
     is_wallet_topup = plan_key.startswith("wallet_topup:")
+    allow_coupon = coupon_order_applicable(order)
     wallet_balance = int(user["wallet_balance"] or 0)
     if not ok:
         text += "\n\n⚠️ <b>این سفارش فعلاً قابل پرداخت نیست.</b>\n" + h(reason)
@@ -4400,7 +4518,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
                 f"کمبود موجودی: <b>{fmt_money(shortage)}</b>\n"
                 f"حداقل شارژ کیف پول <b>{fmt_money(WALLET_MIN_TOPUP)}</b> است؛ برای ادامه پیشنهاد می‌شود <b>{fmt_money(suggested)}</b> شارژ کنید."
             )
-        markup = insufficient_wallet_kb(order_id, suggested, back_callback)
+        markup = insufficient_wallet_kb(order_id, suggested, back_callback, allow_coupon=allow_coupon)
     else:
         markup = order_payment_kb(
             order_id,
@@ -4409,7 +4527,7 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
             back_callback,
             "⬅️ بازگشت",
             allow_wallet=not is_wallet_topup,
-            allow_coupon=not plan_key.startswith("pkg_"),
+            allow_coupon=allow_coupon,
             is_wallet_topup=is_wallet_topup,
         )
     if isinstance(target, CallbackQuery):
@@ -4633,9 +4751,12 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
     if not order or order["status"] != "pending":
         await callback.answer("سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
+    if not coupon_order_applicable(order):
+        await callback.answer("کد تخفیف برای شارژ کیف پول نیست؛ فقط هنگام خرج‌کردن از کیف پول قابل استفاده است.", show_alert=True)
+        return
     await state.set_state(CouponStates.waiting_code)
     await state.update_data(order_id=order_id)
-    text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید."
+    text = header("🎟 کد تخفیف") + "کد تخفیفی که از پشتیبانی یا کمپین دریافت کرده‌اید را وارد کنید.\n\nاین کد فقط روی همین سفارش اعمال می‌شود و برای شارژ کیف پول نیست."
     await edit_or_answer(callback, text, coupon_cancel_kb(order_id))
 
 
@@ -4876,6 +4997,7 @@ async def complete_package_assignment_order(callback: CallbackQuery, telegram_id
         wallet_used = payable
     mark_user_package_active(user_package_id, int(order["id"]))
     mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used)
+    finalize_coupon_usage(int(order["id"]), telegram_id)
     user_package = user_package_by_id(user_package_id, telegram_id) or user_package
     await edit_or_answer(
         callback,
@@ -4948,6 +5070,7 @@ async def complete_package_sub_order(callback: CallbackQuery, telegram_id: int, 
         return
     record_package_subscription(user_package_id, item_id, service_id, telegram_id, int(order["id"]))
     mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used, service_id=service_id)
+    finalize_coupon_usage(int(order["id"]), telegram_id)
     service = db.get_service(service_id, telegram_id)
     await edit_or_answer(callback, header("✅ ساب پکیج ساخته شد", service_name) + service_text(service), service_details_kb(service))
 
@@ -7703,6 +7826,10 @@ async def admin_coupon_condition_type(callback: CallbackQuery, state: FSMContext
         await state.update_data(coupon=coupon)
         await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
         return
+    if ctype == "order_operations":
+        await state.update_data(coupon_operation_selection=[])
+        await edit_or_answer(callback, header("محل مصرف کد") + "مشخص کنید این کد در کدام نوع خرج‌کردن از کیف پول قابل استفاده باشد.", coupon_order_operations_kb([]))
+        return
     if ctype == "channel_member":
         channels = list_required_channels(active_only=True)
         if not channels:
@@ -7801,6 +7928,44 @@ async def admin_coupon_condition_role_done(callback: CallbackQuery, state: FSMCo
     condition = add_coupon_clause(condition, {"type": "admin_roles", "roles": selected}, mode)
     coupon["conditions"] = condition
     await state.update_data(coupon=coupon, coupon_role_selection=[])
+    await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_cond_op_toggle:"))
+async def admin_coupon_condition_operation_toggle(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    op = callback.data.split(":", 1)[1]
+    if op not in COUPON_OPERATION_LABELS:
+        await callback.answer("محل مصرف معتبر نیست.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(data.get("coupon_operation_selection") or [])
+    if op in selected:
+        selected.remove(op)
+    else:
+        selected.append(op)
+    await state.update_data(coupon_operation_selection=selected)
+    await edit_or_answer(callback, header("محل مصرف کد") + "مشخص کنید این کد در کدام نوع خرج‌کردن از کیف پول قابل استفاده باشد.", coupon_order_operations_kb(selected))
+
+
+@router.callback_query(F.data == "adm_coupon_cond_op_done")
+async def admin_coupon_condition_operation_done(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    data = await state.get_data()
+    selected = list(data.get("coupon_operation_selection") or [])
+    if not selected:
+        await callback.answer("حداقل یک محل مصرف را انتخاب کنید.", show_alert=True)
+        return
+    coupon = dict(data.get("coupon") or {})
+    condition = coupon.get("conditions") or empty_coupon_condition()
+    mode = str(data.get("coupon_cond_add_mode") or "and")
+    condition = add_coupon_clause(condition, {"type": "order_operations", "operations": selected}, mode)
+    coupon["conditions"] = condition
+    await state.update_data(coupon=coupon, coupon_operation_selection=[])
     await edit_or_answer(callback, coupon_condition_preview_text(condition), coupon_condition_builder_kb())
 
 
@@ -7980,6 +8145,33 @@ async def admin_coupon_disable_finish(message: Message, state: FSMContext) -> No
     ok = disable_coupon_admin(code, message.from_user.id if message.from_user else 0)
     await state.clear()
     await message.answer((header("✅ کد غیرفعال شد") if ok else header("❌ کد پیدا نشد")) + f"<code>{h(code)}</code>", reply_markup=admin_coupon_kb())
+
+
+@router.callback_query(F.data == "adm_coupon_share")
+async def admin_coupon_share(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    coupons = active_coupon_rows(30)
+    text = header("📣 اشتراک کد تخفیف")
+    text += "یکی از کدهای فعال را انتخاب کنید تا متن آماده و زیبا برای اشتراک‌گذاری ساخته شود." if coupons else "کد تخفیف فعالی برای اشتراک‌گذاری وجود ندارد."
+    await edit_or_answer(callback, text, admin_coupon_share_list_kb())
+
+
+@router.callback_query(F.data.startswith("adm_coupon_share:"))
+async def admin_coupon_share_selected(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "coupons"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    code = callback.data.split(":", 1)[1].strip().upper()
+    row = coupon_row(code)
+    if not row or not int(row["active"]):
+        await callback.answer("این کد فعال نیست یا پیدا نشد.", show_alert=True)
+        return
+    text = header("📣 متن آماده اشتراک‌گذاری", code)
+    text += "پیام زیر را کپی و برای کاربر/کانال ارسال کنید:\n\n"
+    text += coupon_share_message(row)
+    await edit_or_answer(callback, text, inline([[("⬅️ انتخاب کد دیگر", "adm_coupon_share")], [("👑 منوی ادمین", "adm_home")]]))
 
 
 @router.callback_query(F.data == "adm_coupon_list")
@@ -9435,3 +9627,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+

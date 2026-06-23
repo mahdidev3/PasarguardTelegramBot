@@ -109,3 +109,5 @@ def admin_ticket_files_kb(ticket_id: int, file_messages: list[object]) -> Inline
 
 def confirm_cancel_kb(back_callback: str) -> InlineKeyboardMarkup:
     return inline([[('❌ لغو', back_callback), ('👑 منوی ادمین', 'adm_home')]])
+
+

@@ -115,3 +115,5 @@ async def build_all_reports(callback: CallbackQuery) -> None:
     await audit_log(callback.from_user.id, "REPORT_EXPORT_ALL", "report", "all", "format=zip/csv")
     if callback.message:
         await callback.message.answer_document(FSInputFile(Path(path)), caption="🗜 همه گزارش‌ها به صورت CSV داخل فایل ZIP")
+
+

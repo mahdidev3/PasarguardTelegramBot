@@ -451,3 +451,5 @@ def render_backup_summary(manifest: dict[str, Any]) -> str:
         f"⏳ رسید منتظر ارسال: {deadlines.get('receipts_waiting', 0)} | رسید منتظر بررسی: {deadlines.get('receipts_pending_review', 0)} | منقضی‌شده: {deadlines.get('receipts_expired', 0)}\n"
         f"🔌 Pasarguard: desired {pasarguard.get('desired_users', 0)} user / actual {pasarguard.get('actual_users', 0)} user"
     )
+
+
