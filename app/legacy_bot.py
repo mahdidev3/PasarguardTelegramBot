@@ -973,6 +973,10 @@ def ensure_admin_schema() -> None:
                 (key, value, now_iso()),
             )
         conn.commit()
+    try:
+        cleanup_duplicate_coupon_reservations_on_boot()
+    except Exception:
+        logger.exception("failed to cleanup duplicate coupon reservations")
 
 
 def setting_get(key: str, default: str = "") -> str:
@@ -1183,7 +1187,9 @@ def list_orders_admin(limit: int = 20, status: Optional[str] = None) -> list[sql
 
 def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید دستی ادمین") -> Optional[int]:
     order = get_order_any(order_id)
-    if not order or order["status"] == "paid":
+    if not order or str(order["status"]) in {"paid", "processing"}:
+        return None
+    if not reserve_order_for_admin_payment(order_id):
         return None
     telegram_id = int(order["user_telegram_id"])
     plan_key = str(order["plan_key"])
@@ -1191,6 +1197,7 @@ def set_order_paid_admin(order_id: int, admin_id: int, method: str = "تأیید
     service_id: Optional[int] = None
     if plan_key.startswith("wallet_topup:"):
         db.add_wallet(telegram_id, int(order["amount"]), "card_topup", f"شارژ کیف پول با تأیید رسید سفارش #{order_id}", admin_id)
+        service_id = 0  # success sentinel for wallet topup; there is no service row
     elif plan_key.startswith("pkg_assign:"):
         try:
             user_package_id = int(plan_key.split(":", 1)[1])
@@ -1695,6 +1702,172 @@ async def coupon_conditions_match(condition: dict[str, Any] | None, telegram_id:
     return False
 
 
+ACTIVE_COUPON_RESERVATION_STATUSES = {"draft", "pending", "payment_rejected", "waiting_receipt", "receipt_pending", "processing"}
+EDITABLE_COUPON_RELEASE_STATUSES = {"draft", "pending", "payment_rejected"}
+ORDER_PROCESSING_STATUS = "processing"
+
+
+def coupon_active_reservation_count(code: str, telegram_id: Optional[int] = None, exclude_order_id: Optional[int] = None, before_order_id: Optional[int] = None) -> int:
+    """Count non-terminal orders that are currently reserving a coupon.
+
+    coupon_usages is written only after final successful payment. Draft orders with a coupon
+    must still reserve that coupon; otherwise a per-user/one-time code can be applied to many
+    saved orders and later completed one by one.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return 0
+    placeholders = ",".join("?" for _ in ACTIVE_COUPON_RESERVATION_STATUSES)
+    params: list[Any] = [code, *ACTIVE_COUPON_RESERVATION_STATUSES]
+    sql = f"SELECT COUNT(*) AS c FROM orders WHERE UPPER(COALESCE(coupon_code, '')) = ? AND status IN ({placeholders})"
+    if telegram_id is not None:
+        sql += " AND user_telegram_id = ?"
+        params.append(int(telegram_id))
+    if exclude_order_id is not None:
+        sql += " AND id != ?"
+        params.append(int(exclude_order_id))
+    if before_order_id is not None:
+        sql += " AND id < ?"
+        params.append(int(before_order_id))
+    with closing(db.connect()) as conn:
+        row = conn.execute(sql, tuple(params)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def release_editable_coupon_reservations(code: str, telegram_id: int, keep_order_id: int) -> int:
+    """Cancel other editable orders by this user that reserved the same coupon.
+
+    We cancel only safe/editable states. Orders already in receipt review/processing are not
+    silently touched; validation will block the new usage instead.
+    """
+    code = (code or "").strip().upper()
+    if not code:
+        return 0
+    placeholders = ",".join("?" for _ in EDITABLE_COUPON_RELEASE_STATUSES)
+    params: list[Any] = [
+        f"کد تخفیف {code} روی سفارش #{keep_order_id} منتقل/رزرو شد؛ این سفارش برای جلوگیری از مصرف چندباره کد لغو شد.",
+        int(telegram_id),
+        code,
+        int(keep_order_id),
+        *EDITABLE_COUPON_RELEASE_STATUSES,
+    ]
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            f"""
+            UPDATE orders
+            SET status = 'cancelled', admin_note = ?
+            WHERE user_telegram_id = ?
+              AND UPPER(COALESCE(coupon_code, '')) = ?
+              AND id != ?
+              AND status IN ({placeholders})
+            """,
+            tuple(params),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def cleanup_duplicate_coupon_reservations_on_boot() -> int:
+    """One-time safety cleanup for duplicates created before the reservation fix.
+
+    Keeps the newest editable draft for each (user, coupon) pair and cancels the older
+    editable ones. Orders already submitted/processing are left untouched.
+    """
+    placeholders = ",".join("?" for _ in EDITABLE_COUPON_RELEASE_STATUSES)
+    cancelled = 0
+    with closing(db.connect()) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT user_telegram_id, UPPER(coupon_code) AS code, COUNT(*) AS c, MAX(id) AS keep_id
+            FROM orders
+            WHERE coupon_code IS NOT NULL AND TRIM(coupon_code) != ''
+              AND status IN ({placeholders})
+            GROUP BY user_telegram_id, UPPER(coupon_code)
+            HAVING COUNT(*) > 1
+            """,
+            tuple(EDITABLE_COUPON_RELEASE_STATUSES),
+        ).fetchall()
+        for row in rows:
+            code = str(row["code"]).upper()
+            keep_id = int(row["keep_id"])
+            user_id = int(row["user_telegram_id"])
+            cur = conn.execute(
+                f"""
+                UPDATE orders
+                SET status = 'cancelled',
+                    admin_note = COALESCE(?, admin_note)
+                WHERE user_telegram_id = ?
+                  AND UPPER(coupon_code) = ?
+                  AND id != ?
+                  AND status IN ({placeholders})
+                """,
+                (
+                    f"لغو خودکار سفارش تکراری برای جلوگیری از رزرو چندباره کد تخفیف {code}; سفارش #{keep_id} باقی ماند.",
+                    user_id,
+                    code,
+                    keep_id,
+                    *EDITABLE_COUPON_RELEASE_STATUSES,
+                ),
+            )
+            cancelled += int(cur.rowcount or 0)
+        conn.commit()
+    if cancelled:
+        logger.warning("coupon reservation cleanup cancelled %s duplicate draft orders", cancelled)
+    return cancelled
+
+
+def order_discount_components(order: sqlite3.Row) -> dict[str, int | str | None]:
+    coupon_discount = int(order["coupon_discount"] if row_has(order, "coupon_discount") and order["coupon_discount"] is not None else 0)
+    total_discount = int(order["discount_amount"] or 0)
+    referral_discount = max(total_discount - coupon_discount, 0)
+    coupon_code = str(order["coupon_code"]).upper() if row_has(order, "coupon_code") and order["coupon_code"] else None
+    return {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": coupon_code}
+
+
+def compute_order_coupon_discount(order: sqlite3.Row, coupon: sqlite3.Row) -> tuple[int, int, int]:
+    amount = int(order["amount"] or 0)
+    parts = order_discount_components(order)
+    referral_discount = int(parts.get("referral") or 0)
+    if not int(coupon["stack_with_referral"] or 1):
+        referral_discount = 0
+    base_for_coupon = max(amount - referral_discount, 0)
+    coupon_discount = int(base_for_coupon * int(coupon["percent"]) / 100)
+    if row_has(coupon, "max_discount_amount") and coupon["max_discount_amount"] is not None:
+        coupon_discount = min(coupon_discount, int(coupon["max_discount_amount"]))
+    max_discount_percent = int(
+        coupon["max_discount_percent"]
+        if row_has(coupon, "max_discount_percent") and coupon["max_discount_percent"] is not None
+        else 100
+    )
+    max_total_discount = int(amount * min(max(max_discount_percent, 0), 100) / 100)
+    total_discount = min(referral_discount + coupon_discount, max_total_discount)
+    coupon_discount = max(total_discount - referral_discount, 0)
+    return referral_discount, coupon_discount, total_discount
+
+
+def clear_order_coupon(order_id: int, telegram_id: int, reason: str = "") -> None:
+    order = db.get_order(order_id, telegram_id)
+    if not order:
+        return
+    parts = order_discount_components(order)
+    referral_discount = int(parts.get("referral") or 0)
+    note = reason[:500] if reason else None
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE orders
+            SET coupon_code = NULL,
+                coupon_discount = 0,
+                discount_amount = ?,
+                admin_note = COALESCE(?, admin_note)
+            WHERE id = ? AND user_telegram_id = ? AND status IN ('draft', 'pending', 'payment_rejected')
+            """,
+            (referral_discount, note, int(order_id), int(telegram_id)),
+        )
+        conn.commit()
+    order_discounts[order_id] = {"referral": referral_discount, "coupon": 0, "coupon_code": None}
+
+
 async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.Row, bot: Bot | None = None) -> tuple[Optional[sqlite3.Row], str]:
     if setting_get("coupon_enabled", "1") != "1":
         return None, coupon_usage_generic_error()
@@ -1710,11 +1883,28 @@ async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.
                 return None, coupon_usage_generic_error()
         except ValueError:
             pass
+
+    order_id = int(order["id"]) if row_has(order, "id") else None
+    paid_global = coupon_usage_count(code)
+    # For a global usage limit, active coupon reservations are prioritized by order id.
+    # During initial apply, every existing reservation counts. During final revalidation,
+    # only older reservations can block the current order; otherwise two drafts could block
+    # each other forever.
+    current_has_this_coupon = bool(row_has(order, "coupon_code") and order["coupon_code"] and str(order["coupon_code"]).upper() == code)
+    if current_has_this_coupon and order_id is not None:
+        reserved_global = coupon_active_reservation_count(code, exclude_order_id=order_id, before_order_id=order_id)
+    else:
+        reserved_global = coupon_active_reservation_count(code, exclude_order_id=order_id)
     usage_limit = row["usage_limit"]
-    if usage_limit is not None and int(row["used_count"]) >= int(usage_limit):
+    if usage_limit is not None and (paid_global + reserved_global) >= int(usage_limit):
         return None, coupon_usage_generic_error()
-    if int(row["per_user_limit"] or 1) <= coupon_usage_count(code, telegram_id):
-        return None, coupon_usage_generic_error()
+
+    paid_for_user = coupon_usage_count(code, telegram_id)
+    reserved_for_user = coupon_active_reservation_count(code, telegram_id, exclude_order_id=order_id)
+    per_user_limit = int(row["per_user_limit"] or 1)
+    if per_user_limit <= paid_for_user + reserved_for_user:
+        return None, "این کد قبلاً برای شما مصرف شده یا روی یک سفارش فعال دیگر رزرو است. از «سفارش‌های من» همان سفارش را ادامه دهید یا آن را لغو کنید."
+
     min_order_amount = int(row["min_order_amount"] if row_has(row, "min_order_amount") and row["min_order_amount"] is not None else 0)
     if min_order_amount and int(order["amount"]) < min_order_amount:
         return None, coupon_usage_generic_error()
@@ -1734,6 +1924,7 @@ async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.
             if user and int(user["first_purchase_done"]):
                 return None, coupon_usage_generic_error()
     return row, ""
+
 
 def save_order_coupon(order_id: int, telegram_id: int, code: str, coupon_discount: int, total_discount: int) -> None:
     with closing(db.connect()) as conn:
@@ -1757,6 +1948,100 @@ def finalize_coupon_usage(order_id: int, telegram_id: int) -> None:
         )
         conn.execute("UPDATE coupons SET used_count = (SELECT COUNT(*) FROM coupon_usages WHERE code = ?) WHERE code = ?", (code, code))
         conn.commit()
+
+
+async def revalidate_order_coupon_before_payment(order_id: int, telegram_id: int, bot: Bot | None = None) -> tuple[bool, str]:
+    """Re-check coupon at the exact wallet-spend moment.
+
+    This closes the gap where a coupon is valid while the order is a draft but later becomes
+    invalid/disabled/over limit before the user continues the order.
+    """
+    order = db.get_order(order_id, telegram_id)
+    if not order or not row_has(order, "coupon_code") or not order["coupon_code"]:
+        return True, ""
+    code = str(order["coupon_code"]).upper()
+    coupon, error = await validate_coupon_for_order(code, telegram_id, order, bot)
+    if not coupon:
+        clear_order_coupon(order_id, telegram_id, f"کد تخفیف قبل از پرداخت نامعتبر شد: {error}")
+        return False, error or coupon_usage_generic_error()
+    _referral_discount, coupon_discount, total_discount = compute_order_coupon_discount(order, coupon)
+    save_order_coupon(order_id, telegram_id, code, coupon_discount, total_discount)
+    return True, ""
+
+
+def begin_order_processing(order_id: int, telegram_id: int) -> bool:
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET status = 'processing'
+            WHERE id = ? AND user_telegram_id = ? AND status IN ('draft', 'pending', 'payment_rejected')
+            """,
+            (int(order_id), int(telegram_id)),
+        )
+        conn.commit()
+        return bool(cur.rowcount)
+
+
+def restore_order_draft(order_id: int, telegram_id: int, note: str = "") -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            "UPDATE orders SET status = 'draft', admin_note = COALESCE(?, admin_note) WHERE id = ? AND user_telegram_id = ? AND status = 'processing'",
+            (note[:500] if note else None, int(order_id), int(telegram_id)),
+        )
+        conn.commit()
+
+
+def try_debit_wallet(telegram_id: int, amount: int, description: str, related_user_id: Optional[int] = None) -> bool:
+    """Atomically debit wallet only when enough balance exists.
+
+    Never call add_wallet with a negative payment directly in payment flows; that pattern can
+    double-spend on repeated callbacks or concurrent requests.
+    """
+    amount = int(amount or 0)
+    if amount <= 0:
+        return True
+    with closing(db.connect()) as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE users
+                SET wallet_balance = wallet_balance - ?
+                WHERE telegram_id = ? AND wallet_balance >= ? AND wallet_balance >= 0
+                """,
+                (amount, int(telegram_id), amount),
+            )
+            if not cur.rowcount:
+                conn.rollback()
+                return False
+            conn.execute(
+                """
+                INSERT INTO wallet_transactions (user_telegram_id, amount, type, description, related_user_id, created_at)
+                VALUES (?, ?, 'wallet_payment', ?, ?, ?)
+                """,
+                (int(telegram_id), -amount, description, related_user_id, now_iso()),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def reserve_order_for_admin_payment(order_id: int) -> bool:
+    """Lock an order before admin/sales approval credits wallet or provisions service."""
+    with closing(db.connect()) as conn:
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET status = 'processing'
+            WHERE id = ? AND status IN ('draft', 'pending', 'payment_rejected', 'waiting_receipt', 'receipt_pending')
+            """,
+            (int(order_id),),
+        )
+        conn.commit()
+        return bool(cur.rowcount)
 
 
 def mark_order_terminal(order_id: int, *, status: str, method: str, wallet_used: int = 0, service_id: int | None = None, admin_note: str | None = None) -> None:
@@ -4913,28 +5198,23 @@ async def coupon_finish(message: Message, state: FSMContext) -> None:
         await message.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", reply_markup=back_home_kb())
         return
     code = (message.text or "").strip().upper()
+    # If this same user has the same coupon on older editable draft orders, cancel those
+    # first. This prevents creating unlimited discounted drafts with a one-time code.
+    released_count = release_editable_coupon_reservations(code, int(user["telegram_id"]), order_id)
+    order = db.get_order(order_id, int(user["telegram_id"])) or order
     coupon_row_obj, error = await validate_coupon_for_order(code, int(user["telegram_id"]), order, getattr(message, "bot", None))
     if not coupon_row_obj:
         await message.answer(f"❌ {h(error or 'این کد تخفیف معتبر نیست.')}\nلطفاً دوباره وارد کنید یا انصراف را بزنید.", reply_markup=coupon_cancel_kb(order_id))
         return
 
-    amount = int(order["amount"])
-    details = order_discounts.get(order_id, {"referral": int(order["discount_amount"]), "coupon": 0, "coupon_code": None})
-    referral_discount = int(details.get("referral", 0))
-    if not int(coupon_row_obj["stack_with_referral"] or 1):
-        referral_discount = 0
-    base_for_coupon = max(amount - referral_discount, 0)
-    coupon_discount = int(base_for_coupon * int(coupon_row_obj["percent"]) / 100)
-    if row_has(coupon_row_obj, "max_discount_amount") and coupon_row_obj["max_discount_amount"] is not None:
-        coupon_discount = min(coupon_discount, int(coupon_row_obj["max_discount_amount"]))
-    max_discount_percent = int(coupon_row_obj["max_discount_percent"] if row_has(coupon_row_obj, "max_discount_percent") and coupon_row_obj["max_discount_percent"] is not None else 100)
-    max_total_discount = int(amount * min(max_discount_percent, 100) / 100)
-    total_discount = min(referral_discount + coupon_discount, max_total_discount)
-    coupon_discount = max(total_discount - referral_discount, 0)
+    referral_discount, coupon_discount, total_discount = compute_order_coupon_discount(order, coupon_row_obj)
     order_discounts[order_id] = {"referral": referral_discount, "coupon": coupon_discount, "coupon_code": code}
     save_order_coupon(order_id, int(user["telegram_id"]), code, coupon_discount, total_discount)
     await state.clear()
-    await message.answer(header("✅ کد تخفیف اعمال شد") + f"کد <code>{h(code)}</code> با موفقیت روی سفارش اعمال شد.")
+    note = ""
+    if released_count:
+        note = f"\n\n⚠️ برای جلوگیری از مصرف چندباره این کد، {fmt_number(released_count)} سفارش نیمه‌کاره قبلی که همین کد را داشتند لغو شدند."
+    await message.answer(header("✅ کد تخفیف اعمال شد") + f"کد <code>{h(code)}</code> با موفقیت روی همین سفارش رزرو و اعمال شد.{note}")
     await show_order_payment(message, int(user["telegram_id"]), order_id)
 
 
@@ -5131,12 +5411,19 @@ async def complete_package_assignment_order(callback: CallbackQuery, telegram_id
         await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
         return
     wallet_used = 0
+    order_id = int(order["id"])
+    if not begin_order_processing(order_id, telegram_id):
+        await callback.answer("این سفارش همین الان در حال پردازش است یا قبلاً پرداخت شده است.", show_alert=True)
+        return
     if use_wallet:
         if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            restore_order_draft(order_id, telegram_id, "موجودی کیف پول هنگام پرداخت پکیج کافی نبود")
             await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
-        if payable > 0:
-            db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت پکیج اختصاصی سفارش #{order['id']}")
+        if not try_debit_wallet(telegram_id, payable, f"پرداخت پکیج اختصاصی سفارش #{order_id}"):
+            restore_order_draft(order_id, telegram_id, "برداشت کیف پول پکیج به دلیل کمبود موجودی انجام نشد")
+            await callback.answer("موجودی کیف پول کافی نیست. صفحه سفارش را دوباره باز کنید.", show_alert=True)
+            return
         wallet_used = payable
     mark_user_package_active(user_package_id, int(order["id"]))
     mark_order_terminal(int(order["id"]), status="paid", method=method, wallet_used=wallet_used)
@@ -5174,18 +5461,29 @@ async def complete_package_sub_order(callback: CallbackQuery, telegram_id: int, 
         await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
         return
     wallet_used = 0
-    if use_wallet:
-        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
-            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
-            return
-        if payable > 0:
-            db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت ساب پکیج سفارش #{order['id']}")
-        wallet_used = payable
+    order_id = int(order["id"])
+    # Local package/catalog validation happens before locking and wallet debit.
     ok, msg = await ensure_package_item_catalog_plan(item, callback.from_user.id)
     if not ok:
-        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), msg)
         await edit_or_answer(callback, header("⚠️ ساخت ساب ناموفق بود") + h(msg), user_package_view_kb(user_package))
         return
+    if not begin_order_processing(order_id, telegram_id):
+        await callback.answer("این سفارش همین الان در حال پردازش است یا قبلاً پرداخت شده است.", show_alert=True)
+        return
+    if count_package_subscriptions(user_package_id) >= int(user_package["max_subscriptions"]):
+        restore_order_draft(order_id, telegram_id, "ظرفیت پکیج هنگام پرداخت تکمیل شده بود")
+        await callback.answer("ظرفیت ساخت ساب برای این پکیج تکمیل شده است.", show_alert=True)
+        return
+    if use_wallet:
+        if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            restore_order_draft(order_id, telegram_id, "موجودی کیف پول هنگام پرداخت ساب پکیج کافی نبود")
+            await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
+            return
+        if not try_debit_wallet(telegram_id, payable, f"پرداخت ساب پکیج سفارش #{order_id}"):
+            restore_order_draft(order_id, telegram_id, "برداشت کیف پول ساب پکیج به دلیل کمبود موجودی انجام نشد")
+            await callback.answer("موجودی کیف پول کافی نیست. صفحه سفارش را دوباره باز کنید.", show_alert=True)
+            return
+        wallet_used = payable
     plan = Plan(
         key=package_plan_key(item_id),
         title=str(item["title"]),
@@ -5196,9 +5494,23 @@ async def complete_package_sub_order(callback: CallbackQuery, telegram_id: int, 
         badge="🎁 پکیج",
     )
     service_name = make_service_name(telegram_id)
-    service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
-    db.update_order_service(int(order["id"]), service_id)
-    ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=int(order["id"]), is_test=False, paid_amount=payable)
+    service_id: int | None = None
+    try:
+        service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
+        db.update_order_service(int(order["id"]), service_id)
+        ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=int(order["id"]), is_test=False, paid_amount=payable)
+    except Exception as exc:
+        logger.exception("package sub failed after wallet debit: order=%s user=%s", order["id"], telegram_id)
+        error = f"خطای داخلی فعال‌سازی: {exc}"
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(
+            callback,
+            header("⚠️ ساخت ساب ناموفق بود", service_name)
+            + "در زمان فعال‌سازی خطای داخلی رخ داد. اگر مبلغی از کیف پول کم شده باشد، برگشت داده شد. لطفاً با پشتیبانی تماس بگیرید.",
+            inline([[('🎫 پشتیبانی', 'ticket_new')], [("🎁 پکیج‌های من", "my_packages"), ("🏠 منوی اصلی", "home")]]),
+        )
+        return
     if not ok:
         error = _remote_failure_text(remote_result)
         refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
@@ -5226,6 +5538,17 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
     if plan_key.startswith("wallet_topup:"):
         await callback.answer("شارژ کیف پول فقط از طریق کارت‌به‌کارت و تأیید رسید انجام می‌شود.", show_alert=True)
         return
+    coupon_ok, coupon_error = await revalidate_order_coupon_before_payment(order_id, telegram_id, getattr(callback, "bot", None))
+    if not coupon_ok:
+        await callback.answer("کد تخفیف این سفارش دیگر قابل استفاده نبود و از سفارش حذف شد.", show_alert=True)
+        await show_order_payment(callback, telegram_id, order_id)
+        return
+    order = db.get_order(order_id, telegram_id) or order
+    if order_needs_service_name(order):
+        await callback.answer("قبل از پرداخت، باید نام سرویس را ثبت کنید.", show_alert=True)
+        await show_order_payment(callback, telegram_id, order_id)
+        return
+    plan_key = str(order["plan_key"])
     if plan_key.startswith("pkg_assign:"):
         await complete_package_assignment_order(callback, telegram_id, order, method, use_wallet)
         return
@@ -5250,18 +5573,38 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
         return
     wallet_used = 0
+    if not begin_order_processing(order_id, telegram_id):
+        await callback.answer("این سفارش همین الان در حال پردازش است یا قبلاً پرداخت شده است.", show_alert=True)
+        return
     if use_wallet:
         if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            restore_order_draft(order_id, telegram_id, "موجودی کیف پول هنگام پرداخت کافی نبود")
             await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
-        db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت سفارش #{order_id}")
+        if not try_debit_wallet(telegram_id, payable, f"پرداخت سفارش #{order_id}"):
+            restore_order_draft(order_id, telegram_id, "برداشت کیف پول به دلیل کمبود موجودی انجام نشد")
+            await callback.answer("موجودی کیف پول کافی نیست. صفحه سفارش را دوباره باز کنید.", show_alert=True)
+            return
         wallet_used = payable
 
     service_name = order_service_name(order) or make_service_name(telegram_id)
-    service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
-    db.update_order_service(order_id, service_id)
-
-    ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=order_id, is_test=False, paid_amount=payable)
+    service_id: int | None = None
+    try:
+        service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
+        db.update_order_service(order_id, service_id)
+        ok, remote_result, service = await provision_service_or_mark_failed(service_id, telegram_id, order_id=order_id, is_test=False, paid_amount=payable)
+    except Exception as exc:
+        logger.exception("service purchase failed after wallet debit: order=%s user=%s", order_id, telegram_id)
+        error = f"خطای داخلی فعال‌سازی: {exc}"
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, order_id, error)
+        mark_order_terminal(order_id, status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(
+            callback,
+            header("⚠️ پرداخت برگشت خورد", service_name)
+            + "در زمان فعال‌سازی خطای داخلی رخ داد. اگر مبلغی از کیف پول کم شده باشد، برگشت داده شد. لطفاً با پشتیبانی تماس بگیرید.",
+            inline([[('🎫 ارتباط با پشتیبانی', 'ticket_new')], [('🧾 سفارش‌های من', 'my_orders'), ('🏠 منوی اصلی', 'home')]]),
+        )
+        return
     if not ok:
         error = _remote_failure_text(remote_result)
         refund_wallet_payment_if_needed(telegram_id, wallet_used, order_id, error)
@@ -5300,16 +5643,32 @@ async def complete_addon_order(callback: CallbackQuery, telegram_id: int, order:
     if not user:
         return
     wallet_used = 0
+    order_id = int(order["id"])
+    if not begin_order_processing(order_id, telegram_id):
+        await callback.answer("این سفارش همین الان در حال پردازش است یا قبلاً پرداخت شده است.", show_alert=True)
+        return
     if use_wallet:
         if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            restore_order_draft(order_id, telegram_id, "موجودی کیف پول هنگام پرداخت افزایش حجم کافی نبود")
             await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
-        db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت افزایش حجم سفارش #{order['id']}")
+        if not try_debit_wallet(telegram_id, payable, f"پرداخت افزایش حجم سفارش #{order_id}"):
+            restore_order_draft(order_id, telegram_id, "برداشت کیف پول افزایش حجم به دلیل کمبود موجودی انجام نشد")
+            await callback.answer("موجودی کیف پول کافی نیست. صفحه سفارش را دوباره باز کنید.", show_alert=True)
+            return
         wallet_used = payable
 
-    db.add_data_to_service(service_id, telegram_id, pkg.data_gb)
-    service = db.get_service(service_id, telegram_id)
-    remote_result = await update_remote_user_limit(db, service)
+    try:
+        db.add_data_to_service(service_id, telegram_id, pkg.data_gb)
+        service = db.get_service(service_id, telegram_id)
+        remote_result = await update_remote_user_limit(db, service)
+    except Exception as exc:
+        logger.exception("addon failed after wallet debit: order=%s user=%s", order["id"], telegram_id)
+        error = f"خطای داخلی افزایش حجم: {exc}"
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(callback, header("⚠️ افزایش حجم ناموفق بود", service["name"]) + "در زمان افزایش حجم خطای داخلی رخ داد. اگر مبلغی از کیف پول کم شده باشد، برگشت داده شد.", service_details_kb(db.get_service(service_id, telegram_id)))
+        return
     if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
         error = _remote_failure_text(remote_result)
         db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
@@ -5348,16 +5707,32 @@ async def complete_renew_order(callback: CallbackQuery, telegram_id: int, order:
     if not user:
         return
     wallet_used = 0
+    order_id = int(order["id"])
+    if not begin_order_processing(order_id, telegram_id):
+        await callback.answer("این سفارش همین الان در حال پردازش است یا قبلاً پرداخت شده است.", show_alert=True)
+        return
     if use_wallet:
         if int(user["wallet_balance"]) < payable or int(user["wallet_balance"]) < 0:
+            restore_order_draft(order_id, telegram_id, "موجودی کیف پول هنگام پرداخت تمدید کافی نبود")
             await callback.answer("موجودی کیف پول کافی نیست یا منفی است. ابتدا کیف پول را شارژ کنید.", show_alert=True)
             return
-        db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت تمدید سفارش #{order['id']}")
+        if not try_debit_wallet(telegram_id, payable, f"پرداخت تمدید سفارش #{order_id}"):
+            restore_order_draft(order_id, telegram_id, "برداشت کیف پول تمدید به دلیل کمبود موجودی انجام نشد")
+            await callback.answer("موجودی کیف پول کافی نیست. صفحه سفارش را دوباره باز کنید.", show_alert=True)
+            return
         wallet_used = payable
 
-    db.renew_service(service_id, telegram_id, plan, payable)
-    service = db.get_service(service_id, telegram_id)
-    remote_result = await apply_template_to_remote_user(db, service, order_id=int(order["id"]))
+    try:
+        db.renew_service(service_id, telegram_id, plan, payable)
+        service = db.get_service(service_id, telegram_id)
+        remote_result = await apply_template_to_remote_user(db, service, order_id=int(order["id"]))
+    except Exception as exc:
+        logger.exception("renew failed after wallet debit: order=%s user=%s", order["id"], telegram_id)
+        error = f"خطای داخلی تمدید: {exc}"
+        refund_wallet_payment_if_needed(telegram_id, wallet_used, int(order["id"]), error)
+        mark_order_terminal(int(order["id"]), status="provisioning_failed", method=method, wallet_used=0, service_id=service_id, admin_note=error)
+        await edit_or_answer(callback, header("⚠️ تمدید ناموفق بود", service["name"]) + "در زمان تمدید خطای داخلی رخ داد. اگر مبلغی از کیف پول کم شده باشد، برگشت داده شد.", service_details_kb(db.get_service(service_id, telegram_id)))
+        return
     if settings.pasarguard_enabled and not (remote_result and remote_result.ok and remote_result.applied):
         error = _remote_failure_text(remote_result)
         db.set_service_status(service_id, telegram_id, "provisioning_failed", error)
@@ -5743,6 +6118,7 @@ def order_status_label(status: str) -> str:
     status_map = {
         "draft": "در حال تکمیل 📝",
         "pending": "در انتظار پرداخت ⏳",
+        "processing": "در حال پردازش امن 🔄",
         "waiting_receipt": "در انتظار آپلود رسید کارت‌به‌کارت 📤",
         "receipt_pending": "منتظر تأیید رسید 🧾",
         "paid": "پرداخت شده ✅",
@@ -5808,6 +6184,7 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
                 "paid": "پرداخت شده ✅",
                 "draft": "در حال تکمیل 📝",
                 "pending": "در انتظار ⏳",
+                "processing": "در حال پردازش امن 🔄",
                 "waiting_receipt": "در انتظار آپلود رسید کارت‌به‌کارت 📤",
                 "cancelled": "لغو شده ❌",
                 "provisioning": "در حال فعال‌سازی 🔄",
@@ -7035,6 +7412,10 @@ async def admin_receipt_review_finish(message: Message, state: FSMContext) -> No
     service_id = set_order_paid_admin(int(order["id"]), admin_id, method="کارت به کارت")
     refreshed = get_order_any(int(order["id"])) or order
     is_wallet_topup = str(order["plan_key"]).startswith("wallet_topup:")
+    if service_id is None and str(refreshed["status"]) != "paid":
+        await state.clear()
+        await message.answer("این سفارش همزمان توسط فرآیند دیگری در حال بررسی است یا قبلاً پردازش شده است.", reply_markup=admin_back_kb("adm_orders_receipts"))
+        return
     service = db.get_service(service_id) if service_id else None
     provisioning_ok = True
     if is_wallet_topup:
