@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote, quote_plus, urljoin
 
 from aiogram import Bot, Dispatcher, F, Router
 try:
@@ -322,8 +322,26 @@ def subscription_link(service: sqlite3.Row) -> str:
     return f"{SUBSCRIPTION_BASE_URL}/{service['token']}"
 
 
-def subscription_link_or_pending_text(service: sqlite3.Row) -> str:
+def subscription_link_with_service_name(service: sqlite3.Row) -> str:
+    """Return the user-facing full subscription URL with the service name as URL fragment.
+
+    Example: https://host/sub/token#howtosee_1111736
+    """
     link = subscription_link(service)
+    if not link:
+        return ""
+    try:
+        name = str(service["name"] or "").strip()
+    except Exception:
+        name = ""
+    if not name:
+        return link
+    base = link.split("#", 1)[0]
+    return f"{base}#{quote(name, safe='-_.~')}"
+
+
+def subscription_link_or_pending_text(service: sqlite3.Row) -> str:
+    link = subscription_link_with_service_name(service)
     if link:
         return link
     status = str(service["status"] or "")
@@ -486,7 +504,7 @@ class DB:
 
     def update_order_discount(self, order_id: int, telegram_id: int, discount: int) -> None:
         with closing(self.connect()) as conn:
-            conn.execute("UPDATE orders SET discount_amount = ? WHERE id = ? AND user_telegram_id = ? AND status = 'pending'", (discount, order_id, telegram_id))
+            conn.execute("UPDATE orders SET discount_amount = ? WHERE id = ? AND user_telegram_id = ? AND status IN ('draft', 'pending', 'payment_rejected')", (discount, order_id, telegram_id))
             conn.commit()
 
     def update_order_service(self, order_id: int, service_id: int) -> None:
@@ -497,6 +515,11 @@ class DB:
     def update_order_service_name(self, order_id: int, telegram_id: int, service_name: str) -> None:
         with closing(self.connect()) as conn:
             conn.execute("UPDATE orders SET service_name = ? WHERE id = ? AND user_telegram_id = ?", (service_name, order_id, telegram_id))
+            conn.commit()
+
+    def clear_order_service_name(self, order_id: int, telegram_id: int) -> None:
+        with closing(self.connect()) as conn:
+            conn.execute("UPDATE orders SET service_name = NULL WHERE id = ? AND user_telegram_id = ?", (order_id, telegram_id))
             conn.commit()
 
     def get_order(self, order_id: int, telegram_id: int) -> Optional[sqlite3.Row]:
@@ -1464,6 +1487,52 @@ def coupon_operation_label(value: str | None) -> str:
     return COUPON_OPERATION_LABELS.get(str(value or ""), "نامشخص")
 
 
+ORDER_EDITABLE_STATUSES = {"draft", "pending", "payment_rejected"}
+ORDER_PAYMENT_START_STATUSES = {"draft", "pending", "payment_rejected"}
+ORDER_WAITING_RECEIPT_STATUSES = {"waiting_receipt", "payment_rejected"}
+
+
+def order_service_name(order: sqlite3.Row | None) -> str:
+    if not order:
+        return ""
+    try:
+        if row_has(order, "service_name") and order["service_name"]:
+            return str(order["service_name"]).strip()
+    except Exception:
+        pass
+    try:
+        return str(pending_names.get(int(order["id"]), "") or "").strip()
+    except Exception:
+        return ""
+
+
+def order_needs_service_name(order: sqlite3.Row | None) -> bool:
+    if not order:
+        return False
+    plan_key = str(order["plan_key"] or "")
+    plan = PLANS.get(plan_key)
+    return bool(plan and is_public_paid_plan(plan) and not order_service_name(order))
+
+
+def order_is_editable(order: sqlite3.Row | None) -> bool:
+    return bool(order and str(order["status"] or "") in ORDER_EDITABLE_STATUSES)
+
+
+def mark_order_cancelled(order_id: int, telegram_id: int, reason: str = "لغو توسط کاربر") -> None:
+    with closing(db.connect()) as conn:
+        conn.execute(
+            """
+            UPDATE orders
+            SET status = 'cancelled', payment_method = 'cancelled', service_name = NULL, admin_note = COALESCE(?, admin_note)
+            WHERE id = ? AND user_telegram_id = ? AND status NOT IN ('paid', 'receipt_pending')
+            """,
+            (reason, order_id, telegram_id),
+        )
+        conn.commit()
+    pending_names.pop(order_id, None)
+    order_discounts.pop(order_id, None)
+
+
 def safe_json_loads(value: Any, default: Any) -> Any:
     try:
         if not value:
@@ -1669,7 +1738,7 @@ async def validate_coupon_for_order(code: str, telegram_id: int, order: sqlite3.
 def save_order_coupon(order_id: int, telegram_id: int, code: str, coupon_discount: int, total_discount: int) -> None:
     with closing(db.connect()) as conn:
         conn.execute(
-            "UPDATE orders SET coupon_code = ?, coupon_discount = ?, discount_amount = ? WHERE id = ? AND user_telegram_id = ? AND status = 'pending'",
+            "UPDATE orders SET coupon_code = ?, coupon_discount = ?, discount_amount = ? WHERE id = ? AND user_telegram_id = ? AND status IN ('draft', 'pending', 'payment_rejected')",
             (code.upper(), coupon_discount, total_discount, order_id, telegram_id),
         )
         conn.commit()
@@ -1934,7 +2003,7 @@ def create_or_reset_payment_receipt(order: sqlite3.Row, card: sqlite3.Row, amoun
                 (int(order["id"]), int(order["user_telegram_id"]), int(card["id"]), amount, expires_at, now_iso(), now_iso()),
             )
             rid = int(cur.lastrowid)
-        conn.execute("UPDATE orders SET receipt_id = ?, payment_method = ? WHERE id = ?", (rid, "کارت به کارت", int(order["id"])))
+        conn.execute("UPDATE orders SET receipt_id = ?, payment_method = ?, status = 'waiting_receipt' WHERE id = ?", (rid, "کارت به کارت", int(order["id"])))
         conn.commit()
         return rid
 
@@ -2051,7 +2120,7 @@ def receipt_upload_kb(receipt_id: int, order_id: int, can_submit: bool) -> Inlin
     rows: list[list[tuple[str, str]]] = []
     if can_submit:
         rows.append([("✅ ثبت تراکنش و ارسال برای فروش", f"receipt_submit:{receipt_id}")])
-    rows.append([("❌ لغو ارسال رسید", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")])
+    rows.append([("❌ لغو تراکنش", f"order_cancel:{order_id}"), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
 
@@ -2807,7 +2876,7 @@ def main_menu_kb(telegram_id: Optional[int] = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🛒 خرید سرویس")],
         service_row,
         [KeyboardButton(text="🎁 سرویس رایگان")],
-        [KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
+        [KeyboardButton(text="🧾 سفارش‌های من"), KeyboardButton(text="💳 تراکنش‌ها"), KeyboardButton(text="💰 کیف پول")],
         [KeyboardButton(text="💎 معرفی به دوستان"), KeyboardButton(text="📊 اطلاعات حساب")],
     ]
     if tutorial_count_active() > 0:
@@ -2914,15 +2983,19 @@ def order_payment_kb(
     allow_wallet: bool = True,
     allow_coupon: bool = True,
     is_wallet_topup: bool = False,
+    needs_service_name: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     if allow_coupon:
         rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
-    if is_wallet_topup:
-        rows.append([("💳 پرداخت", f"pay_methods:{order_id}")])
+    if needs_service_name:
+        rows.append([("📝 ادامه ثبت سفارش", f"order_continue:{order_id}")])
+    elif is_wallet_topup:
+        rows.append([("💳 انتخاب روش پرداخت", f"pay_methods:{order_id}")])
     elif allow_wallet and wallet_balance >= payable and wallet_balance >= 0:
         label = "✅ فعال‌سازی سفارش رایگان" if payable <= 0 else "💰 پرداخت و فعال‌سازی از کیف پول"
         rows.append([(label, f"pay_wallet:{order_id}")])
+    rows.append([("🧾 سفارش‌های من", "my_orders"), ("❌ لغو سفارش", f"order_cancel:{order_id}")])
     rows.append([(back_text, back_callback), ("🏠 منوی اصلی", "home")])
     return inline(rows)
 
@@ -2930,6 +3003,7 @@ def order_payment_kb(
 def payment_methods_kb(order_id: int) -> InlineKeyboardMarkup:
     return inline([
         [("💳 کارت‌به‌کارت", f"pay_card:{order_id}")],
+        [("❌ لغو تراکنش", f"order_cancel:{order_id}")],
         [("⬅️ بازگشت به بررسی پرداخت", f"pay_page:{order_id}"), ("🏠 منوی اصلی", "home")],
     ])
 
@@ -2946,7 +3020,8 @@ def insufficient_wallet_kb(order_id: int, suggested_amount: int, back_callback: 
         rows.append([("🎟 کد تخفیف دارم", f"coupon_start:{order_id}")])
     rows.extend([
         [(f"➕ شارژ پیشنهادی کیف پول: {fmt_money(suggested_amount)}", f"wallet_topup_for:{order_id}:{suggested_amount}")],
-        [("💰 ورود به کیف پول", "wallet")],
+        [("🧾 سفارش‌های من", "my_orders"), ("💰 ورود به کیف پول", "wallet")],
+        [("❌ لغو سفارش", f"order_cancel:{order_id}")],
         [("⬅️ بازگشت", back_callback), ("🏠 منوی اصلی", "home")],
     ])
     return inline(rows)
@@ -2959,7 +3034,7 @@ def transactions_kb(orders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
         logger.exception("failed to cleanup transaction deadlines before rendering keyboard")
     rows: list[list[tuple[str, str]]] = []
     for order in orders[:20]:
-        if str(order["status"]) in {"pending", "payment_rejected"} and str(order["plan_key"]).startswith("wallet_topup:"):
+        if str(order["status"]) in {"waiting_receipt", "payment_rejected"} and str(order["plan_key"]).startswith("wallet_topup:"):
             receipt = get_receipt_by_order(int(order["id"]))
             if not receipt or (str(receipt["status"]) == "waiting_receipt" and not receipt_deadline_expired(receipt)):
                 rows.append([(f"🧾 ثبت رسید تراکنش #{order['id']}", f"tx_receipt:{order['id']}")])
@@ -2984,7 +3059,7 @@ def services_kb(services: list[sqlite3.Row]) -> InlineKeyboardMarkup:
 def service_details_kb(service: sqlite3.Row) -> InlineKeyboardMarkup:
     sid = int(service["id"])
     keyboard: list[list[InlineKeyboardButton]] = []
-    link = subscription_link(service)
+    link = subscription_link_with_service_name(service)
     if link:
         keyboard.append([InlineKeyboardButton(text="🌐 پنل اشتراکی", url=link)])
     if service["is_test"]:
@@ -3480,7 +3555,7 @@ def admin_service_text(service: sqlite3.Row) -> str:
         + f"💳 پرداختی: <b>{fmt_money(int(service['paid_amount']))}</b>\n"
         + (f"🔌 Pasarguard: <code>{h(service['pasarguard_username'])}</code> | <b>{h(service['pasarguard_sync_status'] or 'local')}</b>\n" if 'pasarguard_username' in service.keys() and service['pasarguard_username'] else "")
         + (f"⚠️ خطای sync: <code>{h(service['pasarguard_sync_error'])}</code>\n" if 'pasarguard_sync_error' in service.keys() and service['pasarguard_sync_error'] else "")
-        + f"🔗 لینک: <code>{h(subscription_link(service))}</code>"
+        + f"🔗 لینک: <code>{h(subscription_link_with_service_name(service))}</code>"
     )
 
 
@@ -3615,13 +3690,20 @@ def discount_lines(details: dict[str, Any]) -> str:
 def payment_text(plan: Plan, service_name: str, order_id: int, amount: int, discount: int, wallet_balance: int) -> str:
     details = order_discount_details(order_id, get_order_any(order_id))
     payable = max(amount - discount, 0)
-    text = header("💳 انتخاب روش پرداخت", service_name)
+    title = "💳 انتخاب روش پرداخت" if service_name else "🧾 خلاصه سفارش"
+    subtitle = service_name or plan.title
+    text = header(title, subtitle)
     text += f"📦 پلن: <b>{h(plan.title)}</b>\n"
+    text += f"📊 حجم: <b>{fmt_number(plan.data_gb)} گیگابایت</b>\n"
+    text += f"⏳ اعتبار: <b>{fmt_number(plan.days)} روز</b>\n"
     text += f"💰 مبلغ اصلی: <b>{fmt_money(amount)}</b>\n"
     text += discount_lines(details)
     text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
     text += f"💼 موجودی کیف پول: <b>{fmt_money(wallet_balance)}</b>\n\n"
-    text += "پرداخت مستقیم حذف شده است. اگر موجودی کیف پول کافی باشد، سفارش از کیف پول فعال می‌شود؛ اگر کافی نباشد باید ابتدا کیف پول را شارژ کنید."
+    if service_name:
+        text += "پرداخت این سفارش از کیف پول انجام می‌شود. بعد از پرداخت موفق، سرویس ساخته و لینک اشتراک آماده می‌شود."
+    else:
+        text += "اگر کد تخفیف دارید، همین‌جا اعمال کنید. وقتی موجودی کیف پول کافی شد، از «ادامه ثبت سفارش» نام سرویس را وارد می‌کنید و بعد پرداخت از کیف پول انجام می‌شود."
     return text
 
 
@@ -3686,7 +3768,7 @@ def render_order_payment_text(order: sqlite3.Row, user: sqlite3.Row) -> tuple[st
         return text, f"renew_menu:{service_id_s}", payable
 
     plan = PLANS[plan_key]
-    service_name = pending_names.get(int(order["id"]), make_service_name(int(user["telegram_id"])))
+    service_name = order_service_name(order)
     return payment_text(plan, service_name, int(order["id"]), amount, discount, int(user["wallet_balance"])), f"buy_cat:{plan.category}", payable
 
 
@@ -3707,7 +3789,7 @@ def service_text(service: sqlite3.Row) -> str:
     days_left = max((expires - datetime.now(TEHRAN_TZ)).days, 0)
     used_gb = int(service["data_used_mb"]) / 1024
     left_gb = max(float(service["data_gb"]) - used_gb, 0)
-    link = subscription_link(service)
+    link = subscription_link_with_service_name(service)
     status_map = {
         "active": "فعال ✅",
         "suspended": "غیرفعال ⛔",
@@ -3742,7 +3824,7 @@ def service_text(service: sqlite3.Row) -> str:
 
 
 def sub_link_text(service: sqlite3.Row) -> str:
-    link = subscription_link(service)
+    link = subscription_link_with_service_name(service)
     if not link:
         return header("🔗 لینک اشتراک", service["name"]) + "هنوز لینک اشتراک برای این سرویس هنوز ثبت نشده است. لطفاً از جزئیات سرویس گزینه sync را بزنید یا با پشتیبانی تماس بگیرید."
     return (
@@ -4492,10 +4574,29 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
         if isinstance(target, CallbackQuery):
             await target.answer("سفارش پیدا نشد.", show_alert=True)
         return
+    status = str(order["status"] or "")
+    if status not in ORDER_EDITABLE_STATUSES and status != "waiting_receipt":
+        text = user_order_text(order)
+        markup = inline([[("🧾 سفارش‌های من", "my_orders"), ("🏠 منوی اصلی", "home")]])
+        if isinstance(target, CallbackQuery):
+            await edit_or_answer(target, text, markup)
+        else:
+            await target.answer(text, reply_markup=markup)
+        return
+    if status == "waiting_receipt":
+        text = user_order_text(order) + payment_receipt_summary_for_order(int(order["id"]))
+        rows = [[("🧾 ارسال/تکمیل رسید", f"tx_receipt:{order['id']}")], [("❌ لغو تراکنش", f"order_cancel:{order['id']}")], [("🧾 سفارش‌های من", "my_orders"), ("🏠 منوی اصلی", "home")]]
+        markup = inline(rows)
+        if isinstance(target, CallbackQuery):
+            await edit_or_answer(target, text, markup)
+        else:
+            await target.answer(text, reply_markup=markup)
+        return
     text, back_callback, payable = render_order_payment_text(order, user)
     ok, reason = await order_activation_preflight(order, telegram_id)
     plan_key = str(order["plan_key"])
     is_wallet_topup = plan_key.startswith("wallet_topup:")
+    needs_service_name = order_needs_service_name(order)
     allow_coupon = coupon_order_applicable(order)
     wallet_balance = int(user["wallet_balance"] or 0)
     if not ok:
@@ -4518,17 +4619,21 @@ async def show_order_payment(target: Message | CallbackQuery, telegram_id: int, 
                 f"کمبود موجودی: <b>{fmt_money(shortage)}</b>\n"
                 f"حداقل شارژ کیف پول <b>{fmt_money(WALLET_MIN_TOPUP)}</b> است؛ برای ادامه پیشنهاد می‌شود <b>{fmt_money(suggested)}</b> شارژ کنید."
             )
+        text += "\n\n🧾 سفارش شما ذخیره شد و از بخش <b>سفارش‌های من</b> قابل پیگیری است. بعد از شارژ کیف پول، سفارش را باز کنید و ادامه ثبت سفارش را بزنید."
         markup = insufficient_wallet_kb(order_id, suggested, back_callback, allow_coupon=allow_coupon)
     else:
+        if needs_service_name:
+            text += "\n\n✅ موجودی کیف پول برای این سفارش کافی است. برای ادامه، نام سرویس را وارد کنید."
         markup = order_payment_kb(
             order_id,
             payable,
             wallet_balance,
             back_callback,
             "⬅️ بازگشت",
-            allow_wallet=not is_wallet_topup,
+            allow_wallet=not is_wallet_topup and not needs_service_name,
             allow_coupon=allow_coupon,
             is_wallet_topup=is_wallet_topup,
+            needs_service_name=needs_service_name,
         )
     if isinstance(target, CallbackQuery):
         await edit_or_answer(target, text, markup)
@@ -4685,40 +4790,77 @@ async def select_plan(callback: CallbackQuery, state: FSMContext) -> None:
     if not plan or not is_public_paid_plan(plan):
         await callback.answer("این پلن برای خرید عمومی فعال نیست.", show_alert=True)
         return
-    text, amount, referral_discount, total_discount, payable = plan_summary_text(plan, user)
-    await state.set_state(BuyStates.waiting_name)
-    await state.update_data(plan_key=plan.key, amount=amount, referral_discount=referral_discount, total_discount=total_discount, back_callback=f"buy_cat:{plan.category}")
-    await edit_or_answer(callback, text, name_prompt_kb(f"buy_cat:{plan.category}"))
+    _text, amount, referral_discount, _total_discount, _payable = plan_summary_text(plan, user)
+    order_id = db.create_order(int(user["telegram_id"]), plan.key, amount, referral_discount, 0, "draft", "none")
+    order_discounts[order_id] = {"referral": referral_discount, "coupon": 0, "coupon_code": None}
+    await state.clear()
+    await show_order_payment(callback, int(user["telegram_id"]), order_id)
 
 
 @router.callback_query(F.data == "auto_name")
 async def auto_name(callback: CallbackQuery, state: FSMContext) -> None:
     user = ensure_from_callback(callback)
     data = await state.get_data()
-    plan_key = data.get("plan_key")
-    if not plan_key or plan_key not in PLANS:
-        await callback.answer("سفارش پیدا نشد. دوباره پلن را انتخاب کنید.", show_alert=True)
+    order_id = int(data.get("resume_order_id", 0) or 0)
+    order = db.get_order(order_id, int(user["telegram_id"])) if order_id else None
+    if not order or not order_is_editable(order) or not order_needs_service_name(order):
+        await callback.answer("سفارش پیدا نشد یا دیگر قابل ادامه نیست.", show_alert=True)
         return
-    await create_pending_order_and_show_payment(callback, state, make_service_name(int(user["telegram_id"])))
+    name = make_service_name(int(user["telegram_id"]))
+    for _ in range(30):
+        if not service_name_taken(name, exclude_order_id=order_id):
+            break
+        name = make_service_name(int(user["telegram_id"]))
+    await save_service_name_and_show_payment(callback, state, order_id, name)
 
 
 @router.message(BuyStates.waiting_name)
 async def custom_name(message: Message, state: FSMContext) -> None:
-    ensure_from_message(message)
+    user = ensure_from_message(message)
+    data = await state.get_data()
+    order_id = int(data.get("resume_order_id", 0) or 0)
     ok, name, error = validate_service_name_input(message.text or "")
     if not ok:
         await message.answer("❌ نام واردشده معتبر نیست.\n\n" + error + "\n\nلطفاً دوباره وارد کنید یا از دکمه ساخت خودکار استفاده کنید.")
         return
-    if service_name_taken(name):
+    if service_name_taken(name, exclude_order_id=order_id or None):
         await message.answer(
             "❌ این نام قبلاً برای یک سرویس یا سفارش فعال استفاده شده است.\n\n"
             "لطفاً یک نام دیگر وارد کنید یا از دکمه ساخت خودکار استفاده کنید."
         )
         return
-    await create_pending_order_and_show_payment(message, state, name)
+    if not order_id:
+        await message.answer("سفارش فعال برای ثبت نام پیدا نشد. لطفاً دوباره پلن را انتخاب کنید.", reply_markup=back_home_kb())
+        await state.clear()
+        return
+    await save_service_name_and_show_payment(message, state, order_id, name)
+
+
+async def save_service_name_and_show_payment(target: Message | CallbackQuery, state: FSMContext, order_id: int, service_name: str) -> None:
+    tg_id = int(target.from_user.id)
+    user = db.get_user(tg_id) or db.ensure_user(tg_id, target.from_user.username, target.from_user.first_name)
+    order = db.get_order(order_id, tg_id)
+    if not order or not order_is_editable(order):
+        await state.clear()
+        if isinstance(target, CallbackQuery):
+            await target.answer("این سفارش دیگر قابل ادامه نیست.", show_alert=True)
+        else:
+            await target.answer("این سفارش دیگر قابل ادامه نیست.", reply_markup=back_home_kb())
+        return
+    if service_name_taken(service_name, exclude_order_id=order_id):
+        if isinstance(target, CallbackQuery):
+            await target.answer("این نام قبلاً استفاده شده است. دوباره تلاش کنید.", show_alert=True)
+        else:
+            await target.answer("این نام قبلاً استفاده شده است. لطفاً نام دیگری وارد کنید.")
+        return
+    pending_names[order_id] = service_name
+    db.update_order_service_name(order_id, tg_id, service_name)
+    await state.clear()
+    await show_order_payment(target, int(user["telegram_id"]), order_id)
 
 
 async def create_pending_order_and_show_payment(target: Message | CallbackQuery, state: FSMContext, service_name: str) -> None:
+    """Backward-compatible helper for older staged handlers."""
     data = await state.get_data()
     plan = PLANS[data["plan_key"]]
     tg_id = target.from_user.id
@@ -4727,7 +4869,7 @@ async def create_pending_order_and_show_payment(target: Message | CallbackQuery,
     user = db.get_user(tg_id) or db.ensure_user(tg_id, target.from_user.username, target.from_user.first_name)
     amount = int(data.get("amount", plan.price))
     referral_discount = int(data.get("referral_discount", 0))
-    order_id = db.create_order(tg_id, plan.key, amount, referral_discount, 0, "pending", "none")
+    order_id = db.create_order(tg_id, plan.key, amount, referral_discount, 0, "draft", "none")
     pending_names[order_id] = service_name
     db.update_order_service_name(order_id, tg_id, service_name)
     order_discounts[order_id] = {"referral": referral_discount, "coupon": 0, "coupon_code": None}
@@ -4748,7 +4890,7 @@ async def coupon_start(callback: CallbackQuery, state: FSMContext) -> None:
     user = ensure_from_callback(callback)
     order_id = int(callback.data.split(":", 1)[1])
     order = db.get_order(order_id, int(user["telegram_id"]))
-    if not order or order["status"] != "pending":
+    if not order or str(order["status"]) not in ORDER_EDITABLE_STATUSES:
         await callback.answer("سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
     if not coupon_order_applicable(order):
@@ -4766,7 +4908,7 @@ async def coupon_finish(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     order_id = int(data["order_id"])
     order = db.get_order(order_id, int(user["telegram_id"]))
-    if not order or order["status"] != "pending":
+    if not order or str(order["status"]) not in ORDER_EDITABLE_STATUSES:
         await state.clear()
         await message.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", reply_markup=back_home_kb())
         return
@@ -4833,7 +4975,7 @@ async def pay_methods(callback: CallbackQuery, state: FSMContext) -> None:
     telegram_id = int(user["telegram_id"])
     order_id = int(callback.data.split(":", 1)[1])
     order = db.get_order(order_id, telegram_id)
-    if not order or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or str(order["status"]) not in ORDER_PAYMENT_START_STATUSES:
         await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
         return
     if not str(order["plan_key"]).startswith("wallet_topup:"):
@@ -4853,7 +4995,7 @@ async def pay_card_start(callback: CallbackQuery, state: FSMContext) -> None:
     telegram_id = int(user["telegram_id"])
     order_id = int(callback.data.split(":", 1)[1])
     order = db.get_order(order_id, telegram_id)
-    if not order or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or str(order["status"]) not in ORDER_PAYMENT_START_STATUSES:
         await callback.answer("این سفارش پیدا نشد یا قابل پرداخت نیست.", show_alert=True)
         return
     if not str(order["plan_key"]).startswith("wallet_topup:"):
@@ -4888,7 +5030,7 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
     receipt_id = int(data.get("receipt_id", 0))
     order = db.get_order(order_id, int(user["telegram_id"]))
     receipt = get_receipt(receipt_id)
-    if not order or not receipt or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or not receipt or str(order["status"]) not in ORDER_WAITING_RECEIPT_STATUSES:
         await state.clear()
         await message.answer("این سفارش دیگر قابل ثبت رسید نیست.", reply_markup=back_home_kb())
         return
@@ -4902,8 +5044,9 @@ async def card_receipt_received(message: Message, state: FSMContext) -> None:
         return
     text = normalize_digits((message.text or "").strip())
     if text in {"لغو", "انصراف", "cancel", "/cancel"}:
+        mark_order_cancelled(order_id, int(user["telegram_id"]))
         await state.clear()
-        await message.answer("ارسال رسید لغو شد. تراکنش هنوز برای بررسی ارسال نشده است.", reply_markup=back_home_kb())
+        await message.answer("❌ تراکنش لغو شد و وضعیت آن در سفارش‌های من به لغوشده تغییر کرد.", reply_markup=back_home_kb())
         return
     file_type = ""
     file_id = ""
@@ -4947,7 +5090,7 @@ async def receipt_submit(callback: CallbackQuery, state: FSMContext) -> None:
         await callback.answer("رسید پیدا نشد.", show_alert=True)
         return
     order = db.get_order(int(receipt["order_id"]), int(user["telegram_id"]))
-    if not order or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or str(order["status"]) not in ORDER_WAITING_RECEIPT_STATUSES:
         await callback.answer("این تراکنش دیگر قابل ثبت نیست.", show_alert=True)
         return
     if receipt_deadline_expired(receipt):
@@ -5076,7 +5219,7 @@ async def complete_package_sub_order(callback: CallbackQuery, telegram_id: int, 
 
 async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: int, method: str, use_wallet: bool) -> None:
     order = db.get_order(order_id, telegram_id)
-    if not order or order["status"] != "pending":
+    if not order or str(order["status"]) not in ORDER_EDITABLE_STATUSES:
         await callback.answer("این سفارش پیدا نشد یا قبلاً پرداخت شده است.", show_alert=True)
         return
     plan_key = str(order["plan_key"])
@@ -5114,7 +5257,7 @@ async def complete_order(callback: CallbackQuery, telegram_id: int, order_id: in
         db.add_wallet(telegram_id, -payable, "wallet_payment", f"پرداخت سفارش #{order_id}")
         wallet_used = payable
 
-    service_name = pending_names.get(order_id) or make_service_name(telegram_id)
+    service_name = order_service_name(order) or make_service_name(telegram_id)
     service_id = db.create_service(telegram_id, service_name, plan, payable, is_test=False, status="provisioning" if settings.pasarguard_enabled else "active")
     db.update_order_service(order_id, service_id)
 
@@ -5299,7 +5442,7 @@ async def addon_package_selected(callback: CallbackQuery) -> None:
     if service["is_test"]:
         await callback.answer("افزایش حجم برای سرویس رایگان فعال نیست.", show_alert=True)
         return
-    order_id = db.create_order(int(user["telegram_id"]), f"addon:{package_key}:{service_id}", pkg.price, 0, 0, "pending", "none")
+    order_id = db.create_order(int(user["telegram_id"]), f"addon:{package_key}:{service_id}", pkg.price, 0, 0, "draft", "none")
     order_discounts[order_id] = {"referral": 0, "coupon": 0, "coupon_code": None}
     await show_order_payment(callback, int(user["telegram_id"]), order_id)
 
@@ -5365,7 +5508,7 @@ async def renew_plan_selected(callback: CallbackQuery) -> None:
     referral_discount = 0
     if user["referred_by_telegram_id"] and not user["first_purchase_done"]:
         referral_discount = int(plan.price * REFERRED_DISCOUNT_PERCENT / 100)
-    order_id = db.create_order(int(user["telegram_id"]), f"renew:{plan_key}:{service_id}", plan.price, referral_discount, 0, "pending", "none")
+    order_id = db.create_order(int(user["telegram_id"]), f"renew:{plan_key}:{service_id}", plan.price, referral_discount, 0, "draft", "none")
     order_discounts[order_id] = {"referral": referral_discount, "coupon": 0, "coupon_code": None}
     await show_order_payment(callback, int(user["telegram_id"]), order_id)
 
@@ -5398,7 +5541,7 @@ async def revoke(callback: CallbackQuery) -> None:
     if not settings.pasarguard_enabled:
         token = db.revoke_service_link(service_id, int(user["telegram_id"]))
     service = db.get_service(service_id, int(user["telegram_id"]))
-    link = subscription_link(service)
+    link = subscription_link_with_service_name(service)
     await edit_or_answer(callback, header("🔄 لینک اشتراک تغییر کرد", service["name"]) + f"لینک قبلی دیگر قابل استفاده نیست.\n\nلینک جدید:\n<code>{h(link or 'لینک اشتراک ثبت نشده است')}</code>", service_details_kb(service))
 
 
@@ -5596,12 +5739,66 @@ async def free_plan_selected(callback: CallbackQuery) -> None:
     await edit_or_answer(callback, header("🎁 سرویس رایگان فعال شد", service_name) + "این سرویس برای بررسی کیفیت اتصال آماده است.\n\n" + service_text(service), service_details_kb(service))
 
 
+def order_status_label(status: str) -> str:
+    status_map = {
+        "draft": "در حال تکمیل 📝",
+        "pending": "در انتظار پرداخت ⏳",
+        "waiting_receipt": "در انتظار آپلود رسید کارت‌به‌کارت 📤",
+        "receipt_pending": "منتظر تأیید رسید 🧾",
+        "paid": "پرداخت شده ✅",
+        "payment_rejected": "رسید رد شد ❌",
+        "payment_expired": "منقضی شده ⏳",
+        "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
+        "cancelled": "لغو شده ❌",
+        "rejected": "رد شده ❌",
+    }
+    return status_map.get(str(status or ""), h(status))
+
+
+def user_order_text(order: sqlite3.Row) -> str:
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    service_name = order_service_name(order)
+    text = header("🧾 جزئیات سفارش", f"#{order['id']}")
+    text += f"📦 نوع/پلن: <code>{h(order['plan_key'])}</code>\n"
+    if service_name:
+        text += f"🏷 نام سرویس: <b>{h(service_name)}</b>\n"
+    text += f"📌 وضعیت: <b>{order_status_label(str(order['status']))}</b>\n"
+    text += f"💰 مبلغ اصلی: <b>{fmt_money(int(order['amount']))}</b>\n"
+    text += f"🎟 تخفیف: <b>{fmt_money(int(order['discount_amount']))}</b>\n"
+    text += f"✅ قابل پرداخت: <b>{fmt_money(payable)}</b>\n"
+    text += f"📅 تاریخ: <code>{h(fmt_jalali_datetime(order['created_at']))}</code>\n"
+    if str(order["status"]) == "draft":
+        text += "\nبرای ادامه، از دکمه‌های زیر استفاده کنید."
+    return text
+
+
+def my_orders_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row]]:
+    orders = db.list_orders(int(user["telegram_id"]), 20, include_expired=True)
+    text = header("🧾 سفارش‌های من")
+    if not orders:
+        text += "هنوز سفارشی ثبت نشده است."
+        return text, orders
+    text += "برای ادامه یا مشاهده جزئیات، یکی از سفارش‌ها را انتخاب کنید.\n\n"
+    for i, order in enumerate(orders[:10], 1):
+        payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+        text += f"{i}. <b>{order_status_label(str(order['status']))}</b> — شماره <code>{order['id']}</code> — <b>{fmt_money(payable)}</b>\n"
+    return text, orders
+
+
+def my_orders_kb(orders: list[sqlite3.Row]) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for order in orders[:20]:
+        rows.append([(f"🧾 سفارش #{order['id']} | {order_status_label(str(order['status']))}", f"order_view:{order['id']}")])
+    rows.append([("🛒 خرید سرویس", "buy"), ("🏠 منوی اصلی", "home")])
+    return inline(rows)
+
+
 def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row]]:
     try:
         expire_sqlite_payment_deadlines()
     except Exception:
         logger.exception("failed to cleanup transaction deadlines before rendering list")
-    orders = db.list_orders(int(user["telegram_id"]))
+    orders = [o for o in db.list_orders(int(user["telegram_id"])) if str(o["status"] or "") != "draft"]
     text = header("💳 تراکنش‌های شما")
     if not orders:
         text += "هنوز تراکنشی ثبت نشده است."
@@ -5609,7 +5806,10 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
         for i, order in enumerate(orders, 1):
             status_map = {
                 "paid": "پرداخت شده ✅",
+                "draft": "در حال تکمیل 📝",
                 "pending": "در انتظار ⏳",
+                "waiting_receipt": "در انتظار آپلود رسید کارت‌به‌کارت 📤",
+                "cancelled": "لغو شده ❌",
                 "provisioning": "در حال فعال‌سازی 🔄",
                 "provisioning_failed": "فعال‌سازی ناموفق ⚠️",
                 "receipt_pending": "رسید در انتظار تأیید 🧾",
@@ -5626,6 +5826,82 @@ def transactions_text_for_user(user: sqlite3.Row) -> tuple[str, list[sqlite3.Row
                 text += f"   ⏳ مهلت ارسال رسید: <code>{h(fmt_jalali_datetime(receipt['expires_at']))}</code>\n"
             text += "\n"
     return text, orders
+
+
+@router.message(F.text == "🧾 سفارش‌های من")
+async def my_orders_msg(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_message(message)
+    text, orders = my_orders_text_for_user(user)
+    await message.answer(text, reply_markup=my_orders_kb(orders))
+
+
+@router.callback_query(F.data == "my_orders")
+async def my_orders_cb(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    text, orders = my_orders_text_for_user(user)
+    await edit_or_answer(callback, text, my_orders_kb(orders))
+
+
+@router.callback_query(F.data.startswith("order_view:"))
+async def order_view(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    if not order:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    status = str(order["status"] or "")
+    if status in ORDER_EDITABLE_STATUSES or status == "waiting_receipt":
+        await show_order_payment(callback, int(user["telegram_id"]), order_id)
+        return
+    await edit_or_answer(callback, user_order_text(order), inline([[("🧾 سفارش‌های من", "my_orders"), ("🏠 منوی اصلی", "home")]]))
+
+
+@router.callback_query(F.data.startswith("order_continue:"))
+async def order_continue(callback: CallbackQuery, state: FSMContext) -> None:
+    user = ensure_from_callback(callback)
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    if not order or not order_is_editable(order):
+        await callback.answer("این سفارش دیگر قابل ادامه نیست.", show_alert=True)
+        return
+    payable = max(int(order["amount"]) - int(order["discount_amount"]), 0)
+    wallet_balance = int(user["wallet_balance"] or 0)
+    if wallet_balance < payable or wallet_balance < 0:
+        await callback.answer("برای ادامه، اول کیف پول را شارژ کنید.", show_alert=True)
+        await show_order_payment(callback, int(user["telegram_id"]), order_id)
+        return
+    if not order_needs_service_name(order):
+        await show_order_payment(callback, int(user["telegram_id"]), order_id)
+        return
+    await state.set_state(BuyStates.waiting_name)
+    await state.update_data(resume_order_id=order_id)
+    plan = PLANS.get(str(order["plan_key"]))
+    title = plan.title if plan else f"سفارش #{order_id}"
+    text = header("📝 نام سرویس", title)
+    text += "یک نام دلخواه برای اشتراک وارد کنید یا دکمه ساخت خودکار را بزنید.\n\n"
+    prefix_rule = f"• ربات خودش ابتدای نام را <code>{SERVICE_NAME_PREFIX}</code> می‌گذارد\n" if SERVICE_NAME_PREFIX else "• پیشوند داخلی برای نام سرویس غیرفعال است\n"
+    text += "قانون نام‌گذاری:\n" + prefix_rule + "• فقط حروف انگلیسی، عدد، خط تیره و آندرلاین مجاز است\n• طول نام دلخواه باید بین ۳ تا ۲۰ کاراکتر باشد"
+    await edit_or_answer(callback, text, name_prompt_kb(f"pay_page:{order_id}"))
+
+
+@router.callback_query(F.data.startswith("order_cancel:"))
+async def order_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    user = ensure_from_callback(callback)
+    order_id = int(callback.data.split(":", 1)[1])
+    order = db.get_order(order_id, int(user["telegram_id"]))
+    if not order:
+        await callback.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    if str(order["status"]) in {"paid", "receipt_pending"}:
+        await callback.answer("این سفارش دیگر قابل لغو نیست.", show_alert=True)
+        return
+    mark_order_cancelled(order_id, int(user["telegram_id"]))
+    await edit_or_answer(callback, header("❌ سفارش لغو شد", f"#{order_id}") + "وضعیت سفارش به <b>لغو شده</b> تغییر کرد و نام سرویسِ رزروشده آزاد شد.", inline([[("🧾 سفارش‌های من", "my_orders"), ("🏠 منوی اصلی", "home")]]))
 
 
 @router.message(F.text == "💳 تراکنش‌ها")
@@ -5648,7 +5924,7 @@ async def transaction_receipt_start(callback: CallbackQuery, state: FSMContext) 
     user = ensure_from_callback(callback)
     order_id = int(callback.data.split(":", 1)[1])
     order = db.get_order(order_id, int(user["telegram_id"]))
-    if not order or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or str(order["status"]) not in {"waiting_receipt", "payment_rejected"}:
         await callback.answer("این تراکنش قابل ثبت رسید نیست.", show_alert=True)
         return
     if not str(order["plan_key"]).startswith("wallet_topup:"):
@@ -5705,7 +5981,7 @@ async def wallet_topup_for_order(callback: CallbackQuery, state: FSMContext) -> 
     order_id = int(parts[1])
     suggested = max(parse_amount(parts[2]) or WALLET_MIN_TOPUP, WALLET_MIN_TOPUP)
     order = db.get_order(order_id, int(user["telegram_id"]))
-    if not order or order["status"] not in {"pending", "payment_rejected"}:
+    if not order or str(order["status"]) not in ORDER_EDITABLE_STATUSES:
         await callback.answer("سفارش پیدا نشد یا دیگر قابل پرداخت نیست.", show_alert=True)
         return
     if str(order["plan_key"]).startswith("wallet_topup:"):
@@ -5736,7 +6012,7 @@ async def wallet_topup_amount(message: Message, state: FSMContext) -> None:
             reply_markup=wallet_amount_kb(),
         )
         return
-    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "pending", "none")
+    order_id = db.create_order(int(user["telegram_id"]), f"wallet_topup:{amount}", amount, 0, 0, "draft", "none")
     await state.clear()
     await show_order_payment(message, int(user["telegram_id"]), order_id)
 
@@ -9545,7 +9821,7 @@ async def user_package_accept(callback: CallbackQuery) -> None:
     if up["order_id"]:
         await show_order_payment(callback, telegram_id, int(up["order_id"]))
         return
-    order_id = db.create_order(telegram_id, f"pkg_assign:{upid}", int(up["price"]), 0, 0, "pending", "none")
+    order_id = db.create_order(telegram_id, f"pkg_assign:{upid}", int(up["price"]), 0, 0, "draft", "none")
     update_user_package(upid, status="pending_payment", order_id=order_id)
     await show_order_payment(callback, telegram_id, order_id)
 
@@ -9587,7 +9863,7 @@ async def user_package_make_sub(callback: CallbackQuery) -> None:
     if count_package_subscriptions(upid) >= int(up["max_subscriptions"]):
         await callback.answer("ظرفیت ساخت ساب برای این پکیج تکمیل شده است.", show_alert=True)
         return
-    order_id = db.create_order(telegram_id, f"pkg_sub:{upid}:{item_id}", int(item["price"]), 0, 0, "pending", "none")
+    order_id = db.create_order(telegram_id, f"pkg_sub:{upid}:{item_id}", int(item["price"]), 0, 0, "draft", "none")
     await show_order_payment(callback, telegram_id, order_id)
 
 @router.message()

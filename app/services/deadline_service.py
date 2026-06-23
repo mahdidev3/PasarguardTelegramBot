@@ -120,7 +120,7 @@ def _expire_receipt(conn: sqlite3.Connection, receipt: sqlite3.Row, *, now_iso: 
         """
         UPDATE orders
         SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت ارسال رسید تمام شد.')
-        WHERE id = ? AND status IN ('pending', 'payment_rejected')
+        WHERE id = ? AND status IN ('waiting_receipt', 'pending', 'payment_rejected')
         """,
         (order_id,),
     )
@@ -186,7 +186,7 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
             rows = conn.execute(
                 """
                 SELECT * FROM orders
-                WHERE status IN ('pending', 'payment_rejected')
+                WHERE status IN ('waiting_receipt', 'pending', 'payment_rejected')
                 """
             ).fetchall()
             for order in rows:
@@ -209,7 +209,7 @@ def expire_sqlite_payment_deadlines(now: datetime | None = None) -> dict[str, in
                         """
                         UPDATE orders
                         SET status = 'payment_expired', admin_note = COALESCE(admin_note, 'مهلت تکمیل پرداخت تمام شد.')
-                        WHERE id = ? AND status IN ('pending', 'payment_rejected')
+                        WHERE id = ? AND status IN ('waiting_receipt', 'pending', 'payment_rejected')
                         """,
                         (int(order["id"]),),
                     )
