@@ -4686,10 +4686,26 @@ def package_sub_items_kb(user_package_id: int) -> InlineKeyboardMarkup:
     return inline(rows)
 
 
+def pipe_escape_field(value: Any) -> str:
+    """Escape text fields before passing them to pipe-separated admin parsers.
+
+    Package item titles often contain a literal pipe, for example:
+    "۳۰ گیگابایت | یک‌ماهه". If we pass that title directly to
+    upsert_plan_from_line(), the parser treats it as a separator and shifts the
+    numeric fields, which causes the false validation error:
+    "حجم، روز یا قیمت معتبر نیست."
+    """
+    return str(value or "").replace("|", r"\|")
+
+
 async def ensure_package_item_catalog_plan(item: sqlite3.Row, admin_id: int = 0) -> tuple[bool, str]:
     key = package_plan_key(int(item["id"]))
     # Use the package item price as CatalogPlan price too; the actual order amount is also stored in orders.
-    line = f"{key}|{item['title']}|{float(item['data_gb'])}|{int(item['days'])}|{int(item['price'])}|package|🎁 پکیج"
+    # Text fields must be escaped because many Persian titles intentionally contain " | ".
+    title = pipe_escape_field(item["title"])
+    category = pipe_escape_field("package")
+    badge = pipe_escape_field("🎁 پکیج")
+    line = f"{key}|{title}|{float(item['data_gb'])}|{int(item['days'])}|{int(item['price'])}|{category}|{badge}"
     ok, msg = await upsert_plan_from_line(line, admin_id)
     return ok, msg
 
