@@ -2644,6 +2644,21 @@ class AdminStates(StatesGroup):
     waiting_package_custom_description = State()
     waiting_package_custom_conditions = State()
     waiting_package_custom_code = State()
+    waiting_package_edit_name = State()
+    waiting_package_edit_code = State()
+    waiting_package_edit_price = State()
+    waiting_package_edit_description = State()
+    waiting_package_edit_conditions = State()
+    waiting_package_edit_max_subs = State()
+    waiting_package_item_edit_title = State()
+    waiting_package_item_edit_data = State()
+    waiting_package_item_edit_days = State()
+    waiting_package_item_edit_price = State()
+    waiting_package_item_edit_sort = State()
+    waiting_package_existing_manual_title = State()
+    waiting_package_existing_manual_data = State()
+    waiting_package_existing_manual_days = State()
+    waiting_package_existing_manual_price = State()
     waiting_job_interval = State()
     waiting_tutorial_title = State()
     waiting_tutorial_body = State()
@@ -4175,12 +4190,19 @@ def validate_package_name(value: str) -> tuple[bool, str]:
 
 
 def validate_package_code(value: str) -> tuple[bool, str]:
+    return validate_package_code_for_package(value, None)
+
+
+def validate_package_code_for_package(value: str, package_id: int | None = None) -> tuple[bool, str]:
     code = normalize_digits(value or "").strip().upper()
     code = re.sub(r"\s+", "", code)
     if not re.fullmatch(r"[A-Z0-9_-]{3,32}", code):
         return False, "کد پکیج باید ۳ تا ۳۲ کاراکتر و فقط شامل حروف انگلیسی، عدد، خط تیره یا آندرلاین باشد."
     with closing(db.connect()) as conn:
-        exists = conn.execute("SELECT id FROM package_templates WHERE code = ?", (code,)).fetchone()
+        if package_id is None:
+            exists = conn.execute("SELECT id FROM package_templates WHERE code = ?", (code,)).fetchone()
+        else:
+            exists = conn.execute("SELECT id FROM package_templates WHERE code = ? AND id != ?", (code, int(package_id))).fetchone()
     if exists:
         return False, "این کد قبلاً برای یک پکیج ثبت شده است."
     return True, code
@@ -4282,6 +4304,126 @@ def package_item_by_id(item_id: int) -> Optional[sqlite3.Row]:
 def package_items(package_id: int) -> list[sqlite3.Row]:
     with closing(db.connect()) as conn:
         return list(conn.execute("SELECT * FROM package_template_items WHERE package_id = ? ORDER BY sort_order, id", (package_id,)).fetchall())
+
+
+def package_assignment_count(package_id: int) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM user_packages WHERE package_id = ?", (int(package_id),)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def package_item_usage_count(item_id: int) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM package_subscriptions WHERE package_item_id = ?", (int(item_id),)).fetchone()
+        return int(row["c"] if row else 0)
+
+
+def update_package_template(package_id: int, **values: Any) -> None:
+    allowed = {"name", "code", "price", "description", "conditions", "max_subscriptions", "is_active"}
+    keys = [k for k in values if k in allowed]
+    if not keys:
+        return
+    assignments = ", ".join([f"{k} = ?" for k in keys]) + ", updated_at = ?"
+    params = [values[k] for k in keys] + [now_iso(), int(package_id)]
+    with closing(db.connect()) as conn:
+        conn.execute(f"UPDATE package_templates SET {assignments} WHERE id = ?", params)
+        conn.commit()
+
+
+def create_package_item(package_id: int, item: dict[str, Any]) -> int:
+    with closing(db.connect()) as conn:
+        row = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 10 AS s FROM package_template_items WHERE package_id = ?", (int(package_id),)).fetchone()
+        sort_order = int(row["s"] if row else 10)
+        cur = conn.execute(
+            """
+            INSERT INTO package_template_items
+            (package_id, source_type, source_plan_key, item_key, title, data_gb, days, price, sort_order, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(package_id),
+                item.get("source_type") or "manual",
+                item.get("source_plan_key") or "",
+                f"pkg{int(package_id)}_{secrets.token_hex(3)}",
+                item["title"],
+                float(item["data_gb"]),
+                int(item["days"]),
+                int(item["price"]),
+                sort_order,
+                now_iso(),
+            ),
+        )
+        conn.execute("UPDATE package_templates SET updated_at = ? WHERE id = ?", (now_iso(), int(package_id)))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_package_item(item_id: int, **values: Any) -> None:
+    allowed = {"title", "data_gb", "days", "price", "sort_order", "source_type", "source_plan_key"}
+    keys = [k for k in values if k in allowed]
+    if not keys:
+        return
+    assignments = ", ".join([f"{k} = ?" for k in keys])
+    params = [values[k] for k in keys] + [int(item_id)]
+    with closing(db.connect()) as conn:
+        item = conn.execute("SELECT package_id FROM package_template_items WHERE id = ?", (int(item_id),)).fetchone()
+        conn.execute(f"UPDATE package_template_items SET {assignments} WHERE id = ?", params)
+        if item:
+            conn.execute("UPDATE package_templates SET updated_at = ? WHERE id = ?", (now_iso(), int(item["package_id"])))
+        conn.commit()
+
+
+def delete_package_item_if_unused(item_id: int) -> tuple[bool, str, int | None]:
+    with closing(db.connect()) as conn:
+        item = conn.execute("SELECT * FROM package_template_items WHERE id = ?", (int(item_id),)).fetchone()
+        if not item:
+            return False, "آیتم پیدا نشد.", None
+        used = conn.execute("SELECT COUNT(*) AS c FROM package_subscriptions WHERE package_item_id = ?", (int(item_id),)).fetchone()["c"]
+        if int(used) > 0:
+            return False, "این ساب قبلاً برای کاربر ساخته شده و برای حفظ گزارش مالی/سرویسی قابل حذف نیست. می‌توانید قیمت/عنوان/ترتیب را ویرایش کنید یا کل پکیج را غیرفعال کنید.", int(item["package_id"])
+        package_id = int(item["package_id"])
+        conn.execute("DELETE FROM package_template_items WHERE id = ?", (int(item_id),))
+        conn.execute("UPDATE package_templates SET updated_at = ? WHERE id = ?", (now_iso(), package_id))
+        conn.commit()
+        return True, "آیتم حذف شد.", package_id
+
+
+def delete_package_template_if_unused(package_id: int) -> tuple[bool, str]:
+    with closing(db.connect()) as conn:
+        package = conn.execute("SELECT * FROM package_templates WHERE id = ?", (int(package_id),)).fetchone()
+        if not package:
+            return False, "پکیج پیدا نشد."
+        assigned = conn.execute("SELECT COUNT(*) AS c FROM user_packages WHERE package_id = ?", (int(package_id),)).fetchone()["c"]
+        if int(assigned) > 0:
+            return False, "این پکیج به کاربر اختصاص داده شده و برای حفظ تاریخچه مالی/پشتیبانی قابل حذف کامل نیست. از دکمه غیرفعال کردن استفاده کنید."
+        conn.execute("DELETE FROM package_template_items WHERE package_id = ?", (int(package_id),))
+        conn.execute("DELETE FROM package_templates WHERE id = ?", (int(package_id),))
+        conn.commit()
+        return True, "پکیج کامل حذف شد."
+
+
+def duplicate_package_template(package_id: int, admin_id: int) -> int | None:
+    package = package_by_id(package_id)
+    if not package:
+        return None
+    base_code = f"{package['code']}_COPY"[:26]
+    code = base_code
+    for i in range(1, 100):
+        ok, value = validate_package_code_for_package(code, None)
+        if ok:
+            code = value
+            break
+        code = f"{base_code}_{i}"[:32]
+    data = {
+        "name": f"کپی {package['name']}",
+        "code": code,
+        "price": int(package["price"]),
+        "description": package["description"] or "",
+        "conditions": package["conditions"] or "",
+        "max_subscriptions": int(package["max_subscriptions"]),
+    }
+    items = [dict(row) for row in package_items(package_id)]
+    return create_package_template(data, items, admin_id)
 
 
 def list_package_templates(active_only: bool = False, limit: int = 50) -> list[sqlite3.Row]:
@@ -4475,17 +4617,41 @@ def record_package_subscription(user_package_id: int, item_id: int, service_id: 
 def package_text(package: sqlite3.Row, *, include_items: bool = True) -> str:
     items = package_items(int(package["id"])) if include_items else []
     text = header("🎁 پکیج", package["name"])
+    text += f"🆔 شناسه: <code>{package['id']}</code>\n"
     text += f"🧾 کد پکیج: <code>{h(package['code'])}</code>\n"
+    text += f"📌 وضعیت: <b>{'فعال' if int(package['is_active']) else 'غیرفعال'}</b>\n"
     text += f"💰 قیمت پک: <b>{'رایگان' if int(package['price']) == 0 else fmt_money(int(package['price']))}</b>\n"
-    text += f"🔢 تعداد ساب قابل ساخت: <b>{fmt_number(int(package['max_subscriptions']))}</b>\n"
+    text += f"🔢 تعداد ساب مجاز: <b>{fmt_number(int(package['max_subscriptions']))}</b>\n"
+    text += f"👥 تعداد اختصاص‌ها: <b>{fmt_number(package_assignment_count(int(package['id'])))}</b>\n"
+    text += f"🧩 تعداد ساب‌های داخل پک: <b>{fmt_number(len(items))}</b>\n"
     if package["description"]:
-        text += f"\n📝 توضیحات:\n{h(package['description'])}\n"
+        text += f"\n📝 توضیح:\n{h(package['description'])}\n"
     if package["conditions"]:
         text += f"\n📌 شرایط:\n{h(package['conditions'])}\n"
-    if items:
-        text += "\n📦 پلن‌های داخل پک:\n"
-        for item in items:
-            text += f"• {h(item['title'])} — {fmt_number(float(item['data_gb']))}GB / {fmt_number(int(item['days']))} روز — ساب: {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}\n"
+    if include_items:
+        text += "\n🧩 ساب‌های داخل پک:\n"
+        if not items:
+            text += "هنوز سابی اضافه نشده است.\n"
+        for idx, item in enumerate(items, 1):
+            usage = package_item_usage_count(int(item['id']))
+            text += f"{idx}. <b>{h(item['title'])}</b> — {fmt_number(float(item['data_gb']))} گیگ — {fmt_number(int(item['days']))} روز — {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))} — استفاده‌شده: {fmt_number(usage)}\n"
+    return text
+
+
+def package_item_admin_text(item: sqlite3.Row) -> str:
+    package = package_by_id(int(item["package_id"]))
+    text = header("🧩 مدیریت ساب داخل پکیج", item["title"])
+    text += f"🎁 پکیج: <b>{h(package['name']) if package else h(item['package_id'])}</b>\n"
+    text += f"🆔 شناسه ساب: <code>{item['id']}</code>\n"
+    text += f"📦 حجم: <b>{fmt_number(float(item['data_gb']))}</b> گیگ\n"
+    text += f"⏳ اعتبار: <b>{fmt_number(int(item['days']))}</b> روز\n"
+    text += f"💰 قیمت ساخت ساب: <b>{'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}</b>\n"
+    text += f"🔢 ترتیب نمایش: <b>{fmt_number(int(item['sort_order']))}</b>\n"
+    text += f"🔗 منبع: <code>{h(item['source_type'])}</code>\n"
+    if item['source_plan_key']:
+        text += f"📌 پلن پایه: <code>{h(item['source_plan_key'])}</code>\n"
+    text += f"📊 تعداد استفاده‌شده: <b>{fmt_number(package_item_usage_count(int(item['id'])))}</b>\n\n"
+    text += "می‌توانید عنوان، حجم، مدت، قیمت و ترتیب نمایش این ساب را جداگانه ویرایش کنید."
     return text
 
 
@@ -4540,9 +4706,41 @@ def admin_package_kb(package_id: int) -> InlineKeyboardMarkup:
     package = package_by_id(package_id)
     toggle = "⛔ غیرفعال کردن" if package and int(package["is_active"]) else "✅ فعال کردن"
     return inline([
+        [("✏️ ویرایش مشخصات", f"adm_pkg_edit_menu:{package_id}"), ("🧩 مدیریت ساب‌ها", f"adm_pkg_items:{package_id}")],
         [("🎯 اختصاص به کاربر", f"adm_pkg_assign:{package_id}"), (toggle, f"adm_pkg_toggle:{package_id}")],
-        [("👥 اختصاص‌های این پکیج", f"adm_pkg_assignments:{package_id}")],
+        [("👥 اختصاص‌های این پکیج", f"adm_pkg_assignments:{package_id}"), ("📋 کپی پکیج", f"adm_pkg_duplicate:{package_id}")],
+        [("🗑 حذف کامل اگر استفاده نشده", f"adm_pkg_delete_ask:{package_id}")],
         [("⬅️ لیست پکیج‌ها", "adm_pkg_list"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_package_edit_kb(package_id: int) -> InlineKeyboardMarkup:
+    return inline([
+        [("✏️ نام پک", f"adm_pkg_edit:{package_id}:name"), ("🧾 کد پک", f"adm_pkg_edit:{package_id}:code")],
+        [("💰 قیمت پک", f"adm_pkg_edit:{package_id}:price"), ("🔢 تعداد ساب", f"adm_pkg_edit:{package_id}:max_subs")],
+        [("📝 توضیح", f"adm_pkg_edit:{package_id}:description"), ("📌 شرایط", f"adm_pkg_edit:{package_id}:conditions")],
+        [("⬅️ برگشت به پکیج", f"adm_pkg:{package_id}"), ("👑 منوی ادمین", "adm_home")],
+    ])
+
+
+def admin_package_items_kb(package_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for item in package_items(package_id)[:40]:
+        rows.append([(f"🧩 {item['title']} — {fmt_number(float(item['data_gb']))}GB / {fmt_number(int(item['days']))} روز — {'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}", f"adm_pkg_item:{item['id']}")])
+    rows.append([("➕ افزودن از پلن فروش", f"adm_pkg_existing_sales:{package_id}"), ("✍️ افزودن دستی", f"adm_pkg_existing_manual:{package_id}")])
+    rows.append([("⬅️ برگشت به پکیج", f"adm_pkg:{package_id}"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def admin_package_item_manage_kb(item_id: int) -> InlineKeyboardMarkup:
+    item = package_item_by_id(item_id)
+    package_id = int(item["package_id"]) if item else 0
+    return inline([
+        [("✏️ عنوان", f"adm_pkg_item_edit:{item_id}:title"), ("📦 حجم", f"adm_pkg_item_edit:{item_id}:data")],
+        [("⏳ مدت", f"adm_pkg_item_edit:{item_id}:days"), ("💰 قیمت", f"adm_pkg_item_edit:{item_id}:price")],
+        [("🔢 ترتیب نمایش", f"adm_pkg_item_edit:{item_id}:sort")],
+        [("🗑 حذف این ساب", f"adm_pkg_item_delete_ask:{item_id}")],
+        [("⬅️ ساب‌های پکیج", f"adm_pkg_items:{package_id}"), ("👑 منوی ادمین", "adm_home")],
     ])
 
 
@@ -4561,6 +4759,15 @@ def package_sales_plan_kb() -> InlineKeyboardMarkup:
         if is_public_paid_plan(p):
             rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_pkg_pick_sales:{p.key}")])
     rows.append([("⬅️ بازگشت", "adm_pkg_add_items"), ("👑 منوی ادمین", "adm_home")])
+    return inline(rows)
+
+
+def package_existing_sales_plan_kb(package_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    for p in PLANS.values():
+        if is_public_paid_plan(p):
+            rows.append([(f"{p.title} — {fmt_money(p.price)}", f"adm_pkg_existing_pick_sales:{package_id}:{p.key}")])
+    rows.append([("⬅️ مدیریت ساب‌ها", f"adm_pkg_items:{package_id}"), ("👑 منوی ادمین", "adm_home")])
     return inline(rows)
 
 
@@ -4686,27 +4893,20 @@ def package_sub_items_kb(user_package_id: int) -> InlineKeyboardMarkup:
     return inline(rows)
 
 
-def pipe_escape_field(value: Any) -> str:
-    """Escape text fields before passing them to pipe-separated admin parsers.
-
-    Package item titles often contain a literal pipe, for example:
-    "۳۰ گیگابایت | یک‌ماهه". If we pass that title directly to
-    upsert_plan_from_line(), the parser treats it as a separator and shifts the
-    numeric fields, which causes the false validation error:
-    "حجم، روز یا قیمت معتبر نیست."
-    """
-    return str(value or "").replace("|", r"\|")
-
-
 async def ensure_package_item_catalog_plan(item: sqlite3.Row, admin_id: int = 0) -> tuple[bool, str]:
     key = package_plan_key(int(item["id"]))
     # Use the package item price as CatalogPlan price too; the actual order amount is also stored in orders.
-    # Text fields must be escaped because many Persian titles intentionally contain " | ".
-    title = pipe_escape_field(item["title"])
-    category = pipe_escape_field("package")
-    badge = pipe_escape_field("🎁 پکیج")
-    line = f"{key}|{title}|{float(item['data_gb'])}|{int(item['days'])}|{int(item['price'])}|{category}|{badge}"
+    # Titles may contain a literal pipe (for example: "۳۰ گیگابایت | یک‌ماهه"),
+    # so escape it before sending the pipe-separated admin line to the parser.
+    safe_title = str(item["title"] or "").replace("|", r"\|")
+    line = f"{key}|{safe_title}|{float(item['data_gb'])}|{int(item['days'])}|{int(item['price'])}|package|🎁 پکیج"
     ok, msg = await upsert_plan_from_line(line, admin_id)
+    if ok:
+        try:
+            import app.legacy_bot as legacy_bot
+            await sync_legacy_catalog_from_db(legacy_bot)
+        except Exception:
+            logger.exception("failed to sync package item plan into legacy catalog")
     return ok, msg
 
 def referral_invite_link(user: sqlite3.Row) -> str:
@@ -9294,6 +9494,531 @@ async def admin_package_toggle(callback: CallbackQuery) -> None:
     admin_log(callback.from_user.id, "PACKAGE_TOGGLE", "package", package_id, f"active={new_active}")
     package = package_by_id(package_id)
     await edit_or_answer(callback, header("✅ وضعیت پکیج تغییر کرد") + package_text(package), admin_package_kb(package_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_edit_menu:"))
+async def admin_package_edit_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("✏️ ویرایش مشخصات پکیج") + package_text(package, include_items=False), admin_package_edit_kb(package_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_edit:"))
+async def admin_package_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _tag, package_id_s, field = callback.data.split(":")
+        package_id = int(package_id_s)
+    except Exception:
+        await callback.answer("اطلاعات ویرایش معتبر نیست.", show_alert=True)
+        return
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(edit_package_id=package_id)
+    if field == "name":
+        await state.set_state(AdminStates.waiting_package_edit_name)
+        await edit_or_answer(callback, header("✏️ تغییر نام پک") + f"نام فعلی: <b>{h(package['name'])}</b>\n\nنام جدید را وارد کنید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    elif field == "code":
+        await state.set_state(AdminStates.waiting_package_edit_code)
+        await edit_or_answer(callback, header("🧾 تغییر کد پک") + f"کد فعلی: <code>{h(package['code'])}</code>\n\nکد جدید را وارد کنید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    elif field == "price":
+        await state.set_state(AdminStates.waiting_package_edit_price)
+        await edit_or_answer(callback, header("💰 تغییر قیمت پک") + f"قیمت فعلی: <b>{'رایگان' if int(package['price']) == 0 else fmt_money(int(package['price']))}</b>\n\nقیمت جدید را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    elif field == "max_subs":
+        await state.set_state(AdminStates.waiting_package_edit_max_subs)
+        await edit_or_answer(callback, header("🔢 تغییر تعداد ساب") + f"مقدار فعلی: <b>{fmt_number(int(package['max_subscriptions']))}</b>\n\nتعداد جدید را وارد کنید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    elif field == "description":
+        await state.set_state(AdminStates.waiting_package_edit_description)
+        await edit_or_answer(callback, header("📝 تغییر توضیح پک") + "توضیح جدید را بفرستید. برای خالی‌کردن توضیح <code>-</code> بفرستید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    elif field == "conditions":
+        await state.set_state(AdminStates.waiting_package_edit_conditions)
+        await edit_or_answer(callback, header("📌 تغییر شرایط پک") + "شرایط جدید را بفرستید. برای خالی‌کردن شرایط <code>-</code> بفرستید.", admin_back_kb(f"adm_pkg_edit_menu:{package_id}"))
+    else:
+        await callback.answer("فیلد معتبر نیست.", show_alert=True)
+
+
+async def _finish_package_edit_message(message: Message, state: FSMContext, package_id: int, title: str = "✅ مشخصات پکیج ذخیره شد") -> None:
+    await state.clear()
+    package = package_by_id(package_id)
+    await message.answer(header(title) + package_text(package, include_items=False), reply_markup=admin_package_edit_kb(package_id))
+
+
+@router.message(AdminStates.waiting_package_edit_name)
+async def admin_package_edit_name_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, value = validate_package_name(message.text or "")
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_package_template(package_id, name=value)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_NAME", "package", package_id, value)
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.message(AdminStates.waiting_package_edit_code)
+async def admin_package_edit_code_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, value = validate_package_code_for_package(message.text or "", package_id)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_package_template(package_id, code=value)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_CODE", "package", package_id, value)
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.message(AdminStates.waiting_package_edit_price)
+async def admin_package_edit_price_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, amount, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    update_package_template(package_id, price=amount)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_PRICE", "package", package_id, str(amount))
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.message(AdminStates.waiting_package_edit_max_subs)
+async def admin_package_edit_max_subs_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, count, err = parse_max_subscriptions(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    update_package_template(package_id, max_subscriptions=count)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_MAX_SUBS", "package", package_id, str(count))
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.message(AdminStates.waiting_package_edit_description)
+async def admin_package_edit_description_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, value = validate_long_text(message.text or "", "توضیحات", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_package_template(package_id, description=value)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_DESCRIPTION", "package", package_id, "")
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.message(AdminStates.waiting_package_edit_conditions)
+async def admin_package_edit_conditions_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    package_id = int(data.get("edit_package_id", 0))
+    ok, value = validate_long_text(message.text or "", "شرایط", allow_empty=True)
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_package_template(package_id, conditions=value)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_EDIT_CONDITIONS", "package", package_id, "")
+    await _finish_package_edit_message(message, state, package_id)
+
+
+@router.callback_query(F.data.startswith("adm_pkg_items:"))
+async def admin_package_items(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    items = package_items(package_id)
+    text = header("🧩 مدیریت ساب‌های داخل پکیج", package["name"])
+    text += f"تعداد ساب‌ها: <b>{fmt_number(len(items))}</b>\n\n"
+    text += "می‌توانید ساب جدید اضافه کنید، یا هر ساب را جداگانه ویرایش/حذف کنید."
+    await edit_or_answer(callback, text, admin_package_items_kb(package_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_item:"))
+async def admin_package_item_details(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    item_id = int(callback.data.split(":", 1)[1])
+    item = package_item_by_id(item_id)
+    if not item:
+        await callback.answer("ساب پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, package_item_admin_text(item), admin_package_item_manage_kb(item_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_item_edit:"))
+async def admin_package_item_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _tag, item_id_s, field = callback.data.split(":")
+        item_id = int(item_id_s)
+    except Exception:
+        await callback.answer("اطلاعات ویرایش معتبر نیست.", show_alert=True)
+        return
+    item = package_item_by_id(item_id)
+    if not item:
+        await callback.answer("ساب پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(edit_package_item_id=item_id)
+    back = f"adm_pkg_item:{item_id}"
+    if field == "title":
+        await state.set_state(AdminStates.waiting_package_item_edit_title)
+        await edit_or_answer(callback, header("✏️ تغییر عنوان ساب") + f"عنوان فعلی: <b>{h(item['title'])}</b>\n\nعنوان جدید را وارد کنید.", admin_back_kb(back))
+    elif field == "data":
+        await state.set_state(AdminStates.waiting_package_item_edit_data)
+        await edit_or_answer(callback, header("📦 تغییر حجم ساب") + f"حجم فعلی: <b>{fmt_number(float(item['data_gb']))}</b> گیگ\n\nحجم جدید را به گیگ وارد کنید.", admin_back_kb(back))
+    elif field == "days":
+        await state.set_state(AdminStates.waiting_package_item_edit_days)
+        await edit_or_answer(callback, header("⏳ تغییر مدت ساب") + f"مدت فعلی: <b>{fmt_number(int(item['days']))}</b> روز\n\nمدت جدید را به روز وارد کنید.", admin_back_kb(back))
+    elif field == "price":
+        await state.set_state(AdminStates.waiting_package_item_edit_price)
+        await edit_or_answer(callback, header("💰 تغییر قیمت ساخت ساب") + f"قیمت فعلی: <b>{'رایگان' if int(item['price']) == 0 else fmt_money(int(item['price']))}</b>\n\nقیمت جدید را به تومان وارد کنید.", admin_back_kb(back))
+    elif field == "sort":
+        await state.set_state(AdminStates.waiting_package_item_edit_sort)
+        await edit_or_answer(callback, header("🔢 تغییر ترتیب نمایش") + f"ترتیب فعلی: <b>{fmt_number(int(item['sort_order']))}</b>\n\nعدد جدید را وارد کنید. عدد کمتر بالاتر نمایش داده می‌شود.", admin_back_kb(back))
+    else:
+        await callback.answer("فیلد معتبر نیست.", show_alert=True)
+
+
+async def _finish_package_item_edit_message(message: Message, state: FSMContext, item_id: int, title: str = "✅ ساب داخل پکیج ذخیره شد") -> None:
+    await state.clear()
+    item = package_item_by_id(item_id)
+    await message.answer(header(title) + package_item_admin_text(item), reply_markup=admin_package_item_manage_kb(item_id))
+
+
+@router.message(AdminStates.waiting_package_item_edit_title)
+async def admin_package_item_edit_title_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_package_item_id", 0))
+    ok, value = validate_package_item_title(message.text or "")
+    if not ok:
+        await message.answer("❌ " + value)
+        return
+    update_package_item(item_id, title=value)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_EDIT_TITLE", "package_item", item_id, value)
+    await _finish_package_item_edit_message(message, state, item_id)
+
+
+@router.message(AdminStates.waiting_package_item_edit_data)
+async def admin_package_item_edit_data_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_package_item_id", 0))
+    ok, value, err = parse_package_data_gb(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    update_package_item(item_id, data_gb=value, source_type="manual_override")
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_EDIT_DATA", "package_item", item_id, str(value))
+    await _finish_package_item_edit_message(message, state, item_id)
+
+
+@router.message(AdminStates.waiting_package_item_edit_days)
+async def admin_package_item_edit_days_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_package_item_id", 0))
+    ok, value, err = parse_package_days(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    update_package_item(item_id, days=value, source_type="manual_override")
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_EDIT_DAYS", "package_item", item_id, str(value))
+    await _finish_package_item_edit_message(message, state, item_id)
+
+
+@router.message(AdminStates.waiting_package_item_edit_price)
+async def admin_package_item_edit_price_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_package_item_id", 0))
+    ok, amount, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    update_package_item(item_id, price=amount)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_EDIT_PRICE", "package_item", item_id, str(amount))
+    await _finish_package_item_edit_message(message, state, item_id)
+
+
+@router.message(AdminStates.waiting_package_item_edit_sort)
+async def admin_package_item_edit_sort_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    data = await state.get_data()
+    item_id = int(data.get("edit_package_item_id", 0))
+    raw = normalize_digits(message.text or "").strip()
+    if not raw.lstrip("-").isdigit():
+        await message.answer("❌ ترتیب نمایش باید عدد صحیح باشد.")
+        return
+    sort_order = int(raw)
+    update_package_item(item_id, sort_order=sort_order)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_EDIT_SORT", "package_item", item_id, str(sort_order))
+    await _finish_package_item_edit_message(message, state, item_id)
+
+
+@router.callback_query(F.data.startswith("adm_pkg_item_delete_ask:"))
+async def admin_package_item_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    item_id = int(callback.data.split(":", 1)[1])
+    item = package_item_by_id(item_id)
+    if not item:
+        await callback.answer("ساب پیدا نشد.", show_alert=True)
+        return
+    usage = package_item_usage_count(item_id)
+    text = header("🗑 حذف ساب از پکیج") + package_item_admin_text(item) + "\n\n"
+    if usage > 0:
+        text += "⚠️ این ساب قبلاً استفاده شده و حذف کامل آن مجاز نیست."
+        await edit_or_answer(callback, text, admin_package_item_manage_kb(item_id))
+        return
+    text += "این عملیات فقط وقتی انجام می‌شود که این ساب هنوز برای هیچ کاربری ساخته نشده باشد. مطمئنی؟"
+    await edit_or_answer(callback, text, inline([[('✅ بله، حذف کن', f'adm_pkg_item_delete_yes:{item_id}')], [('❌ انصراف', f'adm_pkg_item:{item_id}'), ('👑 منوی ادمین', 'adm_home')]]))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_item_delete_yes:"))
+async def admin_package_item_delete_yes(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    item_id = int(callback.data.split(":", 1)[1])
+    ok, msg, package_id = delete_package_item_if_unused(item_id)
+    admin_log(callback.from_user.id, "PACKAGE_ITEM_DELETE", "package_item", item_id, f"ok={ok}; {msg}")
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        if package_id:
+            await edit_or_answer(callback, header("⚠️ حذف انجام نشد") + h(msg), admin_package_items_kb(package_id))
+        return
+    await edit_or_answer(callback, header("✅ ساب حذف شد") + h(msg), admin_package_items_kb(int(package_id or 0)))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_existing_sales:"))
+async def admin_package_existing_sales(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await edit_or_answer(callback, header("➕ افزودن ساب از پلن فروش", package["name"]) + "پلن پایه را انتخاب کنید. بعد از اضافه شدن، می‌توانید عنوان/حجم/مدت/قیمت را ویرایش کنید.", package_existing_sales_plan_kb(package_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_existing_pick_sales:"))
+async def admin_package_existing_pick_sales(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _tag, package_id_s, plan_key = callback.data.split(":", 2)
+        package_id = int(package_id_s)
+    except Exception:
+        await callback.answer("اطلاعات پلن معتبر نیست.", show_alert=True)
+        return
+    package = package_by_id(package_id)
+    plan = PLANS.get(plan_key)
+    if not package or not plan or not is_public_paid_plan(plan):
+        await callback.answer("پکیج یا پلن پیدا نشد.", show_alert=True)
+        return
+    item_id = create_package_item(package_id, {"source_type": "sales_plan", "source_plan_key": plan.key, "title": plan.title, "data_gb": plan.data_gb, "days": plan.days, "price": plan.price})
+    admin_log(callback.from_user.id, "PACKAGE_ITEM_ADD_SALES", "package_item", item_id, f"package={package_id}; plan={plan.key}")
+    item = package_item_by_id(item_id)
+    await edit_or_answer(callback, header("✅ ساب از پلن فروش اضافه شد") + package_item_admin_text(item), admin_package_item_manage_kb(item_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_existing_manual:"))
+async def admin_package_existing_manual_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    if not package_by_id(package_id):
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(existing_package_id=package_id, existing_manual_item={})
+    await state.set_state(AdminStates.waiting_package_existing_manual_title)
+    await edit_or_answer(callback, header("✍️ افزودن ساب دستی به پکیج", "مرحله ۱") + "عنوان ساب را وارد کنید.", admin_back_kb(f"adm_pkg_items:{package_id}"))
+
+
+@router.message(AdminStates.waiting_package_existing_manual_title)
+async def admin_package_existing_manual_title_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, title = validate_package_item_title(message.text or "")
+    if not ok:
+        await message.answer("❌ " + title)
+        return
+    data = await state.get_data()
+    item = dict(data.get("existing_manual_item") or {})
+    item.update({"source_type": "manual", "source_plan_key": "", "title": title})
+    await state.update_data(existing_manual_item=item)
+    await state.set_state(AdminStates.waiting_package_existing_manual_data)
+    await message.answer(header("📦 حجم ساب", "مرحله ۲") + "حجم را به گیگ وارد کنید. مثال: <code>30</code>", reply_markup=admin_back_kb(f"adm_pkg_items:{int(data.get('existing_package_id', 0))}"))
+
+
+@router.message(AdminStates.waiting_package_existing_manual_data)
+async def admin_package_existing_manual_data_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, data_gb, err = parse_package_data_gb(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("existing_manual_item") or {})
+    item["data_gb"] = data_gb
+    await state.update_data(existing_manual_item=item)
+    await state.set_state(AdminStates.waiting_package_existing_manual_days)
+    await message.answer(header("⏳ مدت ساب", "مرحله ۳") + "مدت اعتبار را به روز وارد کنید. مثال: <code>31</code>", reply_markup=admin_back_kb(f"adm_pkg_items:{int(data.get('existing_package_id', 0))}"))
+
+
+@router.message(AdminStates.waiting_package_existing_manual_days)
+async def admin_package_existing_manual_days_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, days, err = parse_package_days(message.text or "")
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    item = dict(data.get("existing_manual_item") or {})
+    item["days"] = days
+    await state.update_data(existing_manual_item=item)
+    await state.set_state(AdminStates.waiting_package_existing_manual_price)
+    await message.answer(header("💰 قیمت ساخت ساب", "مرحله ۴") + "قیمت ساخت این ساب را به تومان وارد کنید. برای رایگان بودن <code>0</code> بفرستید.", reply_markup=admin_back_kb(f"adm_pkg_items:{int(data.get('existing_package_id', 0))}"))
+
+
+@router.message(AdminStates.waiting_package_existing_manual_price)
+async def admin_package_existing_manual_price_step(message: Message, state: FSMContext) -> None:
+    if not require_admin_id(message.from_user.id if message.from_user else 0, "packages"):
+        await message.answer("دسترسی ندارید.")
+        return
+    ok, price, err = parse_positive_amount(message.text or "", allow_zero=True)
+    if not ok:
+        await message.answer("❌ " + err)
+        return
+    data = await state.get_data()
+    package_id = int(data.get("existing_package_id", 0))
+    item = dict(data.get("existing_manual_item") or {})
+    item["price"] = price
+    for key in ("title", "data_gb", "days", "price"):
+        if key not in item:
+            await message.answer("❌ اطلاعات ساب کامل نیست؛ دوباره از مدیریت ساب‌ها شروع کنید.", reply_markup=admin_back_kb(f"adm_pkg_items:{package_id}"))
+            await state.clear()
+            return
+    item_id = create_package_item(package_id, item)
+    admin_log(message.from_user.id if message.from_user else 0, "PACKAGE_ITEM_ADD_MANUAL", "package_item", item_id, f"package={package_id}")
+    await state.clear()
+    saved = package_item_by_id(item_id)
+    await message.answer(header("✅ ساب دستی اضافه شد") + package_item_admin_text(saved), reply_markup=admin_package_item_manage_kb(item_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_duplicate:"))
+async def admin_package_duplicate(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    new_id = duplicate_package_template(package_id, callback.from_user.id)
+    if not new_id:
+        await callback.answer("کپی پکیج ناموفق بود.", show_alert=True)
+        return
+    admin_log(callback.from_user.id, "PACKAGE_DUPLICATE", "package", package_id, f"new={new_id}")
+    package = package_by_id(new_id)
+    await edit_or_answer(callback, header("✅ پکیج کپی شد") + package_text(package), admin_package_kb(new_id))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_delete_ask:"))
+async def admin_package_delete_ask(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    package = package_by_id(package_id)
+    if not package:
+        await callback.answer("پکیج پیدا نشد.", show_alert=True)
+        return
+    assigned = package_assignment_count(package_id)
+    text = header("🗑 حذف کامل پکیج") + package_text(package, include_items=False) + "\n\n"
+    if assigned > 0:
+        text += "⚠️ این پکیج به کاربر اختصاص داده شده و حذف کامل آن مجاز نیست. برای جلوگیری از استفاده جدید، غیرفعالش کنید."
+        await edit_or_answer(callback, text, admin_package_kb(package_id))
+        return
+    text += "این کار پکیج و همه ساب‌های داخل آن را از دیتابیس حذف می‌کند. فقط وقتی مجاز است که هنوز به هیچ کاربری اختصاص داده نشده باشد."
+    await edit_or_answer(callback, text, inline([[('✅ بله، حذف کامل', f'adm_pkg_delete_yes:{package_id}')], [('❌ انصراف', f'adm_pkg:{package_id}'), ('👑 منوی ادمین', 'adm_home')]]))
+
+
+@router.callback_query(F.data.startswith("adm_pkg_delete_yes:"))
+async def admin_package_delete_yes(callback: CallbackQuery) -> None:
+    if not require_admin_id(callback.from_user.id, "packages"):
+        await callback.answer("دسترسی ندارید.", show_alert=True)
+        return
+    package_id = int(callback.data.split(":", 1)[1])
+    ok, msg = delete_package_template_if_unused(package_id)
+    admin_log(callback.from_user.id, "PACKAGE_DELETE", "package", package_id, f"ok={ok}; {msg}")
+    if not ok:
+        await callback.answer(msg, show_alert=True)
+        package = package_by_id(package_id)
+        if package:
+            await edit_or_answer(callback, header("⚠️ حذف انجام نشد") + h(msg), admin_package_kb(package_id))
+        return
+    packages = list_package_templates(False)
+    await edit_or_answer(callback, header("✅ پکیج حذف شد") + h(msg), admin_package_list_kb(packages))
 
 
 @router.callback_query(F.data == "adm_pkg_new")
